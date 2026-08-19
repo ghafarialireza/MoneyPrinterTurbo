@@ -601,12 +601,20 @@ def generate_terms(
 ) -> List[str]:
     if match_script_order:
         goal = (
-            f"Generate {amount} chronological stock-video search terms that follow "
-            "the order of topics in the video script."
+            f"Generate exactly {amount} chronological stock-video search terms, "
+            "one for each consecutive visual slot in the video script."
+        )
+        term_shape_rule = (
+            "2. each search term must be a concrete, camera-visible shot of 2-6 "
+            "English words; include the main subject and avoid abstract concepts, "
+            "emotions, metaphors, camera transitions, or narration summaries."
         )
         ordering_rule = (
             "6. keep the terms in the same order as the script narration; "
-            "earlier terms must describe earlier visual moments."
+            "earlier terms must describe earlier visual moments.\n"
+            "7. every item must describe only its own consecutive script segment; "
+            "do not repeat an opening visual after moving to a later topic.\n"
+            f"8. return exactly {amount} items, including the final script moment."
         )
         # 有序关键词模式下，示例数量要和 amount 保持一致，避免模型被固定
         # 的 4 个示例误导，导致长文案只返回少量关键词，影响素材覆盖度。
@@ -622,6 +630,10 @@ def generate_terms(
             "subject of a video."
         )
         ordering_rule = ""
+        term_shape_rule = (
+            "2. each search term should consist of 1-3 words, always add the main "
+            "subject of the video."
+        )
         output_example = (
             '["search term 1", "search term 2", "search term 3",'
             '"search term 4", "search term 5"]'
@@ -635,7 +647,7 @@ def generate_terms(
 
 ## Constrains:
 1. the search terms are to be returned as a json-array of strings.
-2. each search term should consist of 1-3 words, always add the main subject of the video.
+{term_shape_rule}
 3. you must only return the json-array of strings. you must not return anything else. you must not return the script.
 4. the search terms must be related to the subject of the video.
 5. reply with english search terms only.
@@ -659,6 +671,9 @@ Please note that you must use English for generating video search terms; Chinese
     search_terms = []
     response = ""
     for i in range(_max_retries):
+        # Never let a partially parsed value from an earlier attempt satisfy a
+        # later retry whose response could not be decoded.
+        search_terms = []
         try:
             if app_config is None:
                 response = _generate_response(prompt)
@@ -677,6 +692,14 @@ Please note that you must use English for generating video search terms; Chinese
             ):
                 logger.error("response is not a list of strings.")
                 continue
+            search_terms = [term.strip() for term in search_terms if term.strip()]
+            if match_script_order and len(search_terms) != amount:
+                logger.warning(
+                    "ordered video terms count mismatch: "
+                    f"expected={amount}, received={len(search_terms)}"
+                )
+                search_terms = []
+                continue
 
         except Exception as e:
             logger.warning(f"failed to generate video terms: {str(e)}")
@@ -690,6 +713,24 @@ Please note that you must use English for generating video search terms; Chinese
                         # 否则后续排查搜索词为空时无法定位
                         # 是模型格式问题还是解析逻辑问题。
                         logger.warning(f"failed to generate video terms: {str(e)}")
+
+        # The regex recovery path above must obey exactly the same type/count
+        # contract as the primary JSON path. Previously it could accept the
+        # wrong number of ordered terms and bypass the timeline guarantee.
+        if search_terms:
+            if not isinstance(search_terms, list) or not all(
+                isinstance(term, str) for term in search_terms
+            ):
+                logger.warning("recovered video terms are not a list of strings")
+                search_terms = []
+            else:
+                search_terms = [term.strip() for term in search_terms if term.strip()]
+                if match_script_order and len(search_terms) != amount:
+                    logger.warning(
+                        "recovered ordered video terms count mismatch: "
+                        f"expected={amount}, received={len(search_terms)}"
+                    )
+                    search_terms = []
 
         if search_terms and len(search_terms) > 0:
             break

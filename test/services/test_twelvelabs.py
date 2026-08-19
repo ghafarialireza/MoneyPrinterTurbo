@@ -39,11 +39,10 @@ class TestTwelveLabsService(unittest.TestCase):
         self.assertFalse(twelvelabs.is_enabled())
         # rerank must return the input list unchanged
         terms = ["b", "a", "c"]
-        self.assertEqual(
-            twelvelabs.rerank_terms_by_subject("subject", terms), terms
-        )
+        self.assertEqual(twelvelabs.rerank_terms_by_subject("subject", terms), terms)
         # analyze must be a no-op returning None
         self.assertIsNone(twelvelabs.analyze_clip("https://x/y.mp4"))
+        self.assertFalse(twelvelabs.is_clip_qa_enabled())
 
     def test_rerank_skipped_when_flag_off(self):
         config.app["twelvelabs_api_keys"] = ["tlk_test"]
@@ -145,6 +144,77 @@ class TestTwelveLabsService(unittest.TestCase):
         self.assertEqual(out, "A city skyline at dusk.")
         # max_tokens must be clamped to the Pegasus minimum (>=512)
         self.assertGreaterEqual(client.analyze.call_args.kwargs["max_tokens"], 512)
+
+    # ---------------- per-clip semantic QA ----------------
+
+    def test_clip_qa_requires_explicit_flag(self):
+        config.app["twelvelabs_api_keys"] = ["tlk_test"]
+        config.app["twelvelabs_clip_qa"] = False
+
+        with patch.object(twelvelabs, "analyze_clip") as analyze:
+            result = twelvelabs.evaluate_clip_match(
+                "https://example.com/clip.mp4", "railway ballast closeup"
+            )
+
+        self.assertIsNone(result)
+        analyze.assert_not_called()
+
+    def test_clip_qa_accepts_only_boolean_match_above_threshold(self):
+        config.app["twelvelabs_api_keys"] = ["tlk_test"]
+        config.app["twelvelabs_clip_qa"] = True
+        config.app["twelvelabs_clip_qa_min_score"] = 0.7
+
+        response = (
+            '```json\n{"match":true,"score":0.82,'
+            '"reason":"Ballast is clearly visible under railway sleepers."}\n```'
+        )
+        with patch.object(twelvelabs, "analyze_clip", return_value=response) as analyze:
+            result = twelvelabs.evaluate_clip_match(
+                "https://example.com/clip.mp4", "railway ballast closeup"
+            )
+
+        self.assertEqual(
+            result,
+            {
+                "provider": "twelvelabs",
+                "accepted": True,
+                "score": 0.82,
+                "reason": "Ballast is clearly visible under railway sleepers.",
+            },
+        )
+        self.assertIn("railway ballast closeup", analyze.call_args.kwargs["prompt"])
+        self.assertIn("sideways or upside down", analyze.call_args.kwargs["prompt"])
+
+    def test_clip_qa_rejects_low_score_even_when_model_match_is_true(self):
+        config.app["twelvelabs_api_keys"] = ["tlk_test"]
+        config.app["twelvelabs_clip_qa"] = True
+
+        with patch.object(
+            twelvelabs,
+            "analyze_clip",
+            return_value='{"match":true,"score":0.41,"reason":"Only a train."}',
+        ):
+            result = twelvelabs.evaluate_clip_match(
+                "https://example.com/clip.mp4", "railway ballast closeup"
+            )
+
+        self.assertIsNotNone(result)
+        self.assertFalse(result["accepted"])
+
+    def test_clip_qa_returns_none_for_malformed_model_output(self):
+        config.app["twelvelabs_api_keys"] = ["tlk_test"]
+        config.app["twelvelabs_clip_qa"] = True
+
+        with patch.object(
+            twelvelabs,
+            "analyze_clip",
+            return_value="The clip seems relevant.",
+        ):
+            result = twelvelabs.evaluate_clip_match(
+                "https://example.com/clip.mp4", "railway ballast closeup"
+            )
+
+        self.assertIsNone(result)
 
 
 @unittest.skipUnless(

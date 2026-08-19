@@ -582,6 +582,49 @@ class TestTaskService(unittest.TestCase):
             match_script_order=True,
         )
 
+    def test_fit_script_order_terms_uses_real_audio_timeline(self):
+        params = VideoParams(
+            video_subject="railway ballast",
+            match_materials_to_script=True,
+            video_clip_duration=3,
+        )
+        fitted = [f"railway shot {index}" for index in range(14)]
+
+        with patch.object(tm.llm, "generate_terms", return_value=fitted) as generate:
+            result = tm.fit_script_order_terms_to_timeline(
+                params=params,
+                video_script="A forty-second railway explanation.",
+                video_terms=["opening train", "railway rocks"],
+                audio_duration=40,
+            )
+
+        self.assertEqual(result, fitted)
+        generate.assert_called_once_with(
+            video_subject="railway ballast",
+            video_script="A forty-second railway explanation.",
+            amount=14,
+            match_script_order=True,
+        )
+
+    def test_fit_script_order_terms_preserves_user_terms(self):
+        params = VideoParams(
+            video_subject="railway ballast",
+            video_terms=["custom opening", "custom ending"],
+            match_materials_to_script=True,
+            video_clip_duration=3,
+        )
+
+        with patch.object(tm.llm, "generate_terms") as generate:
+            result = tm.fit_script_order_terms_to_timeline(
+                params=params,
+                video_script="A forty-second railway explanation.",
+                video_terms=["custom opening", "custom ending"],
+                audio_duration=40,
+            )
+
+        self.assertEqual(result, ["custom opening", "custom ending"])
+        generate.assert_not_called()
+
     def test_start_stops_before_materials_when_term_provider_fails(self):
         """
         关键词 Provider 失败后，任务必须立即结束，不能继续生成音频或下载素材。

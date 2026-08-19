@@ -23,15 +23,20 @@ The integration is fully opt-in and non-breaking:
 Config (config.toml, [app] section):
     twelvelabs_api_keys = ["tlk_xxx"]   # required to enable
     twelvelabs_rerank_terms = true      # opt-in: reorder search terms by relevance
+    twelvelabs_clip_qa = true           # opt-in: reject mismatched clips
+    twelvelabs_clip_qa_min_score = 0.70 # match-confidence threshold
+    twelvelabs_clip_qa_fail_closed = true # reject candidates when QA is unavailable
     twelvelabs_marengo_model = "marengo3.0"   # optional override
     twelvelabs_pegasus_model = "pegasus1.5"   # optional override
 
 Configure a TwelveLabs API key from the TwelveLabs dashboard (https://twelvelabs.io) to enable this optional integration.
 """
 
+import json
 import math
+import re
 from functools import lru_cache
-from typing import List, Optional
+from typing import Any, List, Optional
 
 from loguru import logger
 
@@ -42,12 +47,37 @@ DEFAULT_MARENGO_MODEL = "marengo3.0"
 DEFAULT_PEGASUS_MODEL = "pegasus1.5"
 # Pegasus requires max_tokens in [512, 98304]; 512 is plenty for a one-line QA.
 _PEGASUS_MIN_MAX_TOKENS = 512
+DEFAULT_CLIP_QA_MIN_SCORE = 0.70
 
 
 def is_enabled() -> bool:
     """True only when at least one TwelveLabs API key is configured."""
     keys = config.app.get("twelvelabs_api_keys")
     return bool(keys)
+
+
+def is_clip_qa_enabled() -> bool:
+    """True when both TwelveLabs credentials and per-clip QA are enabled."""
+    return is_enabled() and bool(config.app.get("twelvelabs_clip_qa", False))
+
+
+def clip_qa_fail_closed() -> bool:
+    """Whether an unavailable/malformed QA result must reject the candidate."""
+    return bool(config.app.get("twelvelabs_clip_qa_fail_closed", True))
+
+
+def _clip_qa_min_score(value: Any = None) -> float:
+    if value is None:
+        value = config.app.get(
+            "twelvelabs_clip_qa_min_score", DEFAULT_CLIP_QA_MIN_SCORE
+        )
+    try:
+        return min(1.0, max(0.0, float(value)))
+    except (TypeError, ValueError):
+        logger.warning(
+            f"invalid twelvelabs_clip_qa_min_score; using {DEFAULT_CLIP_QA_MIN_SCORE}"
+        )
+        return DEFAULT_CLIP_QA_MIN_SCORE
 
 
 def _client():
@@ -164,3 +194,92 @@ def analyze_clip(
     except Exception as e:  # noqa: BLE001
         logger.warning(f"TwelveLabs analyze_clip failed: {e}")
         return None
+
+
+def _parse_clip_qa_response(
+    response: str,
+    min_score: float,
+) -> Optional[dict[str, Any]]:
+    """Parse and validate the deliberately tiny Pegasus QA JSON contract."""
+    if not isinstance(response, str) or not response.strip():
+        return None
+
+    value = response.strip()
+    if value.startswith("```"):
+        value = re.sub(r"^```[a-zA-Z0-9]*\s*", "", value)
+        value = re.sub(r"\s*```$", "", value)
+
+    try:
+        payload = json.loads(value)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        match = re.search(r"\{.*?\}", value, re.DOTALL)
+        if not match:
+            return None
+        try:
+            payload = json.loads(match.group())
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return None
+
+    if not isinstance(payload, dict) or not isinstance(payload.get("match"), bool):
+        return None
+    try:
+        score = min(1.0, max(0.0, float(payload.get("score"))))
+    except (TypeError, ValueError):
+        return None
+
+    reason = str(payload.get("reason") or "").strip()
+    reason = re.sub(r"[\x00-\x1f\x7f]+", " ", reason)[:240].strip()
+    accepted = payload["match"] and score >= min_score
+    return {
+        "provider": "twelvelabs",
+        "accepted": accepted,
+        "score": round(score, 4),
+        "reason": reason,
+    }
+
+
+def evaluate_clip_match(
+    video_url: str,
+    visual_query: str,
+    min_score: Optional[float] = None,
+) -> Optional[dict[str, Any]]:
+    """Judge whether a public stock clip visibly matches one timeline query.
+
+    ``None`` means the optional QA service could not produce a trustworthy
+    result. The caller decides whether that is allowed through
+    ``twelvelabs_clip_qa_fail_closed``.
+    """
+    if (
+        not is_clip_qa_enabled()
+        or not isinstance(video_url, str)
+        or not video_url.strip()
+        or not isinstance(visual_query, str)
+        or not visual_query.strip()
+    ):
+        return None
+
+    threshold = _clip_qa_min_score(min_score)
+    prompt = f"""
+You are a strict stock-footage quality gate.
+Decide whether the visible content of this video clearly shows this requested shot:
+{visual_query.strip()}
+
+Reject clips that are merely loosely related, dominated by text/logos, visually
+sideways or upside down, or do not clearly show the requested subject/action.
+Return ONLY one minified JSON object with exactly these keys:
+{{"match":true,"score":0.0,"reason":"short visual evidence"}}
+""".strip()
+    response = analyze_clip(video_url=video_url.strip(), prompt=prompt)
+    result = _parse_clip_qa_response(response, threshold)
+    if result is None:
+        logger.warning(
+            f"TwelveLabs clip QA returned an unusable result: query={visual_query!r}"
+        )
+        return None
+
+    logger.info(
+        "TwelveLabs clip QA: "
+        f"accepted={result['accepted']}, score={result['score']}, "
+        f"query={visual_query!r}, reason={result['reason']!r}"
+    )
+    return result

@@ -167,6 +167,48 @@ class TestScriptPromptOptions(unittest.TestCase):
         self.assertEqual(result, ["opening city", "middle office", "final sunset"])
         self.assertIn("chronological stock-video search terms", captured["prompt"])
         self.assertIn("same order as the script narration", captured["prompt"])
+        self.assertIn("concrete, camera-visible shot", captured["prompt"])
+        self.assertIn("return exactly 3 items", captured["prompt"])
+
+    def test_generate_ordered_terms_retries_wrong_timeline_count(self):
+        responses = iter(
+            [
+                '["opening city", "final sunset"]',
+                '["opening city", "middle office", "final sunset"]',
+            ]
+        )
+
+        with patch.object(
+            llm, "_generate_response", side_effect=lambda _: next(responses)
+        ):
+            result = llm.generate_terms(
+                video_subject="startup story",
+                video_script="First city. Then office. Finally sunset.",
+                amount=3,
+                match_script_order=True,
+            )
+
+        self.assertEqual(result, ["opening city", "middle office", "final sunset"])
+
+    def test_generate_ordered_terms_validates_count_after_regex_recovery(self):
+        responses = iter(
+            [
+                'Here are the terms: ["opening city", "final sunset"]',
+                'Result: ["opening city", "middle office", "final sunset"]',
+            ]
+        )
+
+        with patch.object(
+            llm, "_generate_response", side_effect=lambda _: next(responses)
+        ):
+            result = llm.generate_terms(
+                video_subject="startup story",
+                video_script="First city. Then office. Finally sunset.",
+                amount=3,
+                match_script_order=True,
+            )
+
+        self.assertEqual(result, ["opening city", "middle office", "final sunset"])
 
     def test_generate_terms_returns_empty_list_on_provider_error(self):
         """

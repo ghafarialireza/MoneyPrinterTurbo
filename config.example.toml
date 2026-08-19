@@ -75,6 +75,16 @@ twelvelabs_api_keys = []
 # Reorder search terms using Marengo before downloading materials. This option
 # is ignored when match_materials_to_script is enabled.
 twelvelabs_rerank_terms = false
+# Inspect each candidate against its exact timeline query with Pegasus. When
+# enabled, script-order mode rejects unrelated, sideways, or upside-down clips
+# before download. Candidate source videos must be at least 4 seconds long.
+twelvelabs_clip_qa = false
+# A clip is accepted only when Pegasus marks it as a match and its confidence
+# reaches this threshold. Keep this in the 0.0-1.0 range.
+twelvelabs_clip_qa_min_score = 0.70
+# Quality-first behavior: if Pegasus times out or returns malformed output, reject
+# that candidate instead of silently allowing an unverified clip.
+twelvelabs_clip_qa_fail_closed = true
 # Optional model overrides. Uncomment only when a different model is required.
 # twelvelabs_marengo_model = "marengo3.0"
 # twelvelabs_pegasus_model = "pegasus1.5"

@@ -341,6 +341,51 @@ def generate_terms(task_id, params, video_script):
     return video_terms
 
 
+def fit_script_order_terms_to_timeline(
+    params: VideoParams,
+    video_script: str,
+    video_terms: list[str],
+    audio_duration: float,
+) -> list[str]:
+    """Regenerate automatic ordered terms at one search query per clip slot.
+
+    The initial term generation happens before TTS, so it cannot know whether a
+    narration needs six clips or fourteen.  Once the real audio duration is
+    available, generate an exact chronological query for every visual slot.
+    User-authored terms remain authoritative and are distributed monotonically
+    by the material service instead of being replaced.
+    """
+    if not params.match_materials_to_script or params.video_terms:
+        return video_terms
+
+    required_clip_count = max(
+        1,
+        math.ceil(max(0.0, float(audio_duration)) / params.video_clip_duration),
+    )
+    if len(video_terms) == required_clip_count:
+        return video_terms
+
+    fitted_terms = llm.generate_terms(
+        video_subject=params.video_subject,
+        video_script=video_script,
+        amount=required_clip_count,
+        match_script_order=True,
+    )
+    if len(fitted_terms) != required_clip_count:
+        logger.warning(
+            "could not fit ordered video terms to timeline; use monotonic "
+            f"distribution of existing terms: required={required_clip_count}, "
+            f"received={len(fitted_terms)}"
+        )
+        return video_terms
+
+    logger.info(
+        "fitted ordered video terms to narration timeline: "
+        f"audio_duration={audio_duration}, clips={required_clip_count}"
+    )
+    return fitted_terms
+
+
 def save_script_data(task_id, video_script, video_terms, params):
     script_data = {
         "script": video_script,
@@ -672,7 +717,14 @@ def get_video_materials(
                 if params.match_materials_to_script
                 else params.video_concat_mode
             ),
-            audio_duration=audio_duration * params.video_count,
+            # Ordered outputs share one narration timeline. Multiplying by
+            # video_count downloads extra late-script clips that sequential
+            # composition never reaches and can distort the term allocation.
+            audio_duration=(
+                audio_duration
+                if params.match_materials_to_script
+                else audio_duration * params.video_count
+            ),
             max_clip_duration=params.video_clip_duration,
             match_script_order=params.match_materials_to_script,
         )
@@ -1263,6 +1315,16 @@ def _run_pipeline(
             "audio",
             "failed to prepare narration audio",
         )
+
+    fitted_video_terms = fit_script_order_terms_to_timeline(
+        params=params,
+        video_script=video_script,
+        video_terms=video_terms,
+        audio_duration=audio_duration,
+    )
+    if fitted_video_terms != video_terms:
+        video_terms = fitted_video_terms
+        save_script_data(task_id, video_script, video_terms, params)
 
     sm.state.update_task(task_id, state=const.TASK_STATE_PROCESSING, progress=30)
 
