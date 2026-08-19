@@ -117,13 +117,14 @@ class TestTwelveLabsService(unittest.TestCase):
     def test_analyze_clip_returns_model_text(self):
         config.app["twelvelabs_api_keys"] = ["tlk_test"]
 
-        # analyze_clip() lazily imports `twelvelabs.types.VideoContext_Url`.
+        # analyze_clip() lazily imports the V1.3 video and prompt types.
         # The SDK is an optional extra, so the deterministic unit test must pass
         # even without `uv sync --extra twelvelabs`. Inject lightweight stub
         # modules so the internal import resolves; the mocked _client below does
         # the rest. (When the real SDK *is* installed, these stubs are ignored.)
         stub_types = type(sys)("twelvelabs.types")
         stub_types.VideoContext_Url = lambda *, url: {"url": url}
+        stub_types.AnalyzePromptV2 = lambda *, input_text: {"input_text": input_text}
         stub_pkg = sys.modules.get("twelvelabs") or type(sys)("twelvelabs")
         with patch.dict(
             sys.modules, {"twelvelabs": stub_pkg, "twelvelabs.types": stub_types}
@@ -142,6 +143,10 @@ class TestTwelveLabsService(unittest.TestCase):
             )
 
         self.assertEqual(out, "A city skyline at dusk.")
+        self.assertEqual(
+            client.analyze.call_args.kwargs["prompt_v_2"],
+            {"input_text": "describe"},
+        )
         # max_tokens must be clamped to the Pegasus minimum (>=512)
         self.assertGreaterEqual(client.analyze.call_args.kwargs["max_tokens"], 512)
 

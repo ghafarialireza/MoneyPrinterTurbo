@@ -27,16 +27,25 @@ ENGLISH_FALLBACK_KEYS = frozenset(
         "AI Video Quote Summary",
         "AI Video Quote Summary Singular",
         "AI Video Scene Count",
+        "Advanced TwelveLabs Settings",
+        "Candidate Batch Size",
         "Confirm AI Video Charge",
         "Confirm AI Video Charge Help",
         "Confirm AI Video Charge Required",
         "Local LLM Script Generation",
+        "Enable Smart TwelveLabs Visual Matching",
+        "Fail Closed When TwelveLabs Is Unavailable",
         "llm_provider_label.shengsuanyun",
         "LoomLoom Poll Retry Pending",
         "LoomLoom Poll Retry Warning",
         "Resume LoomLoom Status Check",
         "LoomLoom Quote Summary Singular",
         "LoomLoom Video Terms Reuse Help",
+        "Maximum Candidates per Visual Slot",
+        "Maximum Concurrent Analyses",
+        "Minimum Accepted Score",
+        "Please Enter the TwelveLabs API Key",
+        "Preferred Maximum Source Duration",
         "Script Generation Method",
         "Script Generation Method Help",
         "Shengsuan Cloud AI Video",
@@ -47,8 +56,13 @@ ENGLISH_FALLBACK_KEYS = frozenset(
         "Shengsuan Cloud API Key Required",
         "Shengsuan Cloud API Key Reused",
         "Shengsuan Cloud Batch Script Generation",
+        "Smart TwelveLabs Visual Matching",
+        "Smart TwelveLabs Visual Matching Help",
         "Stop Tracking LoomLoom Run",
         "Stop Tracking LoomLoom Run Help",
+        "Strong Early Stop Score",
+        "TwelveLabs API Keys",
+        "TwelveLabs API Keys Help",
     }
 )
 FORMAT_PLACEHOLDER_PATTERN = re.compile(r"(?<!\{)\{([a-zA-Z_][a-zA-Z0-9_]*)\}(?!\})")
@@ -97,6 +111,34 @@ def _markdown_urls(value):
 
 
 class TestWebuiI18n(unittest.TestCase):
+    def test_twelvelabs_api_key_field_is_masked(self):
+        tree = ast.parse(WEBUI_MAIN.read_text(encoding="utf-8"))
+        matching_calls = []
+        for node in ast.walk(tree):
+            if not (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "st"
+                and node.func.attr == "text_input"
+                and node.args
+                and isinstance(node.args[0], ast.Call)
+                and isinstance(node.args[0].func, ast.Name)
+                and node.args[0].func.id == "tr"
+                and node.args[0].args
+                and isinstance(node.args[0].args[0], ast.Constant)
+                and node.args[0].args[0].value == "TwelveLabs API Keys"
+            ):
+                continue
+            matching_calls.append(node)
+
+        self.assertEqual(len(matching_calls), 1)
+        keyword_values = {
+            keyword.arg: keyword.value for keyword in matching_calls[0].keywords
+        }
+        self.assertIsInstance(keyword_values.get("type"), ast.Constant)
+        self.assertEqual(keyword_values["type"].value, "password")
+
     def test_saved_ui_language_takes_priority_over_browser_locale(self):
         language = utils.resolve_ui_language(
             saved_language="de",

@@ -800,7 +800,13 @@ class TestMaterialTlsVerification(unittest.TestCase):
             return f"/tmp/{video_url.rsplit('/', 1)[-1]}"
 
         with (
-            patch.dict(config.app, {"material_directory": ""}),
+            patch.dict(
+                config.app,
+                {
+                    "material_directory": "",
+                    "twelvelabs_clip_qa": False,
+                },
+            ),
             patch.object(material, "search_videos_pexels", side_effect=fake_search),
             patch.object(material, "save_video", side_effect=fake_save_video),
             patch.object(

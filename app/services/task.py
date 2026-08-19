@@ -414,7 +414,9 @@ def build_narration_slots(
 
     subtitle_items = subtitle.file_to_subtitles(subtitle_path)
     if not subtitle_items:
-        raise ValueError("missing narration timeline: subtitle SRT is empty or unavailable")
+        raise ValueError(
+            "missing narration timeline: subtitle SRT is empty or unavailable"
+        )
 
     narration_slots: list[NarrationSlot] = []
     previous_start = -1.0
@@ -474,8 +476,7 @@ def build_narration_slots(
         ]
         missing_preview = missing_lines[:3] or ["unmatched narration text"]
         raise ValueError(
-            "missing narration in subtitle timeline: "
-            + " | ".join(missing_preview)
+            "missing narration in subtitle timeline: " + " | ".join(missing_preview)
         )
 
     return narration_slots
@@ -511,9 +512,7 @@ def build_visual_slots(
 
         timing_sources = {slot.timing_source for slot in overlapping}
         timing_source = (
-            next(iter(timing_sources))
-            if len(timing_sources) == 1
-            else "estimated"
+            next(iter(timing_sources)) if len(timing_sources) == 1 else "estimated"
         )
         visual_slots.append(
             VisualSlot(
@@ -853,6 +852,7 @@ def get_video_materials(
     video_terms,
     audio_duration,
     loomloom_video_request: loomloom.LoomLoomConfirmedVideoRequest | None = None,
+    visual_slots: list[VisualSlot] | None = None,
 ):
     if params.video_source == "local":
         logger.info("\n\n## preprocess local materials")
@@ -952,6 +952,8 @@ def get_video_materials(
             ),
             max_clip_duration=params.video_clip_duration,
             match_script_order=params.match_materials_to_script,
+            visual_slots=visual_slots,
+            clip_speed=params.video_clip_speed,
         )
         if not downloaded_videos:
             _mark_task_failed(
@@ -1007,7 +1009,13 @@ def _record_loomloom_run_reference(
 
 
 def generate_final_videos(
-    task_id, params, downloaded_videos, audio_file, subtitle_path, audio_duration
+    task_id,
+    params,
+    downloaded_videos,
+    audio_file,
+    subtitle_path,
+    audio_duration,
+    source_ranges: list[tuple[float, float]] | None = None,
 ):
     final_video_paths = []
     combined_video_paths = []
@@ -1044,6 +1052,7 @@ def generate_final_videos(
             max_clip_duration=params.video_clip_duration,
             threads=params.n_threads,
             clip_speed=params.video_clip_speed,
+            source_ranges=source_ranges,
         )
 
         _progress += 50 / params.video_count / 2
@@ -1449,6 +1458,20 @@ def _run_pipeline(
     logger.info(f"start task: {task_id}, stop_at: {stop_at}")
     sm.state.update_task(task_id, state=const.TASK_STATE_PROCESSING, progress=5)
 
+    if (
+        stop_at in {"materials", "video"}
+        and params.video_source == "pexels"
+        and params.match_materials_to_script
+        and twelvelabs.visual_matching_requested()
+    ):
+        configuration_error = twelvelabs.validate_smart_visual_matching_configuration()
+        if configuration_error:
+            return _mark_task_failed(
+                task_id,
+                "preflight",
+                configuration_error,
+            )
+
     # 只有完整成片流程需要视频配乐供应商。尽早阻止缺少 Key 的完整任务，避免
     # 先消耗 LLM、TTS 和素材服务额度；中间产物接口仍可独立使用。
     video_music_provider = _VIDEO_MUSIC_PROVIDERS.get(params.bgm_type)
@@ -1509,6 +1532,7 @@ def _run_pipeline(
     ordered_timeline_enabled = (
         params.match_materials_to_script and params.video_source != "local"
     )
+    visual_slots: list[VisualSlot] | None = None
 
     # 2. Generate terms. Ordered matching must wait for the narration timeline;
     # the normal mode intentionally keeps its existing whole-script behavior.
@@ -1639,13 +1663,17 @@ def _run_pipeline(
     sm.state.update_task(task_id, state=const.TASK_STATE_PROCESSING, progress=40)
 
     # 5. Get video materials
-    downloaded_videos = get_video_materials(
-        task_id,
-        params,
-        video_terms,
-        material_audio_duration,
-        loomloom_video_request=loomloom_video_request,
-    )
+    try:
+        downloaded_videos = get_video_materials(
+            task_id,
+            params,
+            video_terms,
+            material_audio_duration,
+            loomloom_video_request=loomloom_video_request,
+            visual_slots=visual_slots,
+        )
+    except material.SmartMaterialSelectionError as exc:
+        return _mark_task_failed(task_id, "materials", str(exc))
     if not downloaded_videos:
         return _mark_task_failed(
             task_id,
@@ -1664,6 +1692,20 @@ def _run_pipeline(
 
     sm.state.update_task(task_id, state=const.TASK_STATE_PROCESSING, progress=50)
 
+    source_ranges: list[tuple[float, float]] | None = None
+    if (
+        params.video_source == "pexels"
+        and params.match_materials_to_script
+        and twelvelabs.visual_matching_requested()
+    ):
+        try:
+            source_ranges = material.load_selected_source_ranges(
+                task_id,
+                downloaded_videos,
+            )
+        except (OSError, ValueError) as exc:
+            return _mark_task_failed(task_id, "video", str(exc))
+
     # 仅完整视频生成流程才需要处理视频拼接模式；
     # 这样可以避免 /subtitle 和 /audio 这类请求访问不存在的字段。
     if type(params.video_concat_mode) is str:
@@ -1678,6 +1720,7 @@ def _run_pipeline(
             audio_file,
             subtitle_path,
             audio_duration,
+            source_ranges=source_ranges,
         )
     )
 

@@ -720,9 +720,7 @@ class TestTaskService(unittest.TestCase):
         self.assertEqual(source, "estimated")
 
     def test_timeline_artifact_contains_slot_text_queries_and_timing_quality(self):
-        narration_slots = [
-            NarrationSlot(1, 0.0, 3.0, 3.0, "Sentence A", "estimated")
-        ]
+        narration_slots = [NarrationSlot(1, 0.0, 3.0, 3.0, "Sentence A", "estimated")]
         visual_slots = [
             VisualSlot(
                 1,
@@ -1069,9 +1067,7 @@ class TestTaskService(unittest.TestCase):
             result = tm.start("non-ordered-terms", params, stop_at="terms")
 
         self.assertEqual(result["terms"], ["coffee beans"])
-        terms.assert_called_once_with(
-            "non-ordered-terms", params, params.video_script
-        )
+        terms.assert_called_once_with("non-ordered-terms", params, params.video_script)
         generate_audio.assert_not_called()
         slot_queries.assert_not_called()
 
@@ -1134,7 +1130,9 @@ class TestTaskService(unittest.TestCase):
             patch.object(tm, "generate_terms") as legacy_terms,
             patch.object(tm, "save_script_data"),
             patch.object(tm, "generate_audio", side_effect=fake_audio),
-            patch.object(tm, "generate_subtitle", side_effect=fake_subtitle) as subtitles,
+            patch.object(
+                tm, "generate_subtitle", side_effect=fake_subtitle
+            ) as subtitles,
             patch.object(tm.voice, "get_audio_duration", return_value=4.0),
             patch.object(tm, "build_narration_slots", side_effect=fake_narration),
             patch.object(tm, "build_visual_slots", side_effect=fake_visual),
@@ -1155,6 +1153,77 @@ class TestTaskService(unittest.TestCase):
         self.assertEqual(result["terms"], ["workers inspecting railway tracks"])
         legacy_terms.assert_not_called()
         self.assertTrue(subtitles.call_args.kwargs["force_timeline"])
+
+    def test_smart_material_failure_is_exposed_as_material_stage_error(self):
+        params = VideoParams(
+            video_subject="Railway",
+            video_script="Workers inspect railway tracks.",
+            subtitle_enabled=False,
+            match_materials_to_script=True,
+            video_clip_duration=4,
+        )
+        narration_slots = [
+            NarrationSlot(
+                1,
+                0.0,
+                4.0,
+                4.0,
+                "Workers inspect railway tracks",
+                "edge_tts_boundary",
+            )
+        ]
+        visual_slots = [
+            VisualSlot(
+                1,
+                0.0,
+                4.0,
+                4.0,
+                [1],
+                "Workers inspect railway tracks",
+                ["workers inspecting railway tracks"],
+                "edge_tts_boundary",
+                "boundary",
+            )
+        ]
+        state = MemoryState()
+
+        with (
+            patch.object(
+                tm.twelvelabs, "visual_matching_requested", return_value=False
+            ),
+            patch.object(tm, "generate_script", return_value=params.video_script),
+            patch.object(tm, "save_script_data"),
+            patch.object(
+                tm,
+                "generate_audio",
+                return_value=("audio.mp3", 4.0, object()),
+            ),
+            patch.object(tm, "generate_subtitle", return_value="subtitle.srt"),
+            patch.object(tm.voice, "get_audio_duration", return_value=4.0),
+            patch.object(tm, "build_narration_slots", return_value=narration_slots),
+            patch.object(tm, "build_visual_slots", return_value=visual_slots),
+            patch.object(
+                tm,
+                "generate_visual_slot_search_queries",
+                return_value=["workers inspecting railway tracks"],
+            ),
+            patch.object(tm, "persist_narration_timeline"),
+            patch.object(
+                tm,
+                "get_video_materials",
+                side_effect=tm.material.SmartMaterialSelectionError(
+                    "TwelveLabs quota is exhausted"
+                ),
+            ),
+            patch.object(tm.sm, "state", state),
+        ):
+            result = tm.start("smart-material-failure", params, stop_at="materials")
+
+        failed_task = state.get_task("smart-material-failure")
+        self.assertEqual(result, failed_task)
+        self.assertEqual(failed_task["state"], tm.const.TASK_STATE_FAILED)
+        self.assertEqual(failed_task["failed_stage"], "materials")
+        self.assertEqual(failed_task["error"], "TwelveLabs quota is exhausted")
 
     def test_start_returns_each_intermediate_result(self):
         """

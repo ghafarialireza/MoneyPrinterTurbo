@@ -41,7 +41,7 @@ dependencies = [
 # integration. Only needed when `twelvelabs_api_keys` is configured; install
 # with `uv sync --extra twelvelabs`.
 twelvelabs = [
-    "twelvelabs>=1.2.8",
+    "twelvelabs==1.3.0",
 ]
 
 [dependency-groups]

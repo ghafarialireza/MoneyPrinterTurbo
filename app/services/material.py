@@ -12,7 +12,7 @@ from loguru import logger
 from moviepy.video.io.VideoFileClip import VideoFileClip
 
 from app.config import config
-from app.models.schema import MaterialInfo, VideoAspect, VideoConcatMode
+from app.models.schema import MaterialInfo, VideoAspect, VideoConcatMode, VisualSlot
 from app.services import material_cache, task_artifacts
 from app.utils import utils
 
@@ -21,6 +21,10 @@ _api_key_counter = 0
 _api_key_lock = threading.Lock()
 _MIN_STOCK_RENDITION_SHORT_EDGE = 720
 _MIN_SEMANTIC_QA_DURATION = 4
+
+
+class SmartMaterialSelectionError(RuntimeError):
+    """A safe user-facing failure from opt-in smart material selection."""
 
 
 def _safe_public_url(value: Any) -> str | None:
@@ -132,6 +136,50 @@ def _material_source_record(item: MaterialInfo, local_path: str) -> dict[str, An
             semantic_qa["reason"] = reason[:240]
         if semantic_qa:
             record["semantic_qa"] = semantic_qa
+
+    slot_index = source.get("slot_index")
+    if isinstance(slot_index, int) and slot_index > 0:
+        record["slot_index"] = slot_index
+
+    if item.source_start_time is not None and item.source_end_time is not None:
+        try:
+            source_start = max(0.0, float(item.source_start_time))
+            source_end = min(float(item.duration), float(item.source_end_time))
+            if math.isfinite(source_start) and math.isfinite(source_end):
+                if source_end > source_start:
+                    record["source_start_time"] = round(source_start, 3)
+                    record["source_end_time"] = round(source_end, 3)
+        except (TypeError, ValueError):
+            pass
+
+    if isinstance(item.semantic_evaluation, dict):
+        evaluation = {}
+        for field in (
+            "provider",
+            "model",
+            "schema_version",
+            "accepted",
+            "match",
+            "required_action_visible",
+            "subject_clearly_visible",
+            "scores",
+            "overall_score",
+            "quality_flags",
+            "visible_summary",
+            "reason",
+            "analysis_input",
+        ):
+            if field in item.semantic_evaluation:
+                evaluation[field] = item.semantic_evaluation[field]
+        if evaluation:
+            record["semantic_evaluation"] = evaluation
+    if item.overall_score is not None:
+        try:
+            record["overall_score"] = round(
+                min(1.0, max(0.0, float(item.overall_score))), 4
+            )
+        except (TypeError, ValueError):
+            pass
     return record
 
 
@@ -163,6 +211,49 @@ def _persist_material_sources(
             "failed to persist material source records: "
             f"task_id={task_id}, error={type(exc).__name__}, detail={exc}"
         )
+
+
+def load_selected_source_ranges(
+    task_id: str,
+    video_paths: List[str],
+) -> list[tuple[float, float]]:
+    """Load the exact TwelveLabs-selected range for every downloaded winner."""
+    payload = task_artifacts.read_script_data(task_id)
+    records = payload.get("material_sources")
+    if not isinstance(records, list):
+        raise ValueError("smart material source ranges are missing from script.json")
+
+    records_by_file: dict[str, dict[str, Any]] = {}
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        local_file = str(record.get("local_file") or "").strip()
+        if not local_file or local_file in records_by_file:
+            raise ValueError("smart material source records are ambiguous")
+        records_by_file[local_file] = record
+
+    ranges: list[tuple[float, float]] = []
+    for video_path in video_paths:
+        record = records_by_file.get(Path(video_path).name)
+        if record is None:
+            raise ValueError("smart material source range is missing for a winner")
+        try:
+            start_time = float(record["source_start_time"])
+            end_time = float(record["source_end_time"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError("smart material source range is invalid") from exc
+        if (
+            not math.isfinite(start_time)
+            or not math.isfinite(end_time)
+            or start_time < 0
+            or end_time <= start_time
+        ):
+            raise ValueError("smart material source range is invalid")
+        ranges.append((start_time, end_time))
+
+    if len(ranges) != len(video_paths):
+        raise ValueError("smart material source range count does not match winners")
+    return ranges
 
 
 def _get_tls_verify() -> bool:
@@ -317,6 +408,62 @@ def _filter_materials_by_aspect(
         ):
             filtered_items.append(item)
     return filtered_items
+
+
+def _prepare_twelvelabs_candidates(
+    items: List[MaterialInfo],
+    *,
+    video_aspect: VideoAspect,
+    required_source_duration: float,
+    preferred_max_source_duration: float,
+) -> List[MaterialInfo]:
+    """Apply cheap metadata gates before any TwelveLabs call.
+
+    Short stock clips stay in the original Pexels order. Longer clips are not
+    discarded; they form a second bucket used only after the preferred bucket.
+    """
+    short_candidates: list[MaterialInfo] = []
+    long_candidates: list[MaterialInfo] = []
+    seen_asset_ids: set[str] = set()
+    seen_urls: set[str] = set()
+    aspect = VideoAspect(video_aspect)
+    minimum_duration = max(4.0, float(required_source_duration))
+
+    for item in items:
+        source = item.source_info if isinstance(item.source_info, dict) else {}
+        rendition = source.get("rendition")
+        rendition = rendition if isinstance(rendition, dict) else {}
+        asset_id = str(source.get("asset_id") or "").strip()
+        url = str(item.url or "").strip()
+        try:
+            duration = float(item.duration)
+            width = int(rendition.get("width") or 0)
+            height = int(rendition.get("height") or 0)
+            parsed = urlsplit(url)
+        except (TypeError, ValueError):
+            continue
+        if (
+            not asset_id
+            or not math.isfinite(duration)
+            or duration < minimum_duration
+            or parsed.scheme != "https"
+            or not parsed.hostname
+            or parsed.username is not None
+            or parsed.password is not None
+            or not parsed.path.lower().endswith(".mp4")
+            or not _matches_video_aspect(width, height, aspect)
+            or min(width, height) < _MIN_STOCK_RENDITION_SHORT_EDGE
+            or asset_id in seen_asset_ids
+            or url in seen_urls
+        ):
+            continue
+        seen_asset_ids.add(asset_id)
+        seen_urls.add(url)
+        if duration <= preferred_max_source_duration:
+            short_candidates.append(item)
+        else:
+            long_candidates.append(item)
+    return short_candidates + long_candidates
 
 
 def _select_best_video_rendition(
@@ -865,6 +1012,8 @@ def download_videos(
     audio_duration: float = 0.0,
     max_clip_duration: int = 5,
     match_script_order: bool = False,
+    visual_slots: list[VisualSlot] | None = None,
+    clip_speed: float = 1.0,
 ) -> List[str]:
     provider = "pexels"
     remote_search_videos = search_videos_pexels
@@ -903,6 +1052,8 @@ def download_videos(
             audio_duration=audio_duration,
             max_clip_duration=max_clip_duration,
             material_directory=material_directory,
+            visual_slots=visual_slots,
+            clip_speed=clip_speed,
         )
 
     valid_video_items = []
@@ -1010,6 +1161,186 @@ def _build_script_order_term_plan(
     ]
 
 
+def _download_videos_by_script_order_smart(
+    *,
+    task_id: str,
+    search_terms: List[str],
+    visual_slots: list[VisualSlot],
+    search_videos,
+    video_aspect: VideoAspect,
+    max_clip_duration: int,
+    material_directory: str,
+    clip_speed: float,
+    twelvelabs_service,
+) -> List[str]:
+    """Select one globally best Pegasus-scored candidate for every visual slot."""
+    if len(search_terms) != len(visual_slots):
+        logger.warning(
+            "smart ordered material matching requires one query per visual slot: "
+            f"queries={len(search_terms)}, slots={len(visual_slots)}"
+        )
+        return []
+
+    settings = twelvelabs_service.candidate_selection_settings()
+    normalized_speed = utils.normalize_clip_speed(clip_speed)
+    used_asset_ids: set[str] = set()
+    used_urls: set[str] = set()
+    video_paths: list[str] = []
+    material_sources: list[dict[str, Any]] = []
+    total_candidates_analyzed = 0
+    total_source_seconds_analyzed = 0.0
+    segmentation_calls = 0
+
+    for slot, search_query in zip(visual_slots, search_terms):
+        if not slot.narration_text.strip():
+            raise SmartMaterialSelectionError(
+                f"Visual slot {slot.index} has no narration requirement"
+            )
+        if not slot.search_queries or search_query not in slot.search_queries:
+            raise SmartMaterialSelectionError(
+                f"Visual slot {slot.index} has an inconsistent search query mapping"
+            )
+
+        required_source_duration = max(
+            0.001,
+            float(slot.duration) * normalized_speed,
+        )
+        video_items = search_videos(
+            search_term=search_query,
+            minimum_duration=math.ceil(max(4.0, required_source_duration)),
+            video_aspect=video_aspect,
+        )
+        prepared = _prepare_twelvelabs_candidates(
+            video_items,
+            video_aspect=video_aspect,
+            required_source_duration=required_source_duration,
+            preferred_max_source_duration=settings["preferred_max_source_duration"],
+        )
+        candidates = []
+        for item in prepared:
+            source = item.source_info if isinstance(item.source_info, dict) else {}
+            asset_id = str(source.get("asset_id") or "")
+            if asset_id in used_asset_ids or item.url in used_urls:
+                continue
+            candidates.append(item)
+
+        narration_preview = re.sub(r"\s+", " ", slot.narration_text).strip()[:160]
+        logger.info(
+            "smart visual slot candidates: "
+            f"slot={slot.index}, narration={narration_preview!r}, "
+            f"query={search_query!r}, after_cheap_filters={len(candidates)}"
+        )
+        if not candidates:
+            _persist_material_sources(task_id, material_sources)
+            raise SmartMaterialSelectionError(
+                f"No valid Pexels candidate remained for visual slot {slot.index} "
+                "after metadata quality filters"
+            )
+
+        winner, stats = twelvelabs_service.select_best_candidate(
+            candidates=candidates,
+            slot_index=slot.index,
+            slot_duration=slot.duration,
+            narration_text=slot.narration_text,
+            search_query=search_query,
+            batch_size=settings["batch_size"],
+            max_candidates=settings["max_candidates"],
+            minimum_score=settings["minimum_score"],
+            strong_early_stop_score=settings["strong_early_stop_score"],
+            concurrency=settings["concurrency"],
+        )
+        total_candidates_analyzed += int(stats["api_candidates_analyzed"])
+        total_source_seconds_analyzed += float(stats["source_seconds_analyzed"])
+
+        if winner is None and not settings["fail_closed"]:
+            winner = candidates[0]
+            logger.warning(
+                "no TwelveLabs candidate passed; using explicit fail-open legacy "
+                f"fallback for slot={slot.index}"
+            )
+        if winner is None:
+            _persist_material_sources(task_id, material_sources)
+            api_failure_reason = stats.get("api_failure_reason")
+            if api_failure_reason:
+                raise SmartMaterialSelectionError(
+                    f"Visual slot {slot.index} could not be analyzed: "
+                    f"{api_failure_reason}"
+                )
+            raise SmartMaterialSelectionError(
+                f"No TwelveLabs candidate satisfied narration for visual slot "
+                f"{slot.index}; cross-segment fallback was not used"
+            )
+
+        source = winner.source_info if isinstance(winner.source_info, dict) else {}
+        asset_id = str(source.get("asset_id") or "")
+        segmentation_calls += 1
+        segment = twelvelabs_service.segment_winner(
+            video_url=winner.url,
+            narration_text=slot.narration_text,
+            slot_duration=slot.duration,
+            source_duration=float(winner.duration),
+            clip_speed=normalized_speed,
+        )
+        if segment is None and settings["fail_closed"]:
+            _persist_material_sources(task_id, material_sources)
+            raise SmartMaterialSelectionError(
+                f"TwelveLabs could not identify a valid temporal segment for visual "
+                f"slot {slot.index}"
+            )
+        if segment is None:
+            segment = {
+                "source_start_time": 0.0,
+                "source_end_time": min(
+                    float(winner.duration), required_source_duration
+                ),
+                "description": "explicit fail-open zero-start fallback",
+            }
+            logger.warning(
+                "winner segmentation unavailable; using explicit fail-open source "
+                f"start for slot={slot.index}, asset_id={asset_id or 'unknown'}"
+            )
+
+        winner.source_start_time = float(segment["source_start_time"])
+        winner.source_end_time = float(segment["source_end_time"])
+        source = dict(source)
+        source["slot_index"] = slot.index
+        source["temporal_segment"] = dict(segment)
+        winner.source_info = source
+        logger.info(
+            "smart visual winner: "
+            f"slot={slot.index}, asset_id={asset_id or 'unknown'}, "
+            f"score={float(winner.overall_score or 0):.4f}, "
+            f"source_start={winner.source_start_time:.3f}, "
+            f"source_end={winner.source_end_time:.3f}"
+        )
+
+        saved_video_path = save_video(
+            video_url=winner.url,
+            save_dir=material_directory,
+            video_aspect=video_aspect,
+        )
+        if not saved_video_path:
+            _persist_material_sources(task_id, material_sources)
+            raise SmartMaterialSelectionError(
+                f"The selected Pexels winner for visual slot {slot.index} could not "
+                "be downloaded"
+            )
+        video_paths.append(saved_video_path)
+        material_sources.append(_material_source_record(winner, saved_video_path))
+        used_asset_ids.add(asset_id)
+        used_urls.add(winner.url)
+
+    logger.info(
+        "TwelveLabs smart selection usage: "
+        f"candidates_analyzed={total_candidates_analyzed}, "
+        f"source_seconds_analyzed={total_source_seconds_analyzed:.3f}, "
+        f"segmentation_calls={segmentation_calls}"
+    )
+    logger.success(f"downloaded {len(video_paths)} smart ordered videos")
+    _persist_material_sources(task_id, material_sources)
+    return video_paths
+
+
 def _download_videos_by_script_order(
     task_id: str,
     search_terms: List[str],
@@ -1018,6 +1349,8 @@ def _download_videos_by_script_order(
     audio_duration: float,
     max_clip_duration: int,
     material_directory: str,
+    visual_slots: list[VisualSlot] | None = None,
+    clip_speed: float = 1.0,
 ) -> List[str]:
     """
     按脚本文案顺序下载素材。
@@ -1034,6 +1367,19 @@ def _download_videos_by_script_order(
     # Imported lazily to avoid the module-level cycle: twelvelabs uses the API
     # key rotator defined in this module.
     from app.services import twelvelabs as twelvelabs_service
+
+    if visual_slots and twelvelabs_service.is_smart_visual_matching_enabled():
+        return _download_videos_by_script_order_smart(
+            task_id=task_id,
+            search_terms=search_terms,
+            visual_slots=visual_slots,
+            search_videos=search_videos,
+            video_aspect=video_aspect,
+            max_clip_duration=max_clip_duration,
+            material_directory=material_directory,
+            clip_speed=clip_speed,
+            twelvelabs_service=twelvelabs_service,
+        )
 
     semantic_qa_enabled = twelvelabs_service.is_clip_qa_enabled()
     minimum_candidate_duration = (
