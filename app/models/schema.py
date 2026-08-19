@@ -61,6 +61,42 @@ class MaterialInfo:
     source_info: Optional[dict[str, Any]] = None
 
 
+NarrationTimingSource = Literal[
+    "edge_tts_boundary",
+    "azure_tts_boundary",
+    "whisper",
+    "estimated",
+]
+NarrationTimingQuality = Literal[
+    "boundary",
+    "speech_recognition",
+    "estimated",
+]
+
+
+@pydantic.dataclasses.dataclass(config=_Config)
+class NarrationSlot:
+    index: int
+    start_time: float
+    end_time: float
+    duration: float
+    text: str
+    timing_source: NarrationTimingSource
+
+
+@pydantic.dataclasses.dataclass(config=_Config)
+class VisualSlot:
+    index: int
+    start_time: float
+    end_time: float
+    duration: float
+    narration_slot_indexes: List[int]
+    narration_text: str
+    search_queries: List[str]
+    timing_source: NarrationTimingSource
+    timing_quality: NarrationTimingQuality
+
+
 class VideoParams(BaseModel):
     """
     {

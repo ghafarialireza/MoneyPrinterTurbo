@@ -12,7 +12,7 @@ from uuid import uuid4
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from app.services import task as tm
-from app.models.schema import MaterialInfo, VideoParams
+from app.models.schema import MaterialInfo, NarrationSlot, VideoParams, VisualSlot
 from app.services.state import MemoryState, RedisState
 from app.utils import utils
 
@@ -582,48 +582,174 @@ class TestTaskService(unittest.TestCase):
             match_script_order=True,
         )
 
-    def test_fit_script_order_terms_uses_real_audio_timeline(self):
-        params = VideoParams(
-            video_subject="railway ballast",
-            match_materials_to_script=True,
-            video_clip_duration=3,
+    def test_valid_srt_builds_typed_narration_slots(self):
+        srt = (
+            "1\n00:00:00,000 --> 00:00:02,800\nSentence A\n\n"
+            "2\n00:00:02,800 --> 00:00:06,500\nSentence B\n\n"
         )
-        fitted = [f"railway shot {index}" for index in range(14)]
-
-        with patch.object(tm.llm, "generate_terms", return_value=fitted) as generate:
-            result = tm.fit_script_order_terms_to_timeline(
-                params=params,
-                video_script="A forty-second railway explanation.",
-                video_terms=["opening train", "railway rocks"],
-                audio_duration=40,
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            subtitle_path = Path(tmp_dir) / "subtitle.srt"
+            subtitle_path.write_text(srt, encoding="utf-8")
+            slots = tm.build_narration_slots(
+                subtitle_path=str(subtitle_path),
+                audio_duration=6.5,
+                timing_source="edge_tts_boundary",
+                expected_script="Sentence A. Sentence B.",
             )
 
-        self.assertEqual(result, fitted)
-        generate.assert_called_once_with(
-            video_subject="railway ballast",
-            video_script="A forty-second railway explanation.",
-            amount=14,
-            match_script_order=True,
+        self.assertEqual(len(slots), 2)
+        self.assertIsInstance(slots[0], NarrationSlot)
+        self.assertEqual(slots[0].index, 1)
+        self.assertEqual(slots[0].start_time, 0.0)
+        self.assertEqual(slots[0].end_time, 2.8)
+        self.assertEqual(slots[0].duration, 2.8)
+        self.assertEqual(slots[0].text, "Sentence A")
+        self.assertEqual(slots[0].timing_source, "edge_tts_boundary")
+
+    def test_narration_slots_reject_zero_range_and_missing_narration(self):
+        invalid_cases = {
+            "zero range": (
+                "1\n00:00:00,000 --> 00:00:00,000\nSentence A\n\n",
+                "Sentence A.",
+                "end_time > start_time",
+            ),
+            "missing narration": (
+                "1\n00:00:00,000 --> 00:00:01,000\nSentence A\n\n",
+                "Sentence A. Sentence B.",
+                "missing narration",
+            ),
+            "empty text": (
+                "1\n00:00:00,000 --> 00:00:01,000\n\n",
+                "",
+                "empty text|empty or unavailable",
+            ),
+            "after audio": (
+                "1\n00:00:00,000 --> 00:00:03,000\nSentence A\n\n",
+                "Sentence A.",
+                "ends after the audio duration",
+            ),
+            "not ascending": (
+                "1\n00:00:01,000 --> 00:00:02,000\nSentence A\n\n"
+                "2\n00:00:00,500 --> 00:00:03,000\nSentence B\n\n",
+                "Sentence A. Sentence B.",
+                "not ascending",
+            ),
+        }
+        for name, (srt, script, error_text) in invalid_cases.items():
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as tmp_dir:
+                subtitle_path = Path(tmp_dir) / "subtitle.srt"
+                subtitle_path.write_text(srt, encoding="utf-8")
+                with self.assertRaisesRegex(ValueError, error_text):
+                    tm.build_narration_slots(
+                        subtitle_path=str(subtitle_path),
+                        audio_duration=2.0,
+                        timing_source="estimated",
+                        expected_script=script,
+                    )
+
+    def test_visual_slots_include_overlapping_narration_and_short_last_slot(self):
+        narration_slots = [
+            NarrationSlot(1, 0.0, 2.8, 2.8, "Sentence A", "whisper"),
+            NarrationSlot(2, 2.8, 6.5, 3.7, "Sentence B", "whisper"),
+            NarrationSlot(3, 6.5, 10.1, 3.6, "Sentence C", "whisper"),
+        ]
+
+        visual_slots = tm.build_visual_slots(
+            narration_slots=narration_slots,
+            audio_duration=10.1,
+            video_clip_duration=4,
         )
 
-    def test_fit_script_order_terms_preserves_user_terms(self):
+        self.assertEqual(len(visual_slots), 3)
+        self.assertIsInstance(visual_slots[0], VisualSlot)
+        self.assertEqual(visual_slots[0].narration_slot_indexes, [1, 2])
+        self.assertEqual(visual_slots[0].narration_text, "Sentence A Sentence B")
+        self.assertEqual(visual_slots[1].narration_slot_indexes, [2, 3])
+        self.assertEqual(visual_slots[2].start_time, 8.0)
+        self.assertEqual(visual_slots[2].end_time, 10.1)
+        self.assertAlmostEqual(visual_slots[2].duration, 2.1)
+        self.assertEqual(visual_slots[0].timing_quality, "speech_recognition")
+
+    def test_visual_slot_queries_stay_attached_to_their_indexes(self):
+        narration_slots = [
+            NarrationSlot(
+                index=index,
+                start_time=(index - 1) * 4,
+                end_time=index * 4,
+                duration=4,
+                text=f"Narration for slot {index}",
+                timing_source="edge_tts_boundary",
+            )
+            for index in range(1, 6)
+        ]
+        visual_slots = tm.build_visual_slots(narration_slots, 20, 4)
+        returned_queries = {
+            index: [f"visible query {index}"] for index in reversed(range(1, 6))
+        }
         params = VideoParams(
-            video_subject="railway ballast",
-            video_terms=["custom opening", "custom ending"],
+            video_subject="railway repair",
             match_materials_to_script=True,
-            video_clip_duration=3,
+            video_terms=["stale whole-script keyword"],
         )
 
-        with patch.object(tm.llm, "generate_terms") as generate:
-            result = tm.fit_script_order_terms_to_timeline(
-                params=params,
-                video_script="A forty-second railway explanation.",
-                video_terms=["custom opening", "custom ending"],
-                audio_duration=40,
+        with patch.object(
+            tm.llm,
+            "generate_visual_slot_queries",
+            return_value=returned_queries,
+        ) as generate:
+            terms = tm.generate_visual_slot_search_queries(params, visual_slots)
+
+        self.assertEqual(terms, [f"visible query {index}" for index in range(1, 6)])
+        self.assertEqual(visual_slots[4].search_queries, ["visible query 5"])
+        sent_slots = generate.call_args.kwargs["visual_slots"]
+        self.assertEqual(sent_slots[4]["slot_index"], 5)
+        self.assertEqual(sent_slots[4]["narration_text"], "Narration for slot 5")
+
+    def test_estimated_tts_timing_is_explicitly_marked_estimated(self):
+        params = VideoParams(
+            video_subject="test",
+            voice_name="gemini:Zephyr-Female",
+        )
+        with patch.object(
+            tm.config,
+            "app",
+            dict(tm.config.app, subtitle_provider="edge"),
+        ):
+            source = tm.resolve_narration_timing_source(params, object())
+
+        self.assertEqual(source, "estimated")
+
+    def test_timeline_artifact_contains_slot_text_queries_and_timing_quality(self):
+        narration_slots = [
+            NarrationSlot(1, 0.0, 3.0, 3.0, "Sentence A", "estimated")
+        ]
+        visual_slots = [
+            VisualSlot(
+                1,
+                0.0,
+                3.0,
+                3.0,
+                [1],
+                "Sentence A",
+                ["visible subject action"],
+                "estimated",
+                "estimated",
+            )
+        ]
+
+        with patch.object(tm.task_artifacts, "patch_script_data") as persist:
+            tm.persist_narration_timeline(
+                task_id="timeline-artifact",
+                narration_slots=narration_slots,
+                visual_slots=visual_slots,
+                video_terms=["visible subject action"],
             )
 
-        self.assertEqual(result, ["custom opening", "custom ending"])
-        generate.assert_not_called()
+        saved_visual = persist.call_args.kwargs["visual_slots"][0]
+        self.assertEqual(saved_visual["narration_text"], "Sentence A")
+        self.assertEqual(saved_visual["search_queries"], ["visible subject action"])
+        self.assertEqual(saved_visual["timing_source"], "estimated")
+        self.assertEqual(saved_visual["timing_quality"], "estimated")
 
     def test_start_stops_before_materials_when_term_provider_fails(self):
         """
@@ -839,6 +965,50 @@ class TestTaskService(unittest.TestCase):
         create_subtitle.assert_not_called()
         whisper_create.assert_not_called()
 
+    def test_ordered_matching_builds_internal_timeline_when_subtitles_are_hidden(self):
+        task_id = "test-hidden-subtitle-timeline"
+        task_dir = utils.task_dir(task_id)
+        params = VideoParams(
+            video_subject="hidden subtitles",
+            video_script="Sentence A.",
+            subtitle_enabled=False,
+            match_materials_to_script=True,
+        )
+        sub_maker = object()
+
+        def fake_create_subtitle(text, sub_maker, subtitle_file):
+            Path(subtitle_file).write_text(
+                "1\n00:00:00,000 --> 00:00:01,000\nSentence A\n\n",
+                encoding="utf-8",
+            )
+
+        try:
+            with (
+                patch.object(
+                    tm.config,
+                    "app",
+                    dict(tm.config.app, subtitle_provider="edge"),
+                ),
+                patch.object(
+                    tm.voice,
+                    "create_subtitle",
+                    side_effect=fake_create_subtitle,
+                ) as create_subtitle,
+            ):
+                subtitle_path = tm.generate_subtitle(
+                    task_id=task_id,
+                    params=params,
+                    video_script="Sentence A.",
+                    sub_maker=sub_maker,
+                    audio_file="audio.mp3",
+                    force_timeline=params.match_materials_to_script,
+                )
+        finally:
+            shutil.rmtree(task_dir, ignore_errors=True)
+
+        self.assertTrue(subtitle_path.endswith("subtitle.srt"))
+        create_subtitle.assert_called_once()
+
     def test_generate_subtitle_does_not_fallback_to_whisper_when_edge_fails(self):
         """
         Edge 没有生成字幕文件时应保留无字幕结果，不能自动下载 Whisper 模型。
@@ -880,6 +1050,111 @@ class TestTaskService(unittest.TestCase):
         create_subtitle.assert_called_once()
         whisper_create.assert_not_called()
         whisper_correct.assert_not_called()
+
+    def test_non_ordered_terms_path_keeps_existing_behavior(self):
+        params = VideoParams(
+            video_subject="Coffee",
+            video_script="Coffee beans are roasted.",
+            match_materials_to_script=False,
+        )
+
+        with (
+            patch.object(tm, "generate_script", return_value=params.video_script),
+            patch.object(tm, "generate_terms", return_value=["coffee beans"]) as terms,
+            patch.object(tm, "save_script_data"),
+            patch.object(tm, "generate_audio") as generate_audio,
+            patch.object(tm.llm, "generate_visual_slot_queries") as slot_queries,
+            patch.object(tm.sm.state, "update_task"),
+        ):
+            result = tm.start("non-ordered-terms", params, stop_at="terms")
+
+        self.assertEqual(result["terms"], ["coffee beans"])
+        terms.assert_called_once_with(
+            "non-ordered-terms", params, params.video_script
+        )
+        generate_audio.assert_not_called()
+        slot_queries.assert_not_called()
+
+    def test_ordered_pipeline_generates_queries_after_internal_timeline(self):
+        params = VideoParams(
+            video_subject="Railway",
+            video_script="Workers inspect railway tracks.",
+            subtitle_enabled=False,
+            match_materials_to_script=True,
+            video_clip_duration=4,
+        )
+        narration_slots = [
+            NarrationSlot(
+                1,
+                0.0,
+                4.0,
+                4.0,
+                "Workers inspect railway tracks",
+                "edge_tts_boundary",
+            )
+        ]
+        visual_slots = [
+            VisualSlot(
+                1,
+                0.0,
+                4.0,
+                4.0,
+                [1],
+                "Workers inspect railway tracks",
+                [],
+                "edge_tts_boundary",
+                "boundary",
+            )
+        ]
+        events = []
+
+        def fake_audio(*args, **kwargs):
+            events.append("audio")
+            return "audio.mp3", 4, object()
+
+        def fake_subtitle(*args, **kwargs):
+            events.append("subtitle")
+            return "subtitle.srt"
+
+        def fake_narration(*args, **kwargs):
+            events.append("narration_slots")
+            return narration_slots
+
+        def fake_visual(*args, **kwargs):
+            events.append("visual_slots")
+            return visual_slots
+
+        def fake_queries(*args, **kwargs):
+            events.append("slot_queries")
+            visual_slots[0].search_queries = ["workers inspecting railway tracks"]
+            return ["workers inspecting railway tracks"]
+
+        with (
+            patch.object(tm, "generate_script", return_value=params.video_script),
+            patch.object(tm, "generate_terms") as legacy_terms,
+            patch.object(tm, "save_script_data"),
+            patch.object(tm, "generate_audio", side_effect=fake_audio),
+            patch.object(tm, "generate_subtitle", side_effect=fake_subtitle) as subtitles,
+            patch.object(tm.voice, "get_audio_duration", return_value=4.0),
+            patch.object(tm, "build_narration_slots", side_effect=fake_narration),
+            patch.object(tm, "build_visual_slots", side_effect=fake_visual),
+            patch.object(
+                tm,
+                "generate_visual_slot_search_queries",
+                side_effect=fake_queries,
+            ),
+            patch.object(tm, "persist_narration_timeline"),
+            patch.object(tm.sm.state, "update_task"),
+        ):
+            result = tm.start("ordered-timeline", params, stop_at="terms")
+
+        self.assertEqual(
+            events,
+            ["audio", "subtitle", "narration_slots", "visual_slots", "slot_queries"],
+        )
+        self.assertEqual(result["terms"], ["workers inspecting railway tracks"])
+        legacy_terms.assert_not_called()
+        self.assertTrue(subtitles.call_args.kwargs["force_timeline"])
 
     def test_start_returns_each_intermediate_result(self):
         """

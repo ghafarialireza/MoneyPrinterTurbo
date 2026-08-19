@@ -13,7 +13,14 @@ from loguru import logger
 
 from app.config import config
 from app.models import const
-from app.models.schema import VideoConcatMode, VideoParams
+from app.models.schema import (
+    NarrationSlot,
+    NarrationTimingQuality,
+    NarrationTimingSource,
+    VideoConcatMode,
+    VideoParams,
+    VisualSlot,
+)
 from app.services import bgm as bgm_service
 from app.services import (
     elevenlabs_music,
@@ -341,49 +348,254 @@ def generate_terms(task_id, params, video_script):
     return video_terms
 
 
-def fit_script_order_terms_to_timeline(
+def resolve_narration_timing_source(
     params: VideoParams,
-    video_script: str,
-    video_terms: list[str],
-    audio_duration: float,
-) -> list[str]:
-    """Regenerate automatic ordered terms at one search query per clip slot.
+    sub_maker,
+) -> NarrationTimingSource:
+    """Describe where subtitle timing came from without overstating estimates."""
+    subtitle_provider = config.app.get("subtitle_provider", "edge").strip().lower()
+    if subtitle_provider == "whisper":
+        return "whisper"
 
-    The initial term generation happens before TTS, so it cannot know whether a
-    narration needs six clips or fourteen.  Once the real audio duration is
-    available, generate an exact chronological query for every visual slot.
-    User-authored terms remain authoritative and are distributed monotonically
-    by the material service instead of being replaced.
-    """
-    if not params.match_materials_to_script or params.video_terms:
-        return video_terms
+    voice_name = voice.parse_voice_name(params.voice_name or "")
+    if sub_maker is not None and voice.is_azure_v2_voice(voice_name):
+        return "azure_tts_boundary"
 
-    required_clip_count = max(
-        1,
-        math.ceil(max(0.0, float(audio_duration)) / params.video_clip_duration),
-    )
-    if len(video_terms) == required_clip_count:
-        return video_terms
-
-    fitted_terms = llm.generate_terms(
-        video_subject=params.video_subject,
-        video_script=video_script,
-        amount=required_clip_count,
-        match_script_order=True,
-    )
-    if len(fitted_terms) != required_clip_count:
-        logger.warning(
-            "could not fit ordered video terms to timeline; use monotonic "
-            f"distribution of existing terms: required={required_clip_count}, "
-            f"received={len(fitted_terms)}"
+    estimated_voice = any(
+        (
+            voice.is_siliconflow_voice(voice_name),
+            voice.is_gemini_voice(voice_name),
+            voice.is_mimo_voice(voice_name),
+            voice.is_minimax_voice(voice_name),
+            voice.is_elevenlabs_voice(voice_name),
+            voice.is_chatterbox_voice(voice_name),
+            voice.is_no_voice(voice_name),
         )
-        return video_terms
-
-    logger.info(
-        "fitted ordered video terms to narration timeline: "
-        f"audio_duration={audio_duration}, clips={required_clip_count}"
     )
-    return fitted_terms
+    if sub_maker is None or estimated_voice:
+        return "estimated"
+    return "edge_tts_boundary"
+
+
+def _timing_quality(
+    timing_source: NarrationTimingSource,
+) -> NarrationTimingQuality:
+    if timing_source in {"edge_tts_boundary", "azure_tts_boundary"}:
+        return "boundary"
+    if timing_source == "whisper":
+        return "speech_recognition"
+    return "estimated"
+
+
+def _parse_srt_timestamp(value: str) -> float:
+    match = re.fullmatch(r"(\d+):(\d{2}):(\d{2}),(\d{3})", value.strip())
+    if not match:
+        raise ValueError(f"invalid SRT timestamp: {value!r}")
+    hours, minutes, seconds, milliseconds = (int(part) for part in match.groups())
+    if minutes >= 60 or seconds >= 60:
+        raise ValueError(f"invalid SRT timestamp: {value!r}")
+    return hours * 3600 + minutes * 60 + seconds + milliseconds / 1000
+
+
+def _normalize_narration_text(value: str) -> str:
+    normalized = utils.normalize_script_for_subtitle_matching(value or "")
+    return re.sub(r"[_\W]+", "", normalized, flags=re.UNICODE).casefold()
+
+
+def build_narration_slots(
+    subtitle_path: str,
+    audio_duration: float,
+    timing_source: NarrationTimingSource,
+    expected_script: str = "",
+) -> list[NarrationSlot]:
+    """Parse and validate the existing SRT as the canonical narration timeline."""
+    if not math.isfinite(audio_duration) or audio_duration <= 0:
+        raise ValueError("narration timeline requires a positive audio duration")
+
+    subtitle_items = subtitle.file_to_subtitles(subtitle_path)
+    if not subtitle_items:
+        raise ValueError("missing narration timeline: subtitle SRT is empty or unavailable")
+
+    narration_slots: list[NarrationSlot] = []
+    previous_start = -1.0
+    previous_end = -1.0
+    for slot_index, (_, timestamp_line, raw_text) in enumerate(subtitle_items, start=1):
+        timestamp_parts = timestamp_line.split(" --> ")
+        if len(timestamp_parts) != 2:
+            raise ValueError(
+                f"narration slot {slot_index} has an invalid timestamp range"
+            )
+        start_time = _parse_srt_timestamp(timestamp_parts[0])
+        end_time = _parse_srt_timestamp(timestamp_parts[1])
+        text = " ".join(str(raw_text or "").split())
+
+        if not text:
+            raise ValueError(f"narration slot {slot_index} has empty text")
+        if end_time <= start_time:
+            raise ValueError(
+                f"narration slot {slot_index} must have end_time > start_time"
+            )
+        if start_time < previous_start or end_time < previous_end:
+            raise ValueError(
+                f"narration slot {slot_index} timestamps are not ascending"
+            )
+        if end_time > audio_duration + 0.001:
+            raise ValueError(
+                f"narration slot {slot_index} ends after the audio duration: "
+                f"end={end_time:.3f}, audio={audio_duration:.3f}"
+            )
+
+        narration_slots.append(
+            NarrationSlot(
+                index=slot_index,
+                start_time=start_time,
+                end_time=end_time,
+                duration=end_time - start_time,
+                text=text,
+                timing_source=timing_source,
+            )
+        )
+        previous_start = start_time
+        previous_end = end_time
+
+    expected_text = _normalize_narration_text(expected_script)
+    actual_text = "".join(
+        _normalize_narration_text(slot.text) for slot in narration_slots
+    )
+    if expected_text and actual_text != expected_text:
+        expected_lines = utils.split_string_by_punctuations(
+            utils.normalize_script_for_subtitle_matching(expected_script)
+        )
+        missing_lines = [
+            line.strip()
+            for line in expected_lines
+            if _normalize_narration_text(line)
+            and _normalize_narration_text(line) not in actual_text
+        ]
+        missing_preview = missing_lines[:3] or ["unmatched narration text"]
+        raise ValueError(
+            "missing narration in subtitle timeline: "
+            + " | ".join(missing_preview)
+        )
+
+    return narration_slots
+
+
+def build_visual_slots(
+    narration_slots: list[NarrationSlot],
+    audio_duration: float,
+    video_clip_duration: float,
+) -> list[VisualSlot]:
+    """Project narration onto the renderer's existing fixed-duration timeline."""
+    if not narration_slots:
+        raise ValueError("visual timeline requires narration slots")
+    if not math.isfinite(audio_duration) or audio_duration <= 0:
+        raise ValueError("visual timeline requires a positive audio duration")
+    if not math.isfinite(video_clip_duration) or video_clip_duration <= 0:
+        raise ValueError("visual timeline requires a positive clip duration")
+
+    visual_slots: list[VisualSlot] = []
+    slot_count = math.ceil(audio_duration / video_clip_duration)
+    for zero_based_index in range(slot_count):
+        start_time = zero_based_index * video_clip_duration
+        end_time = min(start_time + video_clip_duration, audio_duration)
+        overlapping = [
+            narration
+            for narration in narration_slots
+            if narration.start_time < end_time and narration.end_time > start_time
+        ]
+        if not overlapping:
+            raise ValueError(
+                f"visual slot {zero_based_index + 1} has no overlapping narration"
+            )
+
+        timing_sources = {slot.timing_source for slot in overlapping}
+        timing_source = (
+            next(iter(timing_sources))
+            if len(timing_sources) == 1
+            else "estimated"
+        )
+        visual_slots.append(
+            VisualSlot(
+                index=zero_based_index + 1,
+                start_time=start_time,
+                end_time=end_time,
+                duration=end_time - start_time,
+                narration_slot_indexes=[slot.index for slot in overlapping],
+                narration_text=" ".join(slot.text for slot in overlapping),
+                search_queries=[],
+                timing_source=timing_source,
+                timing_quality=_timing_quality(timing_source),
+            )
+        )
+    return visual_slots
+
+
+def generate_visual_slot_search_queries(
+    params: VideoParams,
+    visual_slots: list[VisualSlot],
+) -> list[str]:
+    """Attach one indexed query to every visual slot and return legacy flat terms."""
+    slot_payload = [
+        {
+            "slot_index": slot.index,
+            "start_time": slot.start_time,
+            "end_time": slot.end_time,
+            "narration_text": slot.narration_text,
+        }
+        for slot in visual_slots
+    ]
+    queries_by_slot = llm.generate_visual_slot_queries(
+        video_subject=params.video_subject,
+        visual_slots=slot_payload,
+        queries_per_slot=1,
+    )
+
+    for slot in visual_slots:
+        queries = queries_by_slot.get(slot.index, [])
+        if not queries:
+            raise ValueError(f"visual slot {slot.index} has no search query")
+        slot.search_queries = list(queries)
+    return [slot.search_queries[0] for slot in visual_slots]
+
+
+def persist_narration_timeline(
+    task_id: str,
+    narration_slots: list[NarrationSlot],
+    visual_slots: list[VisualSlot],
+    video_terms: list[str],
+) -> None:
+    narration_records = [
+        {
+            "index": slot.index,
+            "start_time": slot.start_time,
+            "end_time": slot.end_time,
+            "duration": slot.duration,
+            "text": slot.text,
+            "timing_source": slot.timing_source,
+        }
+        for slot in narration_slots
+    ]
+    visual_records = [
+        {
+            "index": slot.index,
+            "start_time": slot.start_time,
+            "end_time": slot.end_time,
+            "duration": slot.duration,
+            "narration_slot_indexes": slot.narration_slot_indexes,
+            "narration_text": slot.narration_text,
+            "search_queries": slot.search_queries,
+            "timing_source": slot.timing_source,
+            "timing_quality": slot.timing_quality,
+        }
+        for slot in visual_slots
+    ]
+    task_artifacts.patch_script_data(
+        task_id,
+        search_terms=video_terms,
+        narration_slots=narration_records,
+        visual_slots=visual_records,
+    )
 
 
 def save_script_data(task_id, video_script, video_terms, params):
@@ -564,17 +776,30 @@ def generate_audio(task_id, params, video_script, voice_preview=None):
         return custom_audio_file, audio_duration, None
 
 
-def generate_subtitle(task_id, params, video_script, sub_maker, audio_file):
+def generate_subtitle(
+    task_id,
+    params,
+    video_script,
+    sub_maker,
+    audio_file,
+    force_timeline: bool = False,
+):
     """
     Generate subtitle for the video script.
-    If subtitle generation is disabled or no subtitle maker is provided, it will return an empty string.
-    Otherwise, it will generate the subtitle using the specified provider.
+    If subtitle display is disabled, ordered matching can still force creation of
+    an internal SRT timeline. Without a subtitle maker, only Whisper can create it.
     Returns:
         - subtitle_path: path to the generated subtitle file
     """
     logger.info("\n\n## generating subtitle")
-    if not params.subtitle_enabled:
+    if not params.subtitle_enabled and not force_timeline:
         return ""
+
+    if force_timeline and not params.subtitle_enabled:
+        logger.info(
+            "subtitle display is disabled; generating internal narration timeline "
+            "for ordered material matching"
+        )
 
     subtitle_path = path.join(utils.task_dir(task_id), "subtitle.srt")
     subtitle_provider = config.app.get("subtitle_provider", "edge").strip().lower()
@@ -1281,9 +1506,14 @@ def _run_pipeline(
         )
         return {"script": video_script}
 
-    # 2. Generate terms
-    video_terms = ""
-    if params.video_source != "local":
+    ordered_timeline_enabled = (
+        params.match_materials_to_script and params.video_source != "local"
+    )
+
+    # 2. Generate terms. Ordered matching must wait for the narration timeline;
+    # the normal mode intentionally keeps its existing whole-script behavior.
+    video_terms = []
+    if params.video_source != "local" and not ordered_timeline_enabled:
         video_terms = generate_terms(task_id, params, video_script)
         if not video_terms:
             return _mark_task_failed(
@@ -1294,7 +1524,7 @@ def _run_pipeline(
 
     save_script_data(task_id, video_script, video_terms, params)
 
-    if stop_at == "terms":
+    if stop_at == "terms" and not ordered_timeline_enabled:
         sm.state.update_task(
             task_id, state=const.TASK_STATE_COMPLETE, progress=100, terms=video_terms
         )
@@ -1316,16 +1546,6 @@ def _run_pipeline(
             "failed to prepare narration audio",
         )
 
-    fitted_video_terms = fit_script_order_terms_to_timeline(
-        params=params,
-        video_script=video_script,
-        video_terms=video_terms,
-        audio_duration=audio_duration,
-    )
-    if fitted_video_terms != video_terms:
-        video_terms = fitted_video_terms
-        save_script_data(task_id, video_script, video_terms, params)
-
     sm.state.update_task(task_id, state=const.TASK_STATE_PROCESSING, progress=30)
 
     if stop_at == "audio":
@@ -1339,8 +1559,73 @@ def _run_pipeline(
 
     # 4. Generate subtitle
     subtitle_path = generate_subtitle(
-        task_id, params, video_script, sub_maker, audio_file
+        task_id,
+        params,
+        video_script,
+        sub_maker,
+        audio_file,
+        force_timeline=ordered_timeline_enabled,
     )
+
+    material_audio_duration = audio_duration
+    if ordered_timeline_enabled:
+        if not subtitle_path:
+            return _mark_task_failed(
+                task_id,
+                "narration_timeline",
+                "ordered material matching requires a valid narration subtitle timeline",
+            )
+
+        exact_audio_duration = voice.get_audio_duration(audio_file)
+        if not math.isfinite(exact_audio_duration) or exact_audio_duration <= 0:
+            exact_audio_duration = float(audio_duration)
+        material_audio_duration = exact_audio_duration
+        timing_source = resolve_narration_timing_source(params, sub_maker)
+        try:
+            narration_slots = build_narration_slots(
+                subtitle_path=subtitle_path,
+                audio_duration=exact_audio_duration,
+                timing_source=timing_source,
+                expected_script=video_script,
+            )
+            visual_slots = build_visual_slots(
+                narration_slots=narration_slots,
+                audio_duration=exact_audio_duration,
+                video_clip_duration=params.video_clip_duration,
+            )
+        except ValueError as exc:
+            return _mark_task_failed(task_id, "narration_timeline", str(exc))
+
+        if stop_at == "subtitle":
+            persist_narration_timeline(
+                task_id=task_id,
+                narration_slots=narration_slots,
+                visual_slots=visual_slots,
+                video_terms=[],
+            )
+        else:
+            try:
+                video_terms = generate_visual_slot_search_queries(
+                    params=params,
+                    visual_slots=visual_slots,
+                )
+            except ValueError as exc:
+                return _mark_task_failed(task_id, "terms", str(exc))
+            persist_narration_timeline(
+                task_id=task_id,
+                narration_slots=narration_slots,
+                visual_slots=visual_slots,
+                video_terms=video_terms,
+            )
+
+        if stop_at == "terms":
+            sm.state.update_task(
+                task_id,
+                state=const.TASK_STATE_COMPLETE,
+                progress=100,
+                terms=video_terms,
+            )
+            return {"script": video_script, "terms": video_terms}
 
     if stop_at == "subtitle":
         sm.state.update_task(
@@ -1358,7 +1643,7 @@ def _run_pipeline(
         task_id,
         params,
         video_terms,
-        audio_duration,
+        material_audio_duration,
         loomloom_video_request=loomloom_video_request,
     )
     if not downloaded_videos:

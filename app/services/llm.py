@@ -741,6 +741,144 @@ Please note that you must use English for generating video search terms; Chinese
     return search_terms
 
 
+def generate_visual_slot_queries(
+    video_subject: str,
+    visual_slots: list[dict],
+    queries_per_slot: int = 1,
+    app_config=None,
+) -> dict[int, list[str]]:
+    """Generate indexed stock-video queries from each slot's narration only."""
+    if not visual_slots:
+        return {}
+
+    queries_per_slot = max(1, int(queries_per_slot))
+    slot_payload = [
+        {
+            "slot_index": int(slot["slot_index"]),
+            "start_time": float(slot["start_time"]),
+            "end_time": float(slot["end_time"]),
+            "narration_text": str(slot["narration_text"]).strip(),
+        }
+        for slot in visual_slots
+    ]
+    expected_indexes = {slot["slot_index"] for slot in slot_payload}
+    output_example = [
+        {
+            "slot_index": slot["slot_index"],
+            "queries": [
+                f"camera visible query {query_index + 1}"
+                for query_index in range(queries_per_slot)
+            ],
+        }
+        for slot in slot_payload
+    ]
+    prompt = f"""
+# Role: Visual Slot Stock-Video Search Query Generator
+
+## Goal
+Generate Pexels stock-video search queries for the indexed visual slots below.
+
+## Rules
+1. Return a JSON array only, with exactly one object for every supplied slot_index.
+2. Each object must contain slot_index and exactly {queries_per_slot} queries.
+3. Derive each query only from that slot's narration_text. Never move an action,
+   subject, or scene from one slot to another.
+4. Preserve the narration's main visible subject and action.
+5. Every query must describe a concrete, camera-visible shot suitable for stock footage.
+6. Avoid abstract concepts, emotions, metaphors, narration summaries, camera
+   transitions, and editorial instructions.
+7. Use concise English queries of 2-6 words.
+
+## Video Subject
+{video_subject}
+
+## Visual Slots
+{json.dumps(slot_payload, ensure_ascii=False)}
+
+## Output Example
+{json.dumps(output_example, ensure_ascii=False)}
+""".strip()
+
+    def parse_slot_queries(raw_response: str) -> dict[int, list[str]]:
+        parsed = json.loads(_strip_code_fence(raw_response))
+        if not isinstance(parsed, list):
+            raise ValueError("visual slot query response must be a JSON array")
+
+        queries_by_slot: dict[int, list[str]] = {}
+        for item in parsed:
+            if not isinstance(item, dict):
+                raise ValueError("each visual slot query item must be an object")
+            slot_index = item.get("slot_index")
+            if isinstance(slot_index, bool):
+                raise ValueError("slot_index must be an integer")
+            try:
+                slot_index = int(slot_index)
+            except (TypeError, ValueError) as exc:
+                raise ValueError("slot_index must be an integer") from exc
+            if slot_index not in expected_indexes or slot_index in queries_by_slot:
+                raise ValueError(f"unexpected or duplicate slot_index: {slot_index}")
+
+            queries = item.get("queries")
+            if not isinstance(queries, list) or not all(
+                isinstance(query, str) for query in queries
+            ):
+                raise ValueError(f"slot {slot_index} queries must be strings")
+            queries = [query.strip() for query in queries if query.strip()]
+            if len(queries) != queries_per_slot:
+                raise ValueError(
+                    f"slot {slot_index} must contain exactly "
+                    f"{queries_per_slot} queries"
+                )
+            if not all(re.search(r"[A-Za-z]", query) for query in queries):
+                raise ValueError(f"slot {slot_index} queries must be English")
+            queries_by_slot[slot_index] = queries
+
+        if set(queries_by_slot) != expected_indexes:
+            missing = sorted(expected_indexes - set(queries_by_slot))
+            raise ValueError(f"visual slot query response is missing slots: {missing}")
+        return queries_by_slot
+
+    response = ""
+    for attempt in range(_max_retries):
+        try:
+            if app_config is None:
+                response = _generate_response(prompt)
+            else:
+                response = _generate_response(prompt, app_config=app_config)
+            if response.startswith("Error: "):
+                logger.error(f"failed to generate visual slot queries: {response}")
+                return {}
+            queries_by_slot = parse_slot_queries(response)
+            logger.success(
+                f"completed visual slot queries: slots={len(queries_by_slot)}"
+            )
+            return queries_by_slot
+        except Exception as exc:
+            logger.warning(f"failed to generate visual slot queries: {str(exc)}")
+            if response:
+                match = re.search(r"\[.*]", response, re.DOTALL)
+                if match:
+                    try:
+                        queries_by_slot = parse_slot_queries(match.group())
+                        logger.success(
+                            "completed visual slot queries after response recovery: "
+                            f"slots={len(queries_by_slot)}"
+                        )
+                        return queries_by_slot
+                    except Exception as recovery_exc:
+                        logger.warning(
+                            "failed to recover visual slot queries: "
+                            f"{str(recovery_exc)}"
+                        )
+            if attempt < _max_retries - 1:
+                logger.warning(
+                    "failed to generate visual slot queries, trying again... "
+                    f"{attempt + 1}"
+                )
+
+    return {}
+
+
 # =============================================================================
 # Social publishing metadata
 #
