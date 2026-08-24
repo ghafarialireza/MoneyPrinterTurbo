@@ -3,8 +3,11 @@ import os
 import random
 import re
 import threading
+# ``field`` is aliased because this module's older record builders use ``field``
+# as a loop variable; importing it under its own name would shadow the import.
+from dataclasses import dataclass, field as dataclass_field, replace as dataclass_replace
 from pathlib import Path
-from typing import Any, Callable, List
+from typing import Any, Callable, List, Protocol, Sequence
 from urllib.parse import quote_plus, urlencode, urlsplit, urlunsplit
 
 import requests
@@ -12,8 +15,17 @@ from loguru import logger
 from moviepy.video.io.VideoFileClip import VideoFileClip
 
 from app.config import config
-from app.models.schema import MaterialInfo, VideoAspect, VideoConcatMode, VisualSlot
-from app.services import material_cache, task_artifacts
+from app.models.schema import (
+    MaterialInfo,
+    RenderSegment,
+    VideoAspect,
+    VideoConcatMode,
+    VisualBeat,
+    VisualRequirementSpec,
+    VisualSlot,
+    VISUAL_BEAT_RAPID_CUT_SECONDS,
+)
+from app.services import llm, material_cache, task_artifacts
 from app.utils import utils
 
 # Thread-safe counter for API key rotation
@@ -21,6 +33,70 @@ _api_key_counter = 0
 _api_key_lock = threading.Lock()
 _MIN_STOCK_RENDITION_SHORT_EDGE = 720
 _MIN_SEMANTIC_QA_DURATION = 4
+
+# Searchable stock-video providers, in cascade order, with their config keys.
+# Smart matching walks this chain so a weak result from the preferred provider
+# can still be replaced by a stronger one instead of failing the whole task.
+_STOCK_VIDEO_PROVIDER_API_KEYS: dict[str, str] = {
+    "pexels": "pexels_api_keys",
+    "pixabay": "pixabay_api_keys",
+    "coverr": "coverr_api_keys",
+}
+_SMART_PROVIDER_CASCADE_ORDER: tuple[str, ...] = ("pexels", "pixabay", "coverr")
+# A beat that finds nothing usable is far more often phrased badly than absent
+# from the catalog, so the alternative phrasings the script stage already
+# generated are tried on the current provider before the next provider is asked.
+# The cap is what keeps the worst case bounded: each extra phrasing is one more
+# search plus one more round of candidate analysis.
+_DEFAULT_MAX_QUERY_VARIANTS = 3
+# A rewritten requirement has no script-stage phrasings of its own. When the
+# provider cannot produce fresh queries either, the requirement text is only
+# usable as a query while it is still short enough to behave like one; stock
+# search treats a long sentence as an over-constrained query and returns nothing.
+_MAX_REQUIREMENT_QUERY_WORDS = 6
+# Every phrasing, every provider in the cascade and the alternative-wording retry
+# bill the same metered account, and only a *successful* round stops early — a
+# round nothing can satisfy spends the full candidate cap on each of them, so the
+# cost of one unfillable item is multiplicative where a healthy one is not.
+# The budget is expressed as a multiple of the configured per-search cap so that
+# lowering that cap lowers this too. The multiple is deliberately loose: phrasings
+# of one item on one provider return heavily overlapping catalogs and the
+# per-item exclusion set already stops the second phrasing re-buying the first
+# one's verdicts, so the realistic designed cascade lands well under the ceiling
+# and only the pathological case — every phrasing returning a fresh full page on
+# every provider — is cut off.
+_DEFAULT_ANALYSIS_BUDGET_MULTIPLIER = 5
+
+# The per-round ceiling bounds one item; nothing bounds one video. Since the
+# failure ladder lets a run reach the end instead of dying at its first unfillable
+# item, a video can now pay for several hopeless items in a row, so the per-video
+# ceiling is what turns "expensive" into "bounded". It is expressed as how many
+# full candidate pages the video may average per item, because those are the two
+# numbers the code actually knows in advance — the average clip length, which is
+# what TwelveLabs really bills, is not knowable before the searches happen. Two
+# pages per item is deliberately loose: a healthy item settles in its first batch,
+# so a whole healthy video spends well under one page per item and never notices
+# this, and a video with one or two genuinely hard items still gets its complete
+# ladder. Only the runaway case — several hopeless items each burning their full
+# two rounds — is cut, and it is cut into the free rungs rather than into failure.
+_DEFAULT_VIDEO_ANALYSIS_PAGES_PER_ITEM = 2
+
+# Beat boundaries come from the same in-memory objects the S4 validator already
+# proved contiguous, so this only guards against float re-association.
+_RENDER_SEGMENT_TIME_TOLERANCE = 1e-6
+# Persisted source windows are rounded to milliseconds, and the renderer
+# recomputes the exact source length from the frame-aligned target anyway. This
+# tolerance only has to be wide enough to absorb that rounding.
+_RENDER_SEGMENT_DURATION_TOLERANCE = 0.02
+
+
+class OrderedVisualItem(Protocol):
+    """Small shared surface consumed by ordered smart material selection."""
+
+    index: int
+    duration: float
+    visual_requirement: str
+    search_queries: list[str]
 
 
 class SmartMaterialSelectionError(RuntimeError):
@@ -50,6 +126,82 @@ def _safe_public_url(value: Any) -> str | None:
     ):
         return None
     return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, "", ""))
+
+
+def _normalized_media_url(value: Any) -> str:
+    """Return a conservative identity form for an exact media URL.
+
+    Scheme/host casing, default ports, an empty root path, and fragments do not
+    change the fetched media resource. Path and query bytes are deliberately
+    preserved because provider CDN URLs can be signed and case-sensitive.
+    """
+    if not isinstance(value, str) or not value.strip():
+        return ""
+    raw_url = value.strip()
+    try:
+        parsed = urlsplit(raw_url)
+        port = parsed.port
+    except ValueError:
+        return raw_url
+    if (
+        parsed.scheme.lower() not in {"http", "https"}
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+    ):
+        return raw_url
+
+    scheme = parsed.scheme.lower()
+    hostname = parsed.hostname.lower()
+    if ":" in hostname and not hostname.startswith("["):
+        hostname = f"[{hostname}]"
+    if port is not None and not (
+        (scheme == "http" and port == 80) or (scheme == "https" and port == 443)
+    ):
+        hostname = f"{hostname}:{port}"
+    return urlunsplit((scheme, hostname, parsed.path or "/", parsed.query, ""))
+
+
+def _provider_asset_identity(item: MaterialInfo) -> tuple[str, str] | None:
+    """Resolve provider-aware identity while accepting legacy source metadata."""
+    source = item.source_info if isinstance(item.source_info, dict) else {}
+    provider = str(source.get("provider") or item.provider or "pexels").strip().lower()
+    provider_asset_id = str(
+        item.provider_asset_id
+        or source.get("provider_asset_id")
+        or source.get("asset_id")
+        or ""
+    ).strip()
+    if not provider or not provider_asset_id:
+        return None
+    return provider, provider_asset_id
+
+
+def _is_duplicate_material(
+    item: MaterialInfo,
+    seen_asset_identities: set[tuple[str, str]],
+    seen_urls: set[str],
+) -> bool:
+    """Match duplicates by provider identity or exact normalized media URL."""
+    identity = _provider_asset_identity(item)
+    normalized_url = _normalized_media_url(item.url)
+    return bool(
+        (identity is not None and identity in seen_asset_identities)
+        or (normalized_url and normalized_url in seen_urls)
+    )
+
+
+def _remember_material_identity(
+    item: MaterialInfo,
+    seen_asset_identities: set[tuple[str, str]],
+    seen_urls: set[str],
+) -> None:
+    identity = _provider_asset_identity(item)
+    normalized_url = _normalized_media_url(item.url)
+    if identity is not None:
+        seen_asset_identities.add(identity)
+    if normalized_url:
+        seen_urls.add(normalized_url)
 
 
 def _creator_info(value: Any) -> dict[str, str] | None:
@@ -83,19 +235,31 @@ def _material_source_record(item: MaterialInfo, local_path: str) -> dict[str, An
     并只记录本地文件名，避免用户目录或 Docker 挂载路径进入任务文件。
     """
     source = item.source_info if isinstance(item.source_info, dict) else {}
+    identity = _provider_asset_identity(item)
     record: dict[str, Any] = {
-        "provider": str(item.provider or source.get("provider") or ""),
+        "provider": identity[0]
+        if identity is not None
+        else str(item.provider or source.get("provider") or ""),
         "local_file": Path(local_path).name,
         "duration": int(item.duration),
     }
 
-    search_term = source.get("search_term")
-    asset_id = source.get("asset_id")
-    source_page = _safe_public_url(source.get("source_page"))
+    search_term = item.search_query or source.get("search_query") or source.get(
+        "search_term"
+    )
+    asset_id = identity[1] if identity is not None else None
+    source_page = _safe_public_url(
+        item.source_page_url
+        or source.get("source_page_url")
+        or source.get("source_page")
+    )
     if isinstance(search_term, str) and search_term.strip():
         record["search_term"] = search_term.strip()
     if asset_id not in (None, ""):
+        # Keep the original key for existing script.json readers while adding
+        # the provider-neutral name used by new code.
         record["asset_id"] = str(asset_id)
+        record["provider_asset_id"] = str(asset_id)
     if source_page:
         record["source_page"] = source_page
 
@@ -104,14 +268,24 @@ def _material_source_record(item: MaterialInfo, local_path: str) -> dict[str, An
         record["creator"] = creator
 
     raw_rendition = source.get("rendition")
-    if isinstance(raw_rendition, dict):
-        rendition = {}
-        for field in ("id", "width", "height"):
-            value = raw_rendition.get(field)
-            if value not in (None, ""):
-                rendition[field] = str(value) if field == "id" else value
-        if rendition:
-            record["rendition"] = rendition
+    raw_rendition = raw_rendition if isinstance(raw_rendition, dict) else {}
+    rendition = {
+        field: value
+        for field, value in {
+            "id": item.rendition_id,
+            "width": item.width,
+            "height": item.height,
+        }.items()
+        if value not in (None, "")
+    }
+    for field in ("id", "width", "height"):
+        value = raw_rendition.get(field)
+        if value not in (None, "") and field not in rendition:
+            rendition[field] = str(value) if field == "id" else value
+    if rendition:
+        if "id" in rendition:
+            rendition["id"] = str(rendition["id"])
+        record["rendition"] = rendition
 
     raw_semantic_qa = source.get("semantic_qa")
     if isinstance(raw_semantic_qa, dict):
@@ -140,6 +314,19 @@ def _material_source_record(item: MaterialInfo, local_path: str) -> dict[str, An
     slot_index = source.get("slot_index")
     if isinstance(slot_index, int) and slot_index > 0:
         record["slot_index"] = slot_index
+    visual_beat_index = source.get("visual_beat_index")
+    if isinstance(visual_beat_index, int) and visual_beat_index > 0:
+        record["visual_beat_index"] = visual_beat_index
+    semantic_group_id = source.get("semantic_group_id")
+    if isinstance(semantic_group_id, int) and semantic_group_id > 0:
+        record["semantic_group_id"] = semantic_group_id
+    for field in ("required_target_duration", "required_source_duration"):
+        try:
+            value = float(source.get(field))
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(value) and value > 0:
+            record[field] = round(value, 3)
 
     if item.source_start_time is not None and item.source_end_time is not None:
         try:
@@ -159,13 +346,14 @@ def _material_source_record(item: MaterialInfo, local_path: str) -> dict[str, An
             "model",
             "schema_version",
             "accepted",
-            "match",
-            "required_action_visible",
-            "subject_clearly_visible",
+            "eligible_for_adjudication",
+            "visual_requirement_spec",
+            "observed_facts",
+            "critical_gate",
+            "semantic_adjudication",
             "scores",
             "overall_score",
             "quality_flags",
-            "visible_summary",
             "reason",
             "analysis_input",
         ):
@@ -186,6 +374,7 @@ def _material_source_record(item: MaterialInfo, local_path: str) -> dict[str, An
 def _persist_material_sources(
     task_id: str,
     material_sources: list[dict[str, Any]],
+    semantic_verifier_runs: list[dict[str, Any]] | None = None,
 ) -> None:
     """
     将当前实际下载成功的素材来源补充到任务清单。
@@ -195,10 +384,10 @@ def _persist_material_sources(
     成功后记录数量，便于确认任务追溯信息是否已经落盘。
     """
     try:
-        saved = task_artifacts.patch_script_data(
-            task_id,
-            material_sources=material_sources,
-        )
+        fields: dict[str, Any] = {"material_sources": material_sources}
+        if semantic_verifier_runs is not None:
+            fields["semantic_verifier_runs"] = semantic_verifier_runs
+        saved = task_artifacts.patch_script_data(task_id, **fields)
         if saved:
             logger.info(
                 f"saved material source records: "
@@ -254,6 +443,148 @@ def load_selected_source_ranges(
     if len(ranges) != len(video_paths):
         raise ValueError("smart material source range count does not match winners")
     return ranges
+
+
+def load_render_segments(
+    task_id: str,
+    video_paths: List[str],
+    visual_beats: Sequence[VisualBeat],
+    clip_speed: float = 1.0,
+    audio_duration: float | None = None,
+) -> list[RenderSegment]:
+    """Bind every approved visual beat to the exact source window that was selected for it.
+
+    ``load_selected_source_ranges`` joins records to files by basename, which is
+    ambiguous as soon as two beats reuse the same asset. Beats carry an explicit
+    ``visual_beat_index``, so this joins on that instead and treats the beat as
+    the authority for target timing and the record as the authority for the
+    source window. Any inconsistency raises: rendering a half-trusted timeline
+    would desync the narration rather than degrade it.
+    """
+    if not visual_beats:
+        raise ValueError("visual beats are required to build render segments")
+    if len(video_paths) != len(visual_beats):
+        raise ValueError(
+            "render segment inputs disagree: "
+            f"winners={len(video_paths)}, beats={len(visual_beats)}"
+        )
+
+    normalized_speed = utils.normalize_clip_speed(clip_speed)
+    payload = task_artifacts.read_script_data(task_id)
+    records = payload.get("material_sources")
+    if not isinstance(records, list):
+        raise ValueError("smart material source records are missing from script.json")
+
+    records_by_beat: dict[int, dict[str, Any]] = {}
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        beat_index = record.get("visual_beat_index")
+        if not isinstance(beat_index, int):
+            raise ValueError(
+                "smart material source records predate the visual beat timeline"
+            )
+        if beat_index in records_by_beat:
+            raise ValueError(
+                f"smart material source records are ambiguous for beat {beat_index}"
+            )
+        records_by_beat[beat_index] = record
+
+    segments: list[RenderSegment] = []
+    previous_end = 0.0
+    for position, (video_path, beat) in enumerate(
+        zip(video_paths, visual_beats), start=1
+    ):
+        record = records_by_beat.get(beat.index)
+        if record is None:
+            raise ValueError(
+                f"smart material source record is missing for beat {beat.index}"
+            )
+        local_file = str(record.get("local_file") or "").strip()
+        if local_file and local_file != Path(video_path).name:
+            # A mismatch means the winner order and the persisted records have
+            # diverged; rendering would attach a beat to somebody else's clip.
+            raise ValueError(
+                f"smart material source record for beat {beat.index} points at "
+                f"{local_file!r} but the winner is {Path(video_path).name!r}"
+            )
+
+        try:
+            source_start = float(record["source_start_time"])
+            source_end = float(record["source_end_time"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError(
+                f"smart material source range is invalid for beat {beat.index}"
+            ) from exc
+
+        target_start = float(beat.start_time)
+        target_end = float(beat.end_time)
+        target_duration = target_end - target_start
+        if (
+            not math.isfinite(source_start)
+            or not math.isfinite(source_end)
+            or not math.isfinite(target_start)
+            or not math.isfinite(target_end)
+            or source_start < 0
+            or source_end <= source_start
+            or target_start < 0
+            or target_duration <= 0
+        ):
+            raise ValueError(f"beat {beat.index} has an unusable render window")
+
+        if position == 1 and target_start > _RENDER_SEGMENT_TIME_TOLERANCE:
+            raise ValueError("the visual beat timeline must start at 0.0s")
+        if abs(target_start - previous_end) > _RENDER_SEGMENT_TIME_TOLERANCE:
+            raise ValueError(
+                f"beat {beat.index} leaves a gap or overlap in the timeline"
+            )
+
+        rendered_length = (source_end - source_start) / normalized_speed
+        if abs(rendered_length - target_duration) > _RENDER_SEGMENT_DURATION_TOLERANCE:
+            # Persisted source times are rounded to milliseconds, so a small
+            # delta is expected. A larger one means the selection was made for a
+            # different slot length than the beat now claims.
+            raise ValueError(
+                f"beat {beat.index} source window renders {rendered_length:.3f}s "
+                f"at {normalized_speed:.2f}x but its timeline slot is "
+                f"{target_duration:.3f}s"
+            )
+
+        semantic_group_id = record.get("semantic_group_id")
+        segments.append(
+            RenderSegment(
+                index=position,
+                file_path=video_path,
+                source_start=source_start,
+                source_end=source_end,
+                target_start=target_start,
+                target_end=target_end,
+                target_duration=target_duration,
+                playback_speed=normalized_speed,
+                visual_beat_index=beat.index,
+                semantic_group_id=(
+                    semantic_group_id
+                    if isinstance(semantic_group_id, int)
+                    else int(beat.semantic_group_id)
+                ),
+                provider=str(record.get("provider") or ""),
+            )
+        )
+        previous_end = target_end
+
+    if audio_duration is not None:
+        coverage = float(audio_duration) - previous_end
+        if coverage > _RENDER_SEGMENT_TIME_TOLERANCE:
+            raise ValueError(
+                "the visual beat timeline does not cover the narration audio: "
+                f"timeline={previous_end:.3f}s, audio={float(audio_duration):.3f}s"
+            )
+
+    logger.info(
+        f"built render segments: task_id={task_id}, segments={len(segments)}, "
+        f"timeline={previous_end:.3f}s, speed={normalized_speed:.2f}x"
+    )
+    return segments
 
 
 def _get_tls_verify() -> bool:
@@ -379,6 +710,87 @@ def _matches_video_aspect(
     return False
 
 
+def _orientation_from_dimensions(width: Any, height: Any) -> str | None:
+    try:
+        normalized_width = int(float(width))
+        normalized_height = int(float(height))
+    except (TypeError, ValueError):
+        return None
+    if normalized_width <= 0 or normalized_height <= 0:
+        return None
+    if normalized_width == normalized_height:
+        return "square"
+    return "landscape" if normalized_width > normalized_height else "portrait"
+
+
+def _hydrate_material_metadata(
+    item: MaterialInfo,
+    *,
+    search_query: str | None = None,
+    query_attempt: int | None = None,
+) -> MaterialInfo:
+    """Populate typed metadata from legacy ``source_info`` in-place."""
+    source = dict(item.source_info) if isinstance(item.source_info, dict) else {}
+    provider = str(source.get("provider") or item.provider or "pexels").strip().lower()
+    provider_asset_id = str(
+        item.provider_asset_id
+        or source.get("provider_asset_id")
+        or source.get("asset_id")
+        or ""
+    ).strip()
+    rendition = source.get("rendition")
+    rendition = rendition if isinstance(rendition, dict) else {}
+
+    item.provider = provider
+    item.provider_asset_id = provider_asset_id or None
+    item.preview_url = _safe_public_url(
+        item.preview_url or source.get("preview_url")
+    )
+    try:
+        item.width = int(item.width or rendition.get("width"))
+        item.height = int(item.height or rendition.get("height"))
+    except (TypeError, ValueError):
+        item.width = None
+        item.height = None
+    item.orientation = item.orientation or _orientation_from_dimensions(
+        item.width,
+        item.height,
+    )
+    rendition_id = item.rendition_id or rendition.get("id")
+    item.rendition_id = (
+        str(rendition_id) if rendition_id not in (None, "") else None
+    )
+    item.search_query = str(
+        search_query
+        or item.search_query
+        or source.get("search_query")
+        or source.get("search_term")
+        or ""
+    ).strip() or None
+    if query_attempt is not None:
+        item.query_attempt = int(query_attempt)
+    elif item.query_attempt is None and item.search_query:
+        item.query_attempt = 1
+    item.source_page_url = _safe_public_url(
+        item.source_page_url
+        or source.get("source_page_url")
+        or source.get("source_page")
+    )
+
+    source["provider"] = provider
+    if provider_asset_id:
+        source["asset_id"] = provider_asset_id
+        source["provider_asset_id"] = provider_asset_id
+    if item.preview_url:
+        source["preview_url"] = item.preview_url
+    if item.search_query:
+        source["search_term"] = item.search_query
+    if item.source_page_url:
+        source["source_page"] = item.source_page_url
+    item.source_info = source or None
+    return item
+
+
 def _filter_materials_by_aspect(
     items: List[MaterialInfo],
     video_aspect: VideoAspect,
@@ -424,7 +836,7 @@ def _prepare_twelvelabs_candidates(
     """
     short_candidates: list[MaterialInfo] = []
     long_candidates: list[MaterialInfo] = []
-    seen_asset_ids: set[str] = set()
+    seen_asset_identities: set[tuple[str, str]] = set()
     seen_urls: set[str] = set()
     aspect = VideoAspect(video_aspect)
     minimum_duration = max(4.0, float(required_source_duration))
@@ -433,7 +845,7 @@ def _prepare_twelvelabs_candidates(
         source = item.source_info if isinstance(item.source_info, dict) else {}
         rendition = source.get("rendition")
         rendition = rendition if isinstance(rendition, dict) else {}
-        asset_id = str(source.get("asset_id") or "").strip()
+        asset_identity = _provider_asset_identity(item)
         url = str(item.url or "").strip()
         try:
             duration = float(item.duration)
@@ -443,7 +855,7 @@ def _prepare_twelvelabs_candidates(
         except (TypeError, ValueError):
             continue
         if (
-            not asset_id
+            asset_identity is None
             or not math.isfinite(duration)
             or duration < minimum_duration
             or parsed.scheme != "https"
@@ -453,17 +865,63 @@ def _prepare_twelvelabs_candidates(
             or not parsed.path.lower().endswith(".mp4")
             or not _matches_video_aspect(width, height, aspect)
             or min(width, height) < _MIN_STOCK_RENDITION_SHORT_EDGE
-            or asset_id in seen_asset_ids
-            or url in seen_urls
+            or _is_duplicate_material(item, seen_asset_identities, seen_urls)
         ):
             continue
-        seen_asset_ids.add(asset_id)
-        seen_urls.add(url)
+        _remember_material_identity(item, seen_asset_identities, seen_urls)
         if duration <= preferred_max_source_duration:
             short_candidates.append(item)
         else:
             long_candidates.append(item)
     return short_candidates + long_candidates
+
+
+def required_source_duration_for_timeline(
+    target_timeline_duration: float,
+    clip_speed: float,
+) -> float:
+    """Mirror MoviePy speed semantics: source seconds = timeline seconds × speed."""
+    try:
+        target_duration = float(target_timeline_duration)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("target timeline duration must be positive") from exc
+    if not math.isfinite(target_duration) or target_duration <= 0:
+        raise ValueError("target timeline duration must be positive")
+    return target_duration * utils.normalize_clip_speed(clip_speed)
+
+
+def _normalize_selected_source_range(
+    segment: dict[str, Any],
+    *,
+    source_duration: float,
+    required_source_duration: float,
+) -> dict[str, Any] | None:
+    """Validate and trim a semantic interval to the exact required source time."""
+    try:
+        start_time = max(0.0, float(segment["source_start_time"]))
+        end_time = min(float(source_duration), float(segment["source_end_time"]))
+        required = float(required_source_duration)
+    except (KeyError, TypeError, ValueError):
+        return None
+    if (
+        not all(math.isfinite(value) for value in (start_time, end_time, required))
+        or required <= 0
+        or end_time - start_time < required - 1e-6
+    ):
+        return None
+
+    center = (start_time + end_time) / 2.0
+    normalized_start = max(0.0, center - required / 2.0)
+    normalized_end = normalized_start + required
+    if normalized_end > source_duration:
+        normalized_end = float(source_duration)
+        normalized_start = max(0.0, normalized_end - required)
+    if normalized_end - normalized_start < required - 1e-6:
+        return None
+    normalized = dict(segment)
+    normalized["source_start_time"] = normalized_start
+    normalized["source_end_time"] = normalized_end
+    return normalized
 
 
 def _select_best_video_rendition(
@@ -558,20 +1016,34 @@ def search_videos_pexels(
                 continue
             w = int(video["width"])
             h = int(video["height"])
+            provider_asset_id = (
+                str(v.get("id")) if v.get("id") is not None else None
+            )
+            source_page_url = _safe_public_url(v.get("url"))
             item = MaterialInfo()
             item.provider = "pexels"
             item.url = video["link"]
             item.duration = duration
+            item.provider_asset_id = provider_asset_id
+            item.preview_url = _safe_public_url(v.get("image"))
+            item.width = w
+            item.height = h
+            item.orientation = _orientation_from_dimensions(w, h)
+            item.rendition_id = (
+                str(video.get("id")) if video.get("id") is not None else None
+            )
+            item.search_query = search_term
+            item.query_attempt = 1
+            item.source_page_url = source_page_url
             item.source_info = {
                 "provider": "pexels",
                 "search_term": search_term,
-                "asset_id": str(v.get("id")) if v.get("id") is not None else None,
-                "source_page": _safe_public_url(v.get("url")),
+                "asset_id": provider_asset_id,
+                "provider_asset_id": provider_asset_id,
+                "source_page": source_page_url,
                 "creator": _creator_info(v.get("user")),
                 "rendition": {
-                    "id": (
-                        str(video.get("id")) if video.get("id") is not None else None
-                    ),
+                    "id": item.rendition_id,
                     "width": w,
                     "height": h,
                 },
@@ -677,17 +1149,28 @@ def search_videos_pixabay(
                     _matches_video_aspect(w, h, aspect)
                 )
                 if orientation_matches and w >= video_width:
+                    provider_asset_id = (
+                        str(v.get("id")) if v.get("id") is not None else None
+                    )
+                    source_page_url = _safe_public_url(v.get("pageURL"))
                     item = MaterialInfo()
                     item.provider = "pixabay"
                     item.url = video["url"]
                     item.duration = duration
+                    item.provider_asset_id = provider_asset_id
+                    item.width = w
+                    item.height = h
+                    item.orientation = _orientation_from_dimensions(w, h)
+                    item.rendition_id = str(video_type)
+                    item.search_query = search_term
+                    item.query_attempt = 1
+                    item.source_page_url = source_page_url
                     item.source_info = {
                         "provider": "pixabay",
                         "search_term": search_term,
-                        "asset_id": (
-                            str(v.get("id")) if v.get("id") is not None else None
-                        ),
-                        "source_page": _safe_public_url(v.get("pageURL")),
+                        "asset_id": provider_asset_id,
+                        "provider_asset_id": provider_asset_id,
+                        "source_page": source_page_url,
                         "creator": _creator_info(
                             {
                                 "id": v.get("user_id"),
@@ -697,7 +1180,7 @@ def search_videos_pixabay(
                         "rendition": {
                             "id": video_type,
                             "width": w,
-                            "height": video.get("height"),
+                            "height": h,
                         },
                     }
                     video_items.append(item)
@@ -790,20 +1273,41 @@ def search_videos_coverr(
             ):
                 continue
 
+            try:
+                source_width = int(float(v.get("max_width")))
+                source_height = int(float(v.get("max_height")))
+            except (TypeError, ValueError):
+                source_width = None
+                source_height = None
+
             item = MaterialInfo()
             item.provider = "coverr"
             item.url = mp4_download_url
             item.duration = duration
+            item.provider_asset_id = str(video_id)
+            item.preview_url = _safe_public_url(
+                v.get("poster") or v.get("thumbnail")
+            )
+            item.width = source_width
+            item.height = source_height
+            item.orientation = _orientation_from_dimensions(item.width, item.height)
+            item.rendition_id = "mp4_download"
+            item.search_query = search_term
+            item.query_attempt = 1
+            item.source_page_url = _safe_public_url(
+                v.get("canonical_url") or v.get("url")
+            )
             item.source_info = {
                 "provider": "coverr",
                 "search_term": search_term,
                 "asset_id": str(video_id),
-                "source_page": _safe_public_url(v.get("canonical_url") or v.get("url")),
+                "provider_asset_id": str(video_id),
+                "source_page": item.source_page_url,
                 "creator": _creator_info(v.get("creator") or v.get("author")),
                 "rendition": {
                     "id": "mp4_download",
-                    "width": v.get("max_width"),
-                    "height": v.get("max_height"),
+                    "width": source_width,
+                    "height": source_height,
                 },
             }
             video_items.append(item)
@@ -986,9 +1490,11 @@ def _search_videos_with_cache(
         # 遗漏或携带错误值。缓存读取会根据缓存键恢复该字段，因此远端结果也在
         # 同一入口校正，保证首次搜索与缓存命中的任务来源记录保持一致。
         for item in items:
-            if isinstance(item.source_info, dict):
-                item.source_info = dict(item.source_info)
-                item.source_info["search_term"] = search_term
+            _hydrate_material_metadata(
+                item,
+                search_query=search_term,
+                query_attempt=1,
+            )
         if items:
             try:
                 material_cache.save_material_search_cache(
@@ -1003,26 +1509,281 @@ def _search_videos_with_cache(
         return items
 
 
-def download_videos(
-    task_id: str,
-    search_terms: List[str],
-    source: str = "pexels",
-    video_aspect: VideoAspect = VideoAspect.portrait,
-    video_concat_mode: VideoConcatMode = VideoConcatMode.random,
-    audio_duration: float = 0.0,
-    max_clip_duration: int = 5,
-    match_script_order: bool = False,
-    visual_slots: list[VisualSlot] | None = None,
-    clip_speed: float = 1.0,
-) -> List[str]:
-    provider = "pexels"
-    remote_search_videos = search_videos_pexels
-    if source == "pixabay":
-        provider = "pixabay"
-        remote_search_videos = search_videos_pixabay
-    elif source == "coverr":
-        provider = "coverr"
-        remote_search_videos = search_videos_coverr
+def provider_has_api_key(provider: str) -> bool:
+    """Report whether a searchable stock provider has at least one API key set."""
+    cfg_key = _STOCK_VIDEO_PROVIDER_API_KEYS.get(str(provider or "").strip().lower())
+    if not cfg_key:
+        return False
+    api_keys = config.app.get(cfg_key)
+    if isinstance(api_keys, str):
+        return bool(api_keys.strip())
+    if isinstance(api_keys, (list, tuple, set)):
+        return any(str(value).strip() for value in api_keys)
+    return bool(api_keys)
+
+
+def is_provider_cascade_enabled() -> bool:
+    """Allow operators to pin smart matching to the single selected provider."""
+    value = config.app.get("smart_material_provider_cascade", True)
+    if isinstance(value, str):
+        return value.strip().lower() not in ("0", "false", "no", "off")
+    return bool(value)
+
+
+def max_query_variants_per_provider() -> int:
+    """How many phrasings of one visual item may be tried on a single provider.
+
+    The script stage already produced several phrasings per item, and trying the
+    next phrasing on the provider that is already configured and cached is both
+    cheaper and more faithful to the script than jumping to a different catalog
+    whose library is thinner. ``1`` restores the previous behavior of spending
+    exactly one query across the whole cascade. Values below 1 are read as 1,
+    because "search with no query at all" is not a mode.
+    """
+    value = config.app.get(
+        "smart_material_max_query_variants",
+        _DEFAULT_MAX_QUERY_VARIANTS,
+    )
+    try:
+        variants = int(str(value).strip())
+    except (TypeError, ValueError):
+        logger.warning(
+            "smart_material_max_query_variants is not a number; "
+            f"using {_DEFAULT_MAX_QUERY_VARIANTS}: value={value!r}"
+        )
+        return _DEFAULT_MAX_QUERY_VARIANTS
+    return max(1, variants)
+
+
+def is_requirement_rewrite_enabled() -> bool:
+    """Allow operators to turn off the one alternative-wording retry per item.
+
+    A beat that no provider and no phrasing could satisfy is usually asking for a
+    scene that stock catalogs do not hold, so the last cheap move before failing
+    the video is to describe the same narration a different way. Turning this off
+    restores the previous behavior of failing as soon as an item is unfillable.
+    """
+    value = config.app.get("smart_material_requirement_rewrite", True)
+    if isinstance(value, str):
+        return value.strip().lower() not in ("0", "false", "no", "off")
+    return bool(value)
+
+
+def analysis_budget_per_selection_round(candidate_limit: int) -> int:
+    """How many stock candidates one selection round may pay to analyze.
+
+    This is a spend ceiling, not a quality knob: it caps *analyses*, because
+    searching a catalog is free and looking at a clip is not. An item that can be
+    satisfied never approaches it — the selector stops at its first strong
+    candidate — so the budget only ever binds on an item that was going to fail
+    anyway, and it decides how much that failure is allowed to cost before it is
+    reported instead of pursued across every remaining phrasing and provider.
+
+    The ceiling is per round rather than per item so that the alternative-wording
+    retry, which is the recovery most likely to actually work, is not starved by
+    the failed round that preceded it. An item runs at most two rounds, so its
+    worst case is twice this number.
+
+    An absent setting means the multiplier-derived default, an explicit ``0``
+    removes the ceiling entirely, and a positive value is an absolute cap. A
+    negative value falls back to the default, because "cap the spend at less than
+    nothing" has no reading that leaves a run able to select anything.
+    """
+    default = max(1, int(candidate_limit)) * _DEFAULT_ANALYSIS_BUDGET_MULTIPLIER
+    value = config.app.get("smart_material_max_analyzed_candidates_per_round")
+    if value is None or not str(value).strip():
+        return default
+    try:
+        budget = int(str(value).strip())
+    except (TypeError, ValueError):
+        logger.warning(
+            "smart_material_max_analyzed_candidates_per_round is not a number; "
+            f"using {default}: value={value!r}"
+        )
+        return default
+    if budget < 0:
+        logger.warning(
+            "smart_material_max_analyzed_candidates_per_round is negative; "
+            f"using {default}: value={value!r}"
+        )
+        return default
+    return budget
+
+
+def analysis_budget_per_video(item_count: int, candidate_limit: int) -> int:
+    """How many stock candidates one whole video may pay to analyze.
+
+    The per-round ceiling answers "how much may one failure cost"; this answers
+    "how much may one video cost". Both are needed because the failure ladder
+    deliberately keeps a damaged run alive: before it, a video died at its first
+    unfillable item and the per-round number was also the per-video number, and
+    now several items can each spend two full rounds before the video is finished
+    or abandoned.
+
+    This ceiling never denies an item its first selection round. It is checked only
+    where a run is about to buy *recovery* — another phrasing, another provider,
+    the rewritten requirement, or a fresh search for a merged window — so a video
+    that has spent its budget still looks once for every remaining item and then
+    falls to the free rungs of the ladder instead of paying for the expensive ones.
+    That ordering is the whole design: cutting recovery costs cuts money, while
+    cutting first looks would silently cut quality.
+
+    An absent setting means the derived default, an explicit ``0`` removes the
+    ceiling entirely, and a positive value is an absolute cap. A negative value
+    falls back to the default, for the same reason as the per-round budget.
+    """
+    default = (
+        max(1, int(item_count))
+        * max(1, int(candidate_limit))
+        * _DEFAULT_VIDEO_ANALYSIS_PAGES_PER_ITEM
+    )
+    value = config.app.get("smart_material_max_analyzed_candidates_per_video")
+    if value is None or not str(value).strip():
+        return default
+    try:
+        budget = int(str(value).strip())
+    except (TypeError, ValueError):
+        logger.warning(
+            "smart_material_max_analyzed_candidates_per_video is not a number; "
+            f"using {default}: value={value!r}"
+        )
+        return default
+    if budget < 0:
+        logger.warning(
+            "smart_material_max_analyzed_candidates_per_video is negative; "
+            f"using {default}: value={value!r}"
+        )
+        return default
+    return budget
+
+
+def _effective_round_budget(
+    round_budget: int,
+    video_budget: int,
+    video_spent: int,
+) -> int:
+    """The per-round ceiling, narrowed by what is left of the video's ceiling.
+
+    Returning ``0`` would mean "no ceiling", so an exhausted video budget must not
+    be passed through as zero. It becomes ``1`` instead, which is exactly the
+    intended behavior at the selector's seam: the first phrasing on the first
+    provider still runs, and every phrasing and provider after it is abandoned
+    rather than bought.
+    """
+    if not video_budget:
+        return round_budget
+    remaining = max(0, video_budget - max(0, video_spent))
+    if not round_budget:
+        return max(1, remaining)
+    return max(1, min(round_budget, remaining))
+
+
+def max_merged_beats_per_video(beat_count: int) -> int:
+    """How many unfillable beats may be absorbed by a sibling before the video fails.
+
+    Merging is the last rung of the per-beat failure ladder: when no provider,
+    phrasing, or rewritten requirement can fill a beat, a sibling shot of the same
+    semantic group takes over its window. That costs nothing at the video model and
+    keeps the narration timeline intact, but every merge removes a cut, so a video
+    that merged most of its beats is no longer the edit that was planned. The
+    default therefore allows a third of the beats — enough to survive a handful of
+    unlucky requirements, not enough to quietly collapse a 14-shot edit into three.
+
+    An absent setting means that default, an explicit ``0`` disables merging and
+    restores the previous behavior of failing the video on the first unfillable
+    beat, and a positive value is an absolute cap. Raising it past a third is a
+    deliberate trade of visual variety for completion, so it is honored as written
+    rather than clamped. A negative value falls back to the default, because
+    "absorb fewer than no beats" has no reading.
+    """
+    try:
+        total = int(beat_count)
+    except (TypeError, ValueError):
+        total = 0
+    default = max(0, total // 3)
+    value = config.app.get("smart_material_max_merged_beats")
+    if value is None or not str(value).strip():
+        return default
+    try:
+        ceiling = int(str(value).strip())
+    except (TypeError, ValueError):
+        logger.warning(
+            "smart_material_max_merged_beats is not a number; "
+            f"using {default}: value={value!r}"
+        )
+        return default
+    if ceiling < 0:
+        logger.warning(
+            f"smart_material_max_merged_beats is negative; using {default}: "
+            f"value={value!r}"
+        )
+        return default
+    return ceiling
+
+
+def _item_narration_text(visual_item: OrderedVisualItem) -> str:
+    """The words actually spoken over one visual item, or an empty string.
+
+    Beats carry ``spoken_text`` and slots carry narration text under two older
+    names. None of them is part of the shared protocol, so this stays tolerant:
+    without spoken text there is nothing to re-describe, and the caller treats
+    that as "no rewrite available" rather than failing differently.
+    """
+    for attribute in ("spoken_text", "primary_narration_text", "narration_text"):
+        text = " ".join(str(getattr(visual_item, attribute, "") or "").split()).strip()
+        if text:
+            return text
+    return ""
+
+
+def supports_smart_visual_matching(source: str) -> bool:
+    """Report whether a video source can take part in smart visual matching.
+
+    Smart matching needs a searchable stock provider so it can rank candidates
+    and pull an exact sub-range. Local files and generated video have neither a
+    catalog to search nor an alternative to fall back to. This predicate is the
+    single place that decides, so the preflight check, the material download and
+    the renderer hand-off can never disagree about which path a task is on.
+    """
+    return str(source or "").strip().lower() in _STOCK_VIDEO_PROVIDER_API_KEYS
+
+
+def smart_provider_chain(source: str) -> list[str]:
+    """Ordered providers smart matching may try for one visual beat.
+
+    The provider the user picked always goes first, so a working configuration
+    keeps its current behavior. The remaining searchable providers follow in a
+    fixed order and are only reached when the earlier ones produce no candidate
+    that passes the semantic gates. Providers without a configured API key are
+    skipped instead of raising mid-timeline.
+    """
+    primary = str(source or "").strip().lower()
+    if primary not in _STOCK_VIDEO_PROVIDER_API_KEYS:
+        return []
+    ordered = [primary]
+    if is_provider_cascade_enabled():
+        ordered.extend(
+            provider
+            for provider in _SMART_PROVIDER_CASCADE_ORDER
+            if provider != primary
+        )
+    usable = [provider for provider in ordered if provider_has_api_key(provider)]
+    # With no key configured anywhere, keep the user's own provider so the
+    # existing actionable "api key is not set" guidance is what they see.
+    return usable or [primary]
+
+
+def _remote_search_function(provider: str) -> Callable[..., List[MaterialInfo]]:
+    if provider == "pixabay":
+        return search_videos_pixabay
+    if provider == "coverr":
+        return search_videos_coverr
+    return search_videos_pexels
+
+
+def _cached_provider_search(provider: str) -> Callable[..., List[MaterialInfo]]:
+    """Bind one provider to the shared search cache entry point."""
+    remote_search_videos = _remote_search_function(provider)
 
     def search_videos(
         search_term: str,
@@ -1036,6 +1797,33 @@ def download_videos(
             minimum_duration=minimum_duration,
             video_aspect=video_aspect,
         )
+
+    return search_videos
+
+
+def download_videos(
+    task_id: str,
+    search_terms: List[str],
+    source: str = "pexels",
+    video_aspect: VideoAspect = VideoAspect.portrait,
+    video_concat_mode: VideoConcatMode = VideoConcatMode.random,
+    audio_duration: float = 0.0,
+    max_clip_duration: int = 5,
+    match_script_order: bool = False,
+    visual_slots: list[VisualSlot] | None = None,
+    visual_beats: list[VisualBeat] | None = None,
+    clip_speed: float = 1.0,
+    requirement_specs: dict[str, VisualRequirementSpec] | None = None,
+    merged_beats_out: list[VisualBeat] | None = None,
+) -> List[str]:
+    provider = str(source or "").strip().lower()
+    if provider not in _STOCK_VIDEO_PROVIDER_API_KEYS:
+        provider = "pexels"
+    search_videos = _cached_provider_search(provider)
+    provider_searches = [
+        (chain_provider, _cached_provider_search(chain_provider))
+        for chain_provider in smart_provider_chain(provider)
+    ]
 
     material_directory = config.app.get("material_directory", "").strip()
     if material_directory == "task":
@@ -1053,7 +1841,11 @@ def download_videos(
             max_clip_duration=max_clip_duration,
             material_directory=material_directory,
             visual_slots=visual_slots,
+            visual_beats=visual_beats,
             clip_speed=clip_speed,
+            provider_searches=provider_searches,
+            requirement_specs=requirement_specs,
+            merged_beats_out=merged_beats_out,
         )
 
     valid_video_items = []
@@ -1161,183 +1953,1893 @@ def _build_script_order_term_plan(
     ]
 
 
+@dataclass
+class _SmartProviderAttempt:
+    """What one stock provider produced for one ordered visual item."""
+
+    winner: MaterialInfo | None = None
+    segment: dict[str, Any] | None = None
+    verifier_runs: list[dict[str, Any]] = dataclass_field(default_factory=list)
+    failure_reason: str = ""
+    candidates_analyzed: int = 0
+    source_seconds_analyzed: float = 0.0
+    segmentation_calls: int = 0
+    had_candidates: bool = False
+    # Assets this attempt already paid a verdict for. The next phrasing of the
+    # same item must not buy the same verdict twice.
+    evaluated_identities: list[tuple[str, str]] = dataclass_field(default_factory=list)
+    # Candidates verification approved but did not rank first, best first. Their
+    # verdicts are already paid for, so a winner whose media transfer fails can
+    # promote one of them without buying a second analysis.
+    approved_alternates: list[MaterialInfo] = dataclass_field(default_factory=list)
+
+    @property
+    def succeeded(self) -> bool:
+        return (
+            not self.failure_reason
+            and self.winner is not None
+            and self.segment is not None
+        )
+
+
+def _approved_alternate_candidates(
+    candidates: Sequence[MaterialInfo],
+    candidate_evaluations: Sequence[Any],
+    winner: MaterialInfo | None,
+) -> list[MaterialInfo]:
+    """Verified runner-ups for one attempt, best ranked first.
+
+    Only candidates verification actually approved qualify. A rejected candidate
+    is not a fallback: promoting one would put footage into the video that
+    verification refused, which is the opposite of a per-beat fail-closed policy.
+    """
+    winner_identity = _provider_asset_identity(winner) if winner is not None else None
+    candidates_by_identity: dict[tuple[str, str], MaterialInfo] = {}
+    for candidate in candidates:
+        identity = _provider_asset_identity(candidate)
+        if identity is None or identity in candidates_by_identity:
+            continue
+        candidates_by_identity[identity] = candidate
+
+    ranked: list[tuple[int, MaterialInfo]] = []
+    seen: set[tuple[str, str]] = set()
+    for position, evaluation in enumerate(candidate_evaluations):
+        if not isinstance(evaluation, dict) or evaluation.get("accepted") is not True:
+            continue
+        identity = (
+            str(evaluation.get("provider") or "").strip(),
+            str(evaluation.get("provider_asset_id") or "").strip(),
+        )
+        if not identity[0] or not identity[1]:
+            continue
+        if identity == winner_identity or identity in seen:
+            continue
+        candidate = candidates_by_identity.get(identity)
+        if candidate is None:
+            continue
+        seen.add(identity)
+        try:
+            rank = int(evaluation["ranking_position"])
+        except (KeyError, TypeError, ValueError):
+            # Ranking metadata is provenance, not a contract. Without it the
+            # evaluation order is still a usable order.
+            rank = len(candidate_evaluations) + position + 1
+        ranked.append((rank, candidate))
+
+    ranked.sort(key=lambda entry: entry[0])
+    return [candidate for _, candidate in ranked]
+
+
+def _segment_smart_candidate(
+    *,
+    candidate: MaterialInfo,
+    visual_item: OrderedVisualItem,
+    requirement: str,
+    required_source_duration: float,
+    normalized_speed: float,
+    settings: dict[str, Any],
+    twelvelabs_service,
+    item_name: str,
+    item_log_name: str,
+) -> tuple[dict[str, Any] | None, str]:
+    """Return the source window to render for one candidate, or why there is none.
+
+    Segmentation stays winner-only: this runs for the candidate that is about to
+    join the timeline, never for the field of candidates being judged. The
+    requirement is passed in rather than read from the item, because a recovered
+    item is verified and segmented against its rewritten requirement.
+    """
+    asset_identity = _provider_asset_identity(candidate)
+    asset_id = asset_identity[1] if asset_identity is not None else ""
+    try:
+        segment = twelvelabs_service.segment_winner(
+            video_url=candidate.url,
+            narration_text=requirement,
+            slot_duration=visual_item.duration,
+            source_duration=float(candidate.duration),
+            clip_speed=normalized_speed,
+            requested_source_duration=required_source_duration,
+        )
+    except twelvelabs_service.TemporalSegmentationError as exc:
+        if settings["fail_closed"]:
+            if exc.category == "auth_quota":
+                return None, (
+                    f"{item_name} {visual_item.index} temporal segmentation "
+                    f"failed: {exc}"
+                )
+            return None, (
+                f"{item_name} {visual_item.index} temporal segmentation is "
+                "temporarily "
+                f"unavailable: {exc}"
+            )
+        logger.warning(
+            "winner segmentation service failed; explicit fail-open is enabled: "
+            f"{item_log_name}={visual_item.index}, reason={exc}"
+        )
+        segment = None
+    if segment is not None:
+        segment = _normalize_selected_source_range(
+            segment,
+            source_duration=float(candidate.duration),
+            required_source_duration=required_source_duration,
+        )
+    if segment is None and settings["fail_closed"]:
+        return None, (
+            "No valid TwelveLabs temporal segment matched narration for "
+            f"{item_log_name} {visual_item.index}"
+        )
+    if segment is None:
+        segment = {
+            "source_start_time": 0.0,
+            "source_end_time": min(float(candidate.duration), required_source_duration),
+            "description": "explicit fail-open zero-start fallback",
+        }
+        logger.warning(
+            "winner segmentation unavailable; using explicit fail-open source "
+            f"start for {item_log_name}={visual_item.index}, "
+            f"asset_id={asset_id or 'unknown'}"
+        )
+    return segment, ""
+
+
+def _attempt_smart_provider_selection(
+    *,
+    provider: str,
+    search_videos: Callable[..., List[MaterialInfo]],
+    visual_item: OrderedVisualItem,
+    requirement: str,
+    search_query: str,
+    requirement_spec,
+    required_source_duration: float,
+    video_aspect: VideoAspect,
+    settings: dict[str, Any],
+    candidate_limit: int,
+    normalized_speed: float,
+    twelvelabs_service,
+    used_asset_identities: set[tuple[str, str]],
+    used_urls: set[str],
+    item_name: str,
+    item_log_name: str,
+) -> _SmartProviderAttempt:
+    """Search one stock provider and return its winner, or why it produced none.
+
+    Every gate that can reject a provider is reported through
+    ``failure_reason`` instead of raising, so the caller can try the next
+    provider in the cascade before giving up on the whole timeline.
+
+    ``requirement`` is the wording this attempt is judged against. It is normally
+    the item's own requirement and differs from it only for a recovery round, so
+    the persisted run records which wording actually bought the analysis.
+    """
+    attempt = _SmartProviderAttempt()
+    run: dict[str, Any] = {
+        "visual_item_type": item_log_name.replace(" ", "_"),
+        "visual_item_index": visual_item.index,
+        "visual_requirement": requirement,
+        "search_query": search_query,
+        "stock_provider": provider,
+        "visual_requirement_spec": (
+            llm.visual_requirement_spec_to_dict(requirement_spec)
+            if requirement_spec is not None
+            else None
+        ),
+        "candidate_evaluations": [],
+    }
+    semantic_group_id = getattr(visual_item, "semantic_group_id", None)
+    if isinstance(semantic_group_id, int) and semantic_group_id > 0:
+        run["semantic_group_id"] = semantic_group_id
+
+    video_items = search_videos(
+        search_term=search_query,
+        minimum_duration=math.ceil(max(4.0, required_source_duration)),
+        video_aspect=video_aspect,
+    )
+    prepared = _prepare_twelvelabs_candidates(
+        video_items,
+        video_aspect=video_aspect,
+        required_source_duration=required_source_duration,
+        preferred_max_source_duration=settings["preferred_max_source_duration"],
+    )
+    candidates = []
+    for item in prepared:
+        if _is_duplicate_material(item, used_asset_identities, used_urls):
+            continue
+        candidates.append(item)
+
+    narration_preview = re.sub(r"\s+", " ", requirement).strip()[:160]
+    logger.info(
+        f"smart {item_log_name} candidates: "
+        f"index={visual_item.index}, provider={provider}, "
+        f"narration={narration_preview!r}, "
+        f"query={search_query!r}, after_cheap_filters={len(candidates)}"
+    )
+    if not candidates:
+        run["final_decision"] = "NO_CANDIDATES"
+        attempt.verifier_runs.append(run)
+        attempt.failure_reason = (
+            f"No valid {provider} candidate remained for {item_log_name} "
+            f"{visual_item.index} "
+            "after metadata quality filters"
+        )
+        return attempt
+
+    attempt.had_candidates = True
+    if requirement_spec is None:
+        winner = None
+        stats: dict[str, Any] = {
+            "api_candidates_analyzed": 0,
+            "source_seconds_analyzed": 0.0,
+            "candidate_evaluations": [],
+            "api_failure_reason": "visual requirement decomposition was unavailable",
+        }
+    else:
+        winner, stats = twelvelabs_service.select_best_candidate(
+            candidates=candidates,
+            slot_index=visual_item.index,
+            slot_duration=visual_item.duration,
+            narration_text=requirement,
+            search_query=search_query,
+            requirement_spec=requirement_spec,
+            batch_size=settings["batch_size"],
+            max_candidates=candidate_limit,
+            minimum_score=settings["minimum_score"],
+            strong_early_stop_score=settings["strong_early_stop_score"],
+            concurrency=settings["concurrency"],
+        )
+    attempt.candidates_analyzed = int(stats["api_candidates_analyzed"])
+    attempt.source_seconds_analyzed = float(stats["source_seconds_analyzed"])
+    run["candidate_evaluations"] = stats.get("candidate_evaluations", [])
+    # Only the candidates that actually reached a verdict are reported back. The
+    # tail this attempt never looked at stays available to the next phrasing,
+    # which is the whole reason another phrasing is worth trying.
+    for evaluation in run["candidate_evaluations"]:
+        if not isinstance(evaluation, dict):
+            continue
+        evaluated_provider = str(evaluation.get("provider") or "").strip()
+        evaluated_asset_id = str(evaluation.get("provider_asset_id") or "").strip()
+        if evaluated_provider and evaluated_asset_id:
+            attempt.evaluated_identities.append(
+                (evaluated_provider, evaluated_asset_id)
+            )
+    run["final_decision"] = "ACCEPT" if winner is not None else "REJECT"
+
+    if winner is None and not settings["fail_closed"]:
+        # Explicit fail-open is honored on the first provider that returned any
+        # candidate at all: the operator asked for output over quality, so
+        # spending further provider and analysis budget would be pointless.
+        winner = candidates[0]
+        run["final_decision"] = "FAIL_OPEN_FALLBACK"
+        logger.warning(
+            "no TwelveLabs candidate passed; using explicit fail-open legacy "
+            f"fallback for {item_log_name}={visual_item.index}"
+        )
+    if winner is None:
+        attempt.verifier_runs.append(run)
+        api_failure_reason = stats.get("api_failure_reason")
+        if api_failure_reason:
+            attempt.failure_reason = (
+                f"{item_name} {visual_item.index} could not be analyzed: "
+                f"{api_failure_reason}"
+            )
+        else:
+            attempt.failure_reason = (
+                f"No TwelveLabs candidate satisfied narration for {item_log_name} "
+                f"{visual_item.index}; cross-segment fallback was not used"
+            )
+        return attempt
+
+    winner_identity = _provider_asset_identity(winner)
+    if winner_identity is not None:
+        run["winner"] = {
+            "provider": winner_identity[0],
+            "provider_asset_id": winner_identity[1],
+            "overall_score": round(float(winner.overall_score or 0.0), 4),
+        }
+    attempt.verifier_runs.append(run)
+    attempt.winner = winner
+    attempt.approved_alternates = _approved_alternate_candidates(
+        candidates,
+        run["candidate_evaluations"],
+        winner,
+    )
+
+    attempt.segmentation_calls = 1
+    segment, segment_failure = _segment_smart_candidate(
+        candidate=winner,
+        visual_item=visual_item,
+        requirement=requirement,
+        required_source_duration=required_source_duration,
+        normalized_speed=normalized_speed,
+        settings=settings,
+        twelvelabs_service=twelvelabs_service,
+        item_name=item_name,
+        item_log_name=item_log_name,
+    )
+    if segment is None:
+        attempt.failure_reason = segment_failure
+        return attempt
+    attempt.segment = segment
+    return attempt
+
+
+def _ordered_item_search_queries(
+    visual_item: OrderedVisualItem,
+    primary_query: str,
+    limit: int,
+) -> list[str]:
+    """Phrasings to try for one visual item, in planned order.
+
+    The planned query stays first, so a configuration that already produced a
+    good clip keeps producing the same clip. The remaining phrasings the script
+    stage generated for this item follow in their own order; duplicates and blank
+    entries are dropped, because repeating a phrasing buys a second bill and no
+    new candidates.
+    """
+    ordered = [primary_query]
+    seen = {primary_query}
+    for query in visual_item.search_queries or []:
+        variant = str(query or "").strip()
+        if not variant or variant in seen:
+            continue
+        seen.add(variant)
+        ordered.append(variant)
+    return ordered[: max(1, limit)]
+
+
+@dataclass
+class _SmartItemSelection:
+    """What one full round of provider and phrasing attempts produced for an item.
+
+    A round is the unit that can be repeated: the same item may be selected for
+    twice, once against its planned requirement and once against a rewritten one.
+    Usage counters and provenance are kept per round so the caller can accumulate
+    them without knowing how many rounds ran.
+    """
+
+    attempt: _SmartProviderAttempt | None = None
+    provider: str = ""
+    query: str = ""
+    requirement: str = ""
+    failures: list[str] = dataclass_field(default_factory=list)
+    verifier_runs: list[dict[str, Any]] = dataclass_field(default_factory=list)
+    candidates_analyzed: int = 0
+    source_seconds_analyzed: float = 0.0
+    segmentation_calls: int = 0
+
+
+def _select_smart_item_winner(
+    *,
+    visual_item: OrderedVisualItem,
+    requirement: str,
+    requirement_spec,
+    item_queries: Sequence[str],
+    provider_chain: Sequence[tuple[str, Callable[..., List[MaterialInfo]]]],
+    required_source_duration: float,
+    video_aspect: VideoAspect,
+    settings: dict[str, Any],
+    candidate_limit: int,
+    normalized_speed: float,
+    twelvelabs_service,
+    item_asset_identities: set[tuple[str, str]],
+    item_urls: set[str],
+    item_name: str,
+    item_log_name: str,
+    analysis_budget: int = 0,
+) -> _SmartItemSelection:
+    """Try every phrasing on every provider for one item, best effort, no raising.
+
+    ``item_asset_identities`` is updated in place, so a second round for the same
+    item never re-buys a verdict the first round already paid for.
+
+    ``analysis_budget`` is a spend ceiling in analyzed candidates. ``0`` means no
+    ceiling. It is checked before opening each new phrasing or provider, never
+    mid-attempt, so a search already dispatched still finishes and an item that
+    settles inside its first batch never notices the budget at all.
+    """
+    selection = _SmartItemSelection(
+        query=item_queries[0] if item_queries else "",
+        requirement=requirement,
+    )
+    budget_exhausted = False
+    for provider_name, provider_search in provider_chain:
+        provider_settled = False
+        for query_position, item_query in enumerate(item_queries):
+            if analysis_budget and selection.candidates_analyzed >= analysis_budget:
+                budget_exhausted = True
+                break
+            attempt = _attempt_smart_provider_selection(
+                provider=provider_name,
+                search_videos=provider_search,
+                visual_item=visual_item,
+                requirement=requirement,
+                search_query=item_query,
+                requirement_spec=requirement_spec,
+                required_source_duration=required_source_duration,
+                video_aspect=video_aspect,
+                settings=settings,
+                candidate_limit=candidate_limit,
+                normalized_speed=normalized_speed,
+                twelvelabs_service=twelvelabs_service,
+                used_asset_identities=item_asset_identities,
+                used_urls=item_urls,
+                item_name=item_name,
+                item_log_name=item_log_name,
+            )
+            selection.candidates_analyzed += attempt.candidates_analyzed
+            selection.source_seconds_analyzed += attempt.source_seconds_analyzed
+            selection.segmentation_calls += attempt.segmentation_calls
+            selection.verifier_runs.extend(attempt.verifier_runs)
+            item_asset_identities.update(attempt.evaluated_identities)
+            if attempt.succeeded:
+                selection.attempt = attempt
+                selection.provider = provider_name
+                selection.query = item_query
+                break
+            failure_context = []
+            if len(provider_chain) > 1:
+                failure_context.append(f"provider={provider_name}")
+            if len(item_queries) > 1:
+                failure_context.append(f"query={item_query!r}")
+            selection.failures.append(
+                f"{', '.join(failure_context)}: {attempt.failure_reason}"
+                if failure_context
+                else attempt.failure_reason
+            )
+            if attempt.had_candidates and not settings["fail_closed"]:
+                # Fail-open already accepted this provider's best available
+                # candidate, so neither another phrasing nor another provider
+                # can improve the result.
+                provider_settled = True
+                break
+            if query_position + 1 < len(item_queries):
+                logger.warning(
+                    "search query produced no usable winner; trying the next "
+                    f"phrasing on the same provider: "
+                    f"{item_log_name}={visual_item.index}, "
+                    f"provider={provider_name}, query={item_query!r}, "
+                    f"reason={attempt.failure_reason}"
+                )
+        if selection.attempt is not None or provider_settled or budget_exhausted:
+            break
+        if len(provider_chain) > 1:
+            logger.warning(
+                "stock provider produced no usable winner for any phrasing; "
+                "trying the next provider: "
+                f"{item_log_name}={visual_item.index}, "
+                f"provider={provider_name}, queries={len(item_queries)}"
+            )
+    if budget_exhausted and selection.attempt is None:
+        # The round was not going to be satisfied and had already cost its whole
+        # budget; the remaining phrasings and providers are abandoned, not bought.
+        logger.warning(
+            "analysis budget reached before a winner; abandoning the remaining "
+            f"phrasings and providers: {item_log_name}={visual_item.index}, "
+            f"analyzed={selection.candidates_analyzed}, budget={analysis_budget}"
+        )
+        selection.failures.append(
+            f"analysis budget of {analysis_budget} analyzed candidates reached for "
+            f"{item_log_name} {visual_item.index}; remaining phrasings and "
+            "providers were not requested"
+        )
+        # Persisted, not only raised: a round the ceiling cut short may still be
+        # rescued by the rewrite, and a run that silently stopped looking would
+        # otherwise be indistinguishable from one that searched everything.
+        selection.verifier_runs.append(
+            {
+                "visual_item_type": item_log_name.replace(" ", "_"),
+                "visual_item_index": visual_item.index,
+                "visual_requirement": requirement,
+                "final_decision": "ANALYSIS_BUDGET_EXHAUSTED",
+                "candidates_analyzed": selection.candidates_analyzed,
+                "analysis_budget": analysis_budget,
+            }
+        )
+    return selection
+
+
+def _alternative_item_search_queries(
+    visual_item: OrderedVisualItem,
+    requirement: str,
+    narration_text: str,
+    limit: int,
+) -> list[str]:
+    """Stock queries for a rewritten requirement.
+
+    The phrasings the script stage planned belong to the requirement that just
+    failed, so reusing them would search for the wording being abandoned. Fresh
+    ones are requested for the new wording instead; if that request fails, a short
+    requirement is itself a usable query and a long one is not.
+    """
+    start_time = float(getattr(visual_item, "start_time", 0.0) or 0.0)
+    end_time = float(
+        getattr(visual_item, "end_time", 0.0) or start_time + float(visual_item.duration)
+    )
+    try:
+        generated = llm.generate_visual_slot_queries(
+            video_subject=narration_text,
+            visual_slots=[
+                {
+                    "slot_index": visual_item.index,
+                    "start_time": start_time,
+                    "end_time": end_time,
+                    "visual_requirement": requirement,
+                }
+            ],
+            queries_per_slot=max(1, limit),
+        )
+    except Exception as exc:
+        logger.warning(
+            "could not generate queries for a rewritten visual requirement: "
+            f"index={visual_item.index}, error={type(exc).__name__}: {exc}"
+        )
+        generated = {}
+
+    queries: list[str] = []
+    for query in (generated or {}).get(visual_item.index) or []:
+        text = str(query or "").strip()
+        if text and text not in queries:
+            queries.append(text)
+    if queries:
+        return queries[: max(1, limit)]
+    words = requirement.split()
+    if 1 <= len(words) <= _MAX_REQUIREMENT_QUERY_WORDS:
+        return [" ".join(words)]
+    return []
+
+
+def _rewrite_requirement_and_reselect(
+    *,
+    visual_item: OrderedVisualItem,
+    failed_requirement: str,
+    failure_summary: str,
+    query_limit: int,
+    provider_chain: Sequence[tuple[str, Callable[..., List[MaterialInfo]]]],
+    required_source_duration: float,
+    video_aspect: VideoAspect,
+    settings: dict[str, Any],
+    candidate_limit: int,
+    normalized_speed: float,
+    twelvelabs_service,
+    item_asset_identities: set[tuple[str, str]],
+    item_urls: set[str],
+    item_name: str,
+    item_log_name: str,
+    analysis_budget: int = 0,
+) -> _SmartItemSelection:
+    """Describe one unfillable item a second way and select for it once more.
+
+    The narration is what the video promised; the requirement is only one reading
+    of it. So the recovery keeps the narration fixed and replaces the reading,
+    which is why the alternative must quote the item's own spoken text to be
+    accepted. Exactly one alternative is tried, and the returned selection carries
+    the wording that was used so the caller segments and logs the same reading.
+    """
+    item_type = item_log_name.replace(" ", "_")
+
+    def _unavailable(reason: str) -> _SmartItemSelection:
+        return _SmartItemSelection(
+            requirement=failed_requirement,
+            failures=[
+                f"No alternative visual requirement was usable for "
+                f"{item_log_name} {visual_item.index}: {reason}"
+            ],
+            verifier_runs=[
+                {
+                    "visual_item_type": item_type,
+                    "visual_item_index": visual_item.index,
+                    "visual_requirement": failed_requirement,
+                    "final_decision": "REQUIREMENT_REWRITE_UNAVAILABLE",
+                    "reason": reason,
+                }
+            ],
+        )
+
+    narration_text = _item_narration_text(visual_item)
+    if not narration_text:
+        return _unavailable("the item carries no spoken text to re-describe")
+
+    alternatives = llm.generate_alternative_visual_requirements(
+        [
+            {
+                "item_index": visual_item.index,
+                "narration_text": narration_text,
+                "failed_requirement": failed_requirement,
+                "problem": failure_summary,
+            }
+        ]
+    )
+    alternative = alternatives.get(visual_item.index) or {}
+    alternative_requirement = str(alternative.get("visual_requirement") or "").strip()
+    if not alternative_requirement:
+        return _unavailable("no grounded alternative wording was returned")
+
+    requirement_spec = llm.generate_visual_requirement_specs(
+        [alternative_requirement]
+    ).get(llm.normalize_visual_requirement(alternative_requirement))
+    if requirement_spec is None and settings["fail_closed"]:
+        return _unavailable("the alternative wording could not be decomposed either")
+
+    item_queries = _alternative_item_search_queries(
+        visual_item,
+        alternative_requirement,
+        narration_text,
+        query_limit,
+    )
+    if not item_queries:
+        return _unavailable("no searchable query could be derived from it")
+
+    logger.warning(
+        "re-describing an unfillable visual requirement and searching once more: "
+        f"{item_log_name}={visual_item.index}, "
+        f"rejected={failed_requirement!r}, alternative={alternative_requirement!r}, "
+        f"queries={len(item_queries)}"
+    )
+    selection = _select_smart_item_winner(
+        visual_item=visual_item,
+        requirement=alternative_requirement,
+        requirement_spec=requirement_spec,
+        item_queries=item_queries,
+        provider_chain=provider_chain,
+        required_source_duration=required_source_duration,
+        video_aspect=video_aspect,
+        settings=settings,
+        candidate_limit=candidate_limit,
+        normalized_speed=normalized_speed,
+        twelvelabs_service=twelvelabs_service,
+        item_asset_identities=item_asset_identities,
+        item_urls=item_urls,
+        item_name=item_name,
+        item_log_name=item_log_name,
+        analysis_budget=analysis_budget,
+    )
+    selection.verifier_runs.insert(
+        0,
+        {
+            "visual_item_type": item_type,
+            "visual_item_index": visual_item.index,
+            "visual_requirement": failed_requirement,
+            "final_decision": "REQUIREMENT_REWRITTEN",
+            "alternative_visual_requirement": alternative_requirement,
+            "narration_basis": str(alternative.get("narration_basis") or ""),
+        },
+    )
+    return selection
+
+
+@dataclass
+class _SmartDownloadResult:
+    """What transferring one approved selection to disk produced."""
+
+    video_path: str = ""
+    winner: MaterialInfo | None = None
+    verifier_runs: list[dict[str, Any]] = dataclass_field(default_factory=list)
+    failures: list[str] = dataclass_field(default_factory=list)
+    segmentation_calls: int = 0
+
+
+def _download_smart_winner(
+    *,
+    attempt: _SmartProviderAttempt,
+    visual_item: OrderedVisualItem,
+    requirement: str,
+    provider: str,
+    query: str,
+    required_target_duration: float,
+    required_source_duration: float,
+    normalized_speed: float,
+    settings: dict[str, Any],
+    twelvelabs_service,
+    material_directory: str,
+    video_aspect: VideoAspect,
+    is_visual_beat: bool,
+    item_name: str,
+    item_log_name: str,
+) -> _SmartDownloadResult:
+    """Transfer the approved selection for one visual item, or report why none arrived.
+
+    A verified winner whose media transfer fails is a transport problem, not a
+    verification problem, and it must not cost the whole video. Candidates this
+    item already approved are promoted in ranking order; each one only needs its
+    own source window, so segmentation stays winner-only.
+
+    ``visual_item`` is the item the window is being cut for, which is not always
+    the item the analysis was bought for: a merged beat reuses a sibling's already
+    approved asset and asks only for a longer window out of it.
+    """
+    result = _SmartDownloadResult()
+    winner = attempt.winner
+    segment = attempt.segment
+    if winner is None or segment is None:
+        # Unreachable through _SmartProviderAttempt.succeeded; kept so a future
+        # refactor cannot silently render an unbound source window.
+        raise SmartMaterialSelectionError(
+            f"{item_name} {visual_item.index} produced an incomplete "
+            "smart selection result"
+        )
+
+    download_plan: list[tuple[MaterialInfo, dict[str, Any] | None]] = [
+        (winner, segment)
+    ]
+    download_plan.extend(
+        (alternate, None) for alternate in attempt.approved_alternates
+    )
+    for plan_position, (candidate, candidate_segment) in enumerate(download_plan):
+        if candidate_segment is None:
+            result.segmentation_calls += 1
+            candidate_segment, segment_failure = _segment_smart_candidate(
+                candidate=candidate,
+                visual_item=visual_item,
+                requirement=requirement,
+                required_source_duration=required_source_duration,
+                normalized_speed=normalized_speed,
+                settings=settings,
+                twelvelabs_service=twelvelabs_service,
+                item_name=item_name,
+                item_log_name=item_log_name,
+            )
+            if candidate_segment is None:
+                result.failures.append(segment_failure)
+                continue
+        candidate_identity = _provider_asset_identity(candidate)
+        candidate_asset_id = (
+            candidate_identity[1] if candidate_identity is not None else ""
+        )
+        source = (
+            candidate.source_info if isinstance(candidate.source_info, dict) else {}
+        )
+
+        candidate.source_start_time = float(candidate_segment["source_start_time"])
+        candidate.source_end_time = float(candidate_segment["source_end_time"])
+        source = dict(source)
+        source["slot_index"] = visual_item.index
+        if is_visual_beat:
+            source["visual_beat_index"] = visual_item.index
+            source["semantic_group_id"] = int(getattr(visual_item, "semantic_group_id"))
+        source["required_target_duration"] = required_target_duration
+        source["required_source_duration"] = required_source_duration
+        source["temporal_segment"] = dict(candidate_segment)
+        candidate.source_info = source
+        candidate.search_query = query
+        logger.info(
+            "smart visual winner: "
+            f"{item_log_name}={visual_item.index}, provider={provider}, "
+            f"query={query!r}, "
+            f"asset_id={candidate_asset_id or 'unknown'}, "
+            f"score={float(candidate.overall_score or 0):.4f}, "
+            f"source_start={candidate.source_start_time:.3f}, "
+            f"source_end={candidate.source_end_time:.3f}"
+        )
+
+        saved_video_path = save_video(
+            video_url=candidate.url,
+            save_dir=material_directory,
+            video_aspect=video_aspect,
+        )
+        if saved_video_path:
+            if plan_position:
+                logger.warning(
+                    "the ranked winner could not be downloaded; promoted an "
+                    "already approved candidate for this "
+                    f"{item_log_name}: index={visual_item.index}, "
+                    f"provider={provider}, "
+                    f"asset_id={candidate_asset_id or 'unknown'}, "
+                    f"plan_position={plan_position + 1}"
+                )
+                result.verifier_runs.append(
+                    {
+                        "visual_item_type": item_log_name.replace(" ", "_"),
+                        "visual_item_index": visual_item.index,
+                        "visual_requirement": requirement,
+                        "stock_provider": provider,
+                        "search_query": query,
+                        "final_decision": "WINNER_DOWNLOAD_SUBSTITUTED",
+                        "promoted_plan_position": plan_position + 1,
+                    }
+                )
+            result.video_path = saved_video_path
+            result.winner = candidate
+            return result
+        result.failures.append(
+            f"The selected {provider} winner for {item_log_name} "
+            f"{visual_item.index} could not "
+            "be downloaded"
+        )
+    return result
+
+
+_MERGE_TIME_TOLERANCE_SECONDS = 1e-6
+
+
+@dataclass
+class _SmartItemOutcome:
+    """What one visual item ended up with, before merges are resolved.
+
+    Winners used to be appended to the timeline the moment they downloaded, which
+    meant the first unfillable item had to fail the whole video: there was nowhere
+    to record "this one is still open" and nothing left to reconsider. Keeping one
+    outcome per item instead lets an unfillable item stay open long enough for a
+    sibling shot to absorb its window.
+    """
+
+    visual_item: OrderedVisualItem
+    requirement: str
+    beat: VisualBeat | None = None
+    provider: str = ""
+    query: str = ""
+    video_path: str = ""
+    winner: MaterialInfo | None = None
+    failures: list[str] = dataclass_field(default_factory=list)
+    # The index of the beat that absorbed this one, or 0 while it is still its own
+    # beat. An absorbed item contributes no clip and no record.
+    absorbed_by: int = 0
+    absorbed_indexes: list[int] = dataclass_field(default_factory=list)
+
+    @property
+    def filled(self) -> bool:
+        return bool(self.video_path) and self.winner is not None
+
+
+def _records_from_outcomes(
+    outcomes: Sequence[_SmartItemOutcome],
+) -> list[dict[str, Any]]:
+    """Persisted source records for the items that actually reached the timeline.
+
+    An item that is still open, or that a sibling absorbed, contributes no clip and
+    therefore no record — so ``material_sources`` stays one record per rendered
+    beat even when the timeline no longer matches the plan.
+    """
+    return [
+        _material_source_record(outcome.winner, outcome.video_path)
+        for outcome in outcomes
+        if outcome.filled and outcome.winner is not None
+    ]
+
+
+@dataclass
+class _MergeResolution:
+    """What resolving the open items by merging produced."""
+
+    merged: int = 0
+    verifier_runs: list[dict[str, Any]] = dataclass_field(default_factory=list)
+    failures: list[str] = dataclass_field(default_factory=list)
+    candidates_analyzed: int = 0
+    source_seconds_analyzed: float = 0.0
+    segmentation_calls: int = 0
+
+
+def _beats_are_adjacent(earlier: VisualBeat, later: VisualBeat) -> bool:
+    """Whether one beat ends exactly where the other begins."""
+    return math.isclose(
+        earlier.end_time,
+        later.start_time,
+        rel_tol=0.0,
+        abs_tol=_MERGE_TIME_TOLERANCE_SECONDS,
+    )
+
+
+def _has_mergeable_sibling(beats: Sequence[VisualBeat], position: int) -> bool:
+    """Whether the beat at ``position`` could ever be absorbed by a neighbour.
+
+    This reads the planned timeline only, so it costs nothing and is allowed to be
+    optimistic: the sibling it finds may itself turn out to be unfillable. Its job
+    is to stop a run from paying for every remaining beat when the beat that just
+    failed is the only shot of its group and could never have been rescued.
+    """
+    beat = beats[position]
+    for other_position in (position - 1, position + 1):
+        if not 0 <= other_position < len(beats):
+            continue
+        other = beats[other_position]
+        if other.semantic_group_id != beat.semantic_group_id:
+            continue
+        if _beats_are_adjacent(other, beat) or _beats_are_adjacent(beat, other):
+            return True
+    return False
+
+
+def _merged_visual_beat(survivor: VisualBeat, absorbed: VisualBeat) -> VisualBeat:
+    """One beat covering both windows, keeping the survivor's identity.
+
+    The survivor keeps its index because its clip, its persisted source record and
+    its verifier runs already refer to it. The absorbed index is retired rather
+    than reused, so a run record saying beat 5 was unfillable still points at a
+    beat that no longer exists in the timeline — which is exactly what happened to
+    it. Everything else is inherited from the survivor, which is sound only because
+    both beats are shots of one semantic group and therefore already share a
+    requirement and a source span.
+    """
+    first, second = (
+        (survivor, absorbed)
+        if survivor.start_time <= absorbed.start_time
+        else (absorbed, survivor)
+    )
+    start_units = [
+        unit for unit in (first.start_unit, second.start_unit) if unit is not None
+    ]
+    end_units = [
+        unit
+        for unit in (first.end_unit_exclusive, second.end_unit_exclusive)
+        if unit is not None
+    ]
+    duration = second.end_time - first.start_time
+    return dataclass_replace(
+        survivor,
+        start_time=first.start_time,
+        end_time=second.end_time,
+        duration=duration,
+        spoken_text=" ".join(f"{first.spoken_text} {second.spoken_text}".split()),
+        source_narration_slot_indexes=sorted(
+            {
+                *first.source_narration_slot_indexes,
+                *second.source_narration_slot_indexes,
+            }
+        ),
+        start_unit=min(start_units) if start_units else None,
+        end_unit_exclusive=max(end_units) if end_units else None,
+        duration_policy="unfillable_beat_merged",
+        rapid_cut=(
+            duration < VISUAL_BEAT_RAPID_CUT_SECONDS - _MERGE_TIME_TOLERANCE_SECONDS
+        ),
+    )
+
+
+def validate_merged_beat_timeline(beats: Sequence[VisualBeat]) -> None:
+    """Check a merged timeline still covers the narration without a seam.
+
+    The timeline the script stage validated required beat indexes to run 1..N,
+    which a merge deliberately breaks: absorbing a beat retires its index so the
+    surviving clip keeps the identity its persisted record was written under. So
+    this re-checks everything the renderer actually depends on — a start at zero,
+    no gap or overlap, and a duration that matches its own endpoints — while
+    requiring indexes only to be unique and increasing.
+    """
+    if not beats:
+        raise ValueError("merged visual beat timeline is empty")
+    if abs(beats[0].start_time) > _MERGE_TIME_TOLERANCE_SECONDS:
+        raise ValueError("merged visual beat timeline must start at zero")
+    previous_index = 0
+    previous_end: float | None = None
+    for beat in beats:
+        if beat.index <= previous_index:
+            raise ValueError("merged visual beat indexes must increase")
+        previous_index = beat.index
+        if not math.isfinite(beat.start_time) or not math.isfinite(beat.end_time):
+            raise ValueError("merged visual beat timing must be finite")
+        if beat.duration <= _MERGE_TIME_TOLERANCE_SECONDS:
+            raise ValueError("merged visual beat duration must be positive")
+        if not math.isclose(
+            beat.duration,
+            beat.end_time - beat.start_time,
+            rel_tol=0.0,
+            abs_tol=_MERGE_TIME_TOLERANCE_SECONDS,
+        ):
+            raise ValueError("merged visual beat duration is inconsistent")
+        if previous_end is not None and not math.isclose(
+            previous_end,
+            beat.start_time,
+            rel_tol=0.0,
+            abs_tol=_MERGE_TIME_TOLERANCE_SECONDS,
+        ):
+            raise ValueError("merged visual beat timeline contains a gap or overlap")
+        previous_end = beat.end_time
+
+
+def _adjacent_merge_survivors(
+    outcomes: Sequence[_SmartItemOutcome],
+    position: int,
+) -> list[_SmartItemOutcome]:
+    """Filled same-group neighbours that touch the open beat, previous side first.
+
+    Only the nearest neighbour on each side is considered, and an already absorbed
+    outcome is looked straight through, so a run of consecutive open beats can
+    still collapse into one survivor: the first merge extends that survivor's
+    window until it reaches the next open beat.
+    """
+    beat = outcomes[position].beat
+    if beat is None:
+        return []
+    survivors: list[_SmartItemOutcome] = []
+    for step in (-1, 1):
+        other_position = position + step
+        while 0 <= other_position < len(outcomes):
+            other = outcomes[other_position]
+            if other.absorbed_by:
+                other_position += step
+                continue
+            other_beat = other.beat
+            if (
+                other.filled
+                and other_beat is not None
+                and other_beat.semantic_group_id == beat.semantic_group_id
+                and (
+                    _beats_are_adjacent(other_beat, beat)
+                    if step < 0
+                    else _beats_are_adjacent(beat, other_beat)
+                )
+            ):
+                survivors.append(other)
+            break
+    return survivors
+
+
+def _restamp_merged_source(
+    *,
+    winner: MaterialInfo,
+    merged_beat: VisualBeat,
+    segment: dict[str, Any],
+    required_target_duration: float,
+    required_source_duration: float,
+) -> None:
+    """Point an already downloaded winner at the wider window it now has to cover."""
+    winner.source_start_time = float(segment["source_start_time"])
+    winner.source_end_time = float(segment["source_end_time"])
+    source = dict(winner.source_info) if isinstance(winner.source_info, dict) else {}
+    source["slot_index"] = merged_beat.index
+    source["visual_beat_index"] = merged_beat.index
+    source["semantic_group_id"] = int(merged_beat.semantic_group_id)
+    source["required_target_duration"] = required_target_duration
+    source["required_source_duration"] = required_source_duration
+    source["temporal_segment"] = dict(segment)
+    winner.source_info = source
+
+
+def _merge_unfillable_beats(
+    *,
+    outcomes: list[_SmartItemOutcome],
+    merge_ceiling: int,
+    resolved_specs: dict[str, VisualRequirementSpec],
+    provider_chain: Sequence[tuple[str, Callable[..., List[MaterialInfo]]]],
+    required_query_limit: int,
+    video_aspect: VideoAspect,
+    settings: dict[str, Any],
+    candidate_limit: int,
+    normalized_speed: float,
+    twelvelabs_service,
+    material_directory: str,
+    used_asset_identities: set[tuple[str, str]],
+    used_urls: set[str],
+    analysis_budget: int,
+    video_budget_exhausted: bool = False,
+    video_analysis_budget: int = 0,
+    item_name: str,
+    item_log_name: str,
+) -> _MergeResolution:
+    """Let a sibling shot absorb the window of a beat nothing could fill.
+
+    This is the last rung before the video fails, and it is deliberately the
+    cheapest one: sibling shots of a semantic group share a requirement, so the
+    neighbour's clip was already approved for exactly the thing the open beat was
+    asking for. Extending that clip's source window therefore buys no analysis and
+    no tokens — only a new window out of footage that already passed. A fresh
+    selection round is run only when the neighbour's asset is simply too short to
+    cover both beats.
+
+    ``video_budget_exhausted`` marks the video as out of analysis money. It only
+    disables that fresh selection round; the free window extension is unaffected,
+    which is why a video out of budget can still finish instead of failing.
+    """
+    item_type = item_log_name.replace(" ", "_")
+    result = _MergeResolution()
+    for position, outcome in enumerate(outcomes):
+        beat = outcome.beat
+        if outcome.filled or outcome.absorbed_by or beat is None:
+            continue
+
+        def _refuse(decision: str, reason: str) -> None:
+            result.verifier_runs.append(
+                {
+                    "visual_item_type": item_type,
+                    "visual_item_index": beat.index,
+                    "visual_requirement": outcome.requirement,
+                    "final_decision": decision,
+                    "reason": reason,
+                }
+            )
+            result.failures.append(
+                f"{item_name} {beat.index} could not be absorbed by a sibling "
+                f"shot: {reason}"
+            )
+
+        if result.merged >= merge_ceiling:
+            # Unreachable while selection stops the run as soon as more items are
+            # open than the ceiling allows, which is where the ceiling actually
+            # earns its keep: refusing there is what stops a lost video from
+            # paying for every remaining beat. This stays as the backstop that
+            # keeps the cap true if that fail-fast is ever relaxed.
+            _refuse(
+                "MERGE_CEILING_REACHED",
+                f"this video already merged {result.merged} of its beats",
+            )
+            continue
+
+        survivors = _adjacent_merge_survivors(outcomes, position)
+        if not survivors:
+            _refuse(
+                "MERGE_NEIGHBOUR_UNAVAILABLE",
+                "no filled shot of the same semantic group borders it",
+            )
+            continue
+
+        # Both sides can qualify. The one with more room left in its asset is the
+        # one that can cover the combined window without being re-selected, and
+        # max() keeps the first of equals, which is the previous beat.
+        def _headroom(candidate: _SmartItemOutcome) -> float:
+            candidate_beat = candidate.beat
+            candidate_winner = candidate.winner
+            if candidate_beat is None or candidate_winner is None:
+                return float("-inf")
+            merged = _merged_visual_beat(candidate_beat, beat)
+            needed = required_source_duration_for_timeline(
+                merged.duration,
+                normalized_speed,
+            )
+            return float(candidate_winner.duration) - needed
+
+        survivor = max(survivors, key=_headroom)
+        survivor_beat = survivor.beat
+        survivor_winner = survivor.winner
+        if survivor_beat is None or survivor_winner is None:
+            _refuse(
+                "MERGE_NEIGHBOUR_UNAVAILABLE",
+                "the bordering shot lost its approved clip",
+            )
+            continue
+        merged_beat = _merged_visual_beat(survivor_beat, beat)
+        required_target_duration = float(merged_beat.duration)
+        required_source_duration = required_source_duration_for_timeline(
+            required_target_duration,
+            normalized_speed,
+        )
+
+        merge_fill = ""
+        if float(survivor_winner.duration) + _MERGE_TIME_TOLERANCE_SECONDS >= (
+            required_source_duration
+        ):
+            # The approved asset is long enough, so nothing new is bought or
+            # downloaded: the same file is simply cut wider.
+            result.segmentation_calls += 1
+            segment, segment_failure = _segment_smart_candidate(
+                candidate=survivor_winner,
+                visual_item=merged_beat,
+                requirement=survivor.requirement,
+                required_source_duration=required_source_duration,
+                normalized_speed=normalized_speed,
+                settings=settings,
+                twelvelabs_service=twelvelabs_service,
+                item_name=item_name,
+                item_log_name=item_log_name,
+            )
+            if segment is None:
+                _refuse("MERGE_SEGMENTATION_FAILED", segment_failure)
+                continue
+            _restamp_merged_source(
+                winner=survivor_winner,
+                merged_beat=merged_beat,
+                segment=segment,
+                required_target_duration=required_target_duration,
+                required_source_duration=required_source_duration,
+            )
+            merge_fill = "neighbour_window_extended"
+        elif video_budget_exhausted:
+            # The neighbour's asset cannot cover both windows, so filling this one
+            # means buying a whole new selection round — the single most expensive
+            # thing left in the ladder, spent on a beat that already failed once.
+            # A video that has hit its ceiling refuses it and fails this beat
+            # instead, which is what keeps the ceiling an actual bound rather than
+            # a suggestion. Every free rung above has already been tried.
+            _refuse(
+                "MERGE_ANALYSIS_BUDGET_EXHAUSTED",
+                "the neighbour's approved clip is too short to cover both windows "
+                f"and this video has spent its analysis budget of "
+                f"{video_analysis_budget} analyzed candidates",
+            )
+            continue
+        else:
+            fresh = _reselect_for_merged_beat(
+                merged_beat=merged_beat,
+                resolved_specs=resolved_specs,
+                provider_chain=provider_chain,
+                required_query_limit=required_query_limit,
+                required_source_duration=required_source_duration,
+                required_target_duration=required_target_duration,
+                video_aspect=video_aspect,
+                settings=settings,
+                candidate_limit=candidate_limit,
+                normalized_speed=normalized_speed,
+                twelvelabs_service=twelvelabs_service,
+                material_directory=material_directory,
+                used_asset_identities=used_asset_identities,
+                used_urls=used_urls,
+                analysis_budget=analysis_budget,
+                item_name=item_name,
+                item_log_name=item_log_name,
+            )
+            result.candidates_analyzed += fresh.candidates_analyzed
+            result.source_seconds_analyzed += fresh.source_seconds_analyzed
+            result.segmentation_calls += fresh.segmentation_calls
+            result.verifier_runs.extend(fresh.verifier_runs)
+            if not fresh.video_path or fresh.winner is None:
+                _refuse(
+                    "MERGE_RESELECTION_FAILED",
+                    "; ".join(fresh.failures)
+                    or "no candidate covered the combined window",
+                )
+                continue
+            survivor.video_path = fresh.video_path
+            survivor.winner = fresh.winner
+            survivor.provider = fresh.provider
+            survivor.query = fresh.query
+            survivor.requirement = fresh.requirement
+            _remember_material_identity(
+                fresh.winner,
+                used_asset_identities,
+                used_urls,
+            )
+            merge_fill = "fresh_selection_round"
+
+        survivor.beat = merged_beat
+        survivor.absorbed_indexes = [*survivor.absorbed_indexes, beat.index]
+        outcome.absorbed_by = merged_beat.index
+        result.merged += 1
+        logger.warning(
+            "no material could fill a visual beat, so a sibling shot absorbed its "
+            f"window: {item_log_name}={beat.index}, "
+            f"merged_into={merged_beat.index}, fill={merge_fill}, "
+            f"merged_duration={required_target_duration:.3f}s"
+        )
+        result.verifier_runs.append(
+            {
+                "visual_item_type": item_type,
+                "visual_item_index": beat.index,
+                "visual_requirement": outcome.requirement,
+                "final_decision": "UNFILLABLE_BEAT_MERGED",
+                "merged_into_visual_item_index": merged_beat.index,
+                "merged_target_duration": round(required_target_duration, 3),
+                "merge_fill": merge_fill,
+                "reason": "; ".join(outcome.failures)[:240],
+            }
+        )
+    return result
+
+
+@dataclass
+class _MergeReselection:
+    """What one fresh selection round for a merged window produced."""
+
+    video_path: str = ""
+    winner: MaterialInfo | None = None
+    provider: str = ""
+    query: str = ""
+    requirement: str = ""
+    verifier_runs: list[dict[str, Any]] = dataclass_field(default_factory=list)
+    failures: list[str] = dataclass_field(default_factory=list)
+    candidates_analyzed: int = 0
+    source_seconds_analyzed: float = 0.0
+    segmentation_calls: int = 0
+
+
+def _reselect_for_merged_beat(
+    *,
+    merged_beat: VisualBeat,
+    resolved_specs: dict[str, VisualRequirementSpec],
+    provider_chain: Sequence[tuple[str, Callable[..., List[MaterialInfo]]]],
+    required_query_limit: int,
+    required_source_duration: float,
+    required_target_duration: float,
+    video_aspect: VideoAspect,
+    settings: dict[str, Any],
+    candidate_limit: int,
+    normalized_speed: float,
+    twelvelabs_service,
+    material_directory: str,
+    used_asset_identities: set[tuple[str, str]],
+    used_urls: set[str],
+    analysis_budget: int,
+    item_name: str,
+    item_log_name: str,
+) -> _MergeReselection:
+    """Search once for a clip long enough to cover a merged window.
+
+    Only reached when the sibling's approved asset is shorter than the combined
+    beats need. The requirement is unchanged — it is the group's own, which both
+    beats already shared — so this is one ordinary selection round asking for a
+    longer clip, not a new reading of the narration.
+    """
+    result = _MergeReselection(requirement=merged_beat.visual_requirement)
+    requirement_spec = resolved_specs.get(
+        llm.normalize_visual_requirement(merged_beat.visual_requirement)
+    )
+    if requirement_spec is None and settings["fail_closed"]:
+        result.failures.append(
+            "the merged window has no verifiable requirement checklist"
+        )
+        return result
+    planned_queries = [
+        query for query in (merged_beat.search_queries or []) if str(query or "").strip()
+    ]
+    if not planned_queries:
+        result.failures.append("the merged window has no searchable query")
+        return result
+    item_queries = _ordered_item_search_queries(
+        merged_beat,
+        planned_queries[0],
+        required_query_limit,
+    )
+    logger.info(
+        "searching once for a clip long enough to cover a merged visual beat: "
+        f"{item_log_name}={merged_beat.index}, "
+        f"required_source_duration={required_source_duration:.3f}s, "
+        f"queries={len(item_queries)}"
+    )
+    selection = _select_smart_item_winner(
+        visual_item=merged_beat,
+        requirement=merged_beat.visual_requirement,
+        requirement_spec=requirement_spec,
+        item_queries=item_queries,
+        provider_chain=provider_chain,
+        required_source_duration=required_source_duration,
+        video_aspect=video_aspect,
+        settings=settings,
+        candidate_limit=candidate_limit,
+        normalized_speed=normalized_speed,
+        twelvelabs_service=twelvelabs_service,
+        item_asset_identities=set(used_asset_identities),
+        item_urls=set(used_urls),
+        item_name=item_name,
+        item_log_name=item_log_name,
+        analysis_budget=analysis_budget,
+    )
+    result.candidates_analyzed = selection.candidates_analyzed
+    result.source_seconds_analyzed = selection.source_seconds_analyzed
+    result.segmentation_calls = selection.segmentation_calls
+    result.verifier_runs.extend(selection.verifier_runs)
+    result.failures.extend(selection.failures)
+    if selection.attempt is None:
+        return result
+
+    download = _download_smart_winner(
+        attempt=selection.attempt,
+        visual_item=merged_beat,
+        requirement=selection.requirement,
+        provider=selection.provider,
+        query=selection.query,
+        required_target_duration=required_target_duration,
+        required_source_duration=required_source_duration,
+        normalized_speed=normalized_speed,
+        settings=settings,
+        twelvelabs_service=twelvelabs_service,
+        material_directory=material_directory,
+        video_aspect=video_aspect,
+        is_visual_beat=True,
+        item_name=item_name,
+        item_log_name=item_log_name,
+    )
+    result.segmentation_calls += download.segmentation_calls
+    result.verifier_runs.extend(download.verifier_runs)
+    result.failures.extend(download.failures)
+    if download.video_path and download.winner is not None:
+        result.video_path = download.video_path
+        result.winner = download.winner
+        result.provider = selection.provider
+        result.query = selection.query
+        result.requirement = selection.requirement
+    return result
+
+
 def _download_videos_by_script_order_smart(
     *,
     task_id: str,
     search_terms: List[str],
-    visual_slots: list[VisualSlot],
-    search_videos,
+    visual_slots: Sequence[OrderedVisualItem] | None = None,
+    visual_beats: Sequence[OrderedVisualItem] | None = None,
+    search_videos: Callable[..., List[MaterialInfo]] | None = None,
+    provider_searches: Sequence[tuple[str, Callable[..., List[MaterialInfo]]]]
+    | None = None,
     video_aspect: VideoAspect,
     max_clip_duration: int,
     material_directory: str,
     clip_speed: float,
     twelvelabs_service,
+    max_candidates_override: int | None = None,
+    requirement_specs: dict[str, VisualRequirementSpec] | None = None,
+    merged_beats_out: list[VisualBeat] | None = None,
 ) -> List[str]:
-    """Select one globally best Pegasus-scored candidate for every visual slot."""
-    if len(search_terms) != len(visual_slots):
+    """Select one best candidate for each generic ordered slot or beat.
+
+    ``merged_beats_out`` is how a rewritten timeline gets back to the caller. It is
+    filled only when an unfillable beat was absorbed by a sibling shot, because
+    that is the only case where the beats the renderer must use are no longer the
+    beats that were passed in. Left empty, the caller's own timeline still holds.
+    """
+    if visual_slots is not None and visual_beats is not None:
+        raise ValueError("smart selection accepts visual slots or visual beats, not both")
+    visual_items = list(visual_beats if visual_beats is not None else visual_slots or [])
+    item_name = "Visual beat" if visual_beats is not None else "Visual slot"
+    item_log_name = item_name.lower()
+    provider_chain: list[tuple[str, Callable[..., List[MaterialInfo]]]] = list(
+        provider_searches or []
+    )
+    if not provider_chain:
+        if search_videos is None:
+            raise ValueError("smart selection requires at least one provider search")
+        provider_chain = [("pexels", search_videos)]
+    if len(search_terms) != len(visual_items):
         logger.warning(
-            "smart ordered material matching requires one query per visual slot: "
-            f"queries={len(search_terms)}, slots={len(visual_slots)}"
+            f"smart ordered material matching requires one query per {item_log_name}: "
+            f"queries={len(search_terms)}, items={len(visual_items)}"
         )
         return []
+    for visual_item, search_query in zip(visual_items, search_terms):
+        if not visual_item.visual_requirement.strip():
+            raise SmartMaterialSelectionError(
+                f"{item_name} {visual_item.index} has no visual requirement"
+            )
+        if (
+            not visual_item.search_queries
+            or search_query not in visual_item.search_queries
+        ):
+            raise SmartMaterialSelectionError(
+                f"{item_name} {visual_item.index} has an inconsistent search query mapping"
+            )
 
     settings = twelvelabs_service.candidate_selection_settings()
     normalized_speed = utils.normalize_clip_speed(clip_speed)
-    used_asset_ids: set[str] = set()
+    used_asset_identities: set[tuple[str, str]] = set()
     used_urls: set[str] = set()
-    video_paths: list[str] = []
-    material_sources: list[dict[str, Any]] = []
+    outcomes: list[_SmartItemOutcome] = []
+    semantic_verifier_runs: list[dict[str, Any]] = []
     total_candidates_analyzed = 0
     total_source_seconds_analyzed = 0.0
     segmentation_calls = 0
-
-    for slot, search_query in zip(visual_slots, search_terms):
-        if not slot.narration_text.strip():
-            raise SmartMaterialSelectionError(
-                f"Visual slot {slot.index} has no narration requirement"
-            )
-        if not slot.search_queries or search_query not in slot.search_queries:
-            raise SmartMaterialSelectionError(
-                f"Visual slot {slot.index} has an inconsistent search query mapping"
-            )
-
-        required_source_duration = max(
-            0.001,
-            float(slot.duration) * normalized_speed,
-        )
-        video_items = search_videos(
-            search_term=search_query,
-            minimum_duration=math.ceil(max(4.0, required_source_duration)),
-            video_aspect=video_aspect,
-        )
-        prepared = _prepare_twelvelabs_candidates(
-            video_items,
-            video_aspect=video_aspect,
-            required_source_duration=required_source_duration,
-            preferred_max_source_duration=settings["preferred_max_source_duration"],
-        )
-        candidates = []
-        for item in prepared:
-            source = item.source_info if isinstance(item.source_info, dict) else {}
-            asset_id = str(source.get("asset_id") or "")
-            if asset_id in used_asset_ids or item.url in used_urls:
-                continue
-            candidates.append(item)
-
-        narration_preview = re.sub(r"\s+", " ", slot.narration_text).strip()[:160]
+    # Merging rewrites the beat timeline, so it is available only where there is a
+    # beat timeline to rewrite: fixed slots carry no semantic group to merge within,
+    # and a duck-typed item cannot be recombined into a valid beat.
+    merge_beats: list[VisualBeat] = (
+        list(visual_items)  # type: ignore[arg-type]
+        if visual_beats is not None
+        and all(isinstance(item, VisualBeat) for item in visual_items)
+        else []
+    )
+    merge_ceiling = max_merged_beats_per_video(len(merge_beats))
+    if merge_ceiling:
         logger.info(
-            "smart visual slot candidates: "
-            f"slot={slot.index}, narration={narration_preview!r}, "
-            f"query={search_query!r}, after_cheap_filters={len(candidates)}"
+            "smart material unfillable beat merge ceiling: "
+            f"max_merged_beats={merge_ceiling}"
         )
-        if not candidates:
-            _persist_material_sources(task_id, material_sources)
-            raise SmartMaterialSelectionError(
-                f"No valid Pexels candidate remained for visual slot {slot.index} "
-                "after metadata quality filters"
-            )
-
-        winner, stats = twelvelabs_service.select_best_candidate(
-            candidates=candidates,
-            slot_index=slot.index,
-            slot_duration=slot.duration,
-            narration_text=slot.narration_text,
-            search_query=search_query,
-            batch_size=settings["batch_size"],
-            max_candidates=settings["max_candidates"],
-            minimum_score=settings["minimum_score"],
-            strong_early_stop_score=settings["strong_early_stop_score"],
-            concurrency=settings["concurrency"],
+    if len(provider_chain) > 1:
+        logger.info(
+            "smart material provider cascade: "
+            f"{' -> '.join(name for name, _ in provider_chain)}"
         )
-        total_candidates_analyzed += int(stats["api_candidates_analyzed"])
-        total_source_seconds_analyzed += float(stats["source_seconds_analyzed"])
-
-        if winner is None and not settings["fail_closed"]:
-            winner = candidates[0]
-            logger.warning(
-                "no TwelveLabs candidate passed; using explicit fail-open legacy "
-                f"fallback for slot={slot.index}"
-            )
-        if winner is None:
-            _persist_material_sources(task_id, material_sources)
-            api_failure_reason = stats.get("api_failure_reason")
-            if api_failure_reason:
-                raise SmartMaterialSelectionError(
-                    f"Visual slot {slot.index} could not be analyzed: "
-                    f"{api_failure_reason}"
-                )
-            raise SmartMaterialSelectionError(
-                f"No TwelveLabs candidate satisfied narration for visual slot "
-                f"{slot.index}; cross-segment fallback was not used"
-            )
-
-        source = winner.source_info if isinstance(winner.source_info, dict) else {}
-        asset_id = str(source.get("asset_id") or "")
-        segmentation_calls += 1
-        segment = twelvelabs_service.segment_winner(
-            video_url=winner.url,
-            narration_text=slot.narration_text,
-            slot_duration=slot.duration,
-            source_duration=float(winner.duration),
-            clip_speed=normalized_speed,
+    max_query_variants = max_query_variants_per_provider()
+    if max_query_variants > 1:
+        logger.info(
+            "smart material query variants per provider: "
+            f"max={max_query_variants}"
         )
-        if segment is None and settings["fail_closed"]:
-            _persist_material_sources(task_id, material_sources)
-            raise SmartMaterialSelectionError(
-                f"TwelveLabs could not identify a valid temporal segment for visual "
-                f"slot {slot.index}"
+
+    # The checklist normally arrives from the script stage, where it was computed
+    # and persisted before a single stock request was made. Verification then gates
+    # on exactly the plan the run was recorded with. Only requirements the script
+    # stage could not resolve are decomposed here, which also keeps API and legacy
+    # callers that pass nothing working exactly as before.
+    resolved_specs: dict[str, VisualRequirementSpec] = dict(requirement_specs or {})
+    unresolved_requirements: list[str] = []
+    seen_unresolved: set[str] = set()
+    for visual_item in visual_items:
+        normalized = llm.normalize_visual_requirement(visual_item.visual_requirement)
+        if normalized in resolved_specs or normalized in seen_unresolved:
+            continue
+        # Sibling shots of one semantic group share a requirement. The decomposer
+        # de-duplicates internally too; collapsing here keeps the log count in
+        # requirements rather than in beats, which is what actually gets requested.
+        seen_unresolved.add(normalized)
+        unresolved_requirements.append(visual_item.visual_requirement)
+    if unresolved_requirements:
+        if resolved_specs:
+            logger.info(
+                "decomposing visual requirements missing from the script-stage "
+                f"checklist: supplied={len(resolved_specs)}, "
+                f"missing={len(unresolved_requirements)}"
             )
-        if segment is None:
-            segment = {
-                "source_start_time": 0.0,
-                "source_end_time": min(
-                    float(winner.duration), required_source_duration
+        resolved_specs.update(
+            llm.generate_visual_requirement_specs(unresolved_requirements)
+        )
+    missing_spec_items = [
+        visual_item.index
+        for visual_item in visual_items
+        if llm.normalize_visual_requirement(visual_item.visual_requirement)
+        not in resolved_specs
+    ]
+    if missing_spec_items and settings["fail_closed"]:
+        # A requirement with no spec cannot be verified against, so this is a
+        # per-item problem from here on: the item skips the stock search it could
+        # never pass and goes straight to the recovery path, while items whose
+        # requirements did decompose keep their full budget.
+        logger.warning(
+            "visual requirement decomposition produced no checklist for "
+            f"{item_log_name} indexes {missing_spec_items}; no candidate will be "
+            "requested for those requirements"
+        )
+    rewrite_enabled = is_requirement_rewrite_enabled()
+
+    candidate_limit = settings["max_candidates"]
+    if max_candidates_override is not None:
+        candidate_limit = min(
+            candidate_limit,
+            max(1, int(max_candidates_override)),
+        )
+    # One unfillable item, left alone, will spend the full candidate cap on every
+    # phrasing and every provider and then again on the rewrite. The budget caps
+    # that per round; a healthy item settles well inside it and never notices.
+    analysis_budget = analysis_budget_per_selection_round(candidate_limit)
+    if analysis_budget:
+        logger.info(
+            "smart material per-round analysis budget: "
+            f"max_analyzed_candidates={analysis_budget}"
+        )
+    # And a ceiling for the whole video, because the failure ladder means a run no
+    # longer stops at its first unfillable item. This one is spent on recovery only.
+    video_analysis_budget = analysis_budget_per_video(
+        len(visual_items),
+        candidate_limit,
+    )
+    if video_analysis_budget:
+        logger.info(
+            "smart material per-video analysis budget: "
+            f"max_analyzed_candidates={video_analysis_budget}"
+        )
+
+    for item_position, (visual_item, search_query) in enumerate(
+        zip(visual_items, search_terms)
+    ):
+        required_target_duration = float(visual_item.duration)
+        required_source_duration = required_source_duration_for_timeline(
+            required_target_duration,
+            normalized_speed,
+        )
+        requirement_spec = resolved_specs.get(
+            llm.normalize_visual_requirement(visual_item.visual_requirement)
+        )
+        item_queries = _ordered_item_search_queries(
+            visual_item,
+            search_query,
+            max_query_variants,
+        )
+
+        winning_attempt: _SmartProviderAttempt | None = None
+        winning_provider = ""
+        winning_query = search_query
+        selected_requirement = visual_item.visual_requirement
+        attempt_failures: list[str] = []
+        # Exclusions accumulate for the whole item, not for one attempt: a
+        # candidate this item already rejected must not be analyzed again under
+        # another phrasing. Identity is what grows here — the verdict cache is
+        # keyed by provider asset, and search results carry no stable url beyond
+        # it. Only the winner joins the timeline-wide sets, so later items stay
+        # free to consider what this one turned down.
+        item_asset_identities = set(used_asset_identities)
+        item_urls = set(used_urls)
+
+        if requirement_spec is None and settings["fail_closed"]:
+            # Nothing is searched for a requirement no gate can approve; the item
+            # is handed to the recovery path with its budget still unspent.
+            semantic_verifier_runs.append(
+                {
+                    "visual_item_type": item_log_name.replace(" ", "_"),
+                    "visual_item_index": visual_item.index,
+                    "visual_requirement": visual_item.visual_requirement,
+                    "final_decision": "DECOMPOSITION_FAILED",
+                }
+            )
+            selection = _SmartItemSelection(
+                requirement=visual_item.visual_requirement,
+                failures=[
+                    f"Visual requirement decomposition failed for {item_log_name} "
+                    f"{visual_item.index}"
+                ],
+            )
+        else:
+            selection = _select_smart_item_winner(
+                visual_item=visual_item,
+                requirement=visual_item.visual_requirement,
+                requirement_spec=requirement_spec,
+                item_queries=item_queries,
+                provider_chain=provider_chain,
+                required_source_duration=required_source_duration,
+                video_aspect=video_aspect,
+                settings=settings,
+                candidate_limit=candidate_limit,
+                normalized_speed=normalized_speed,
+                twelvelabs_service=twelvelabs_service,
+                item_asset_identities=item_asset_identities,
+                item_urls=item_urls,
+                item_name=item_name,
+                item_log_name=item_log_name,
+                # Narrowed by whatever is left of the video's ceiling. Never below
+                # one, so this item still gets its first look on the first provider
+                # even in a video that has already overspent; what gets cut is the
+                # phrasing-and-provider cascade behind that first look.
+                analysis_budget=_effective_round_budget(
+                    analysis_budget,
+                    video_analysis_budget,
+                    total_candidates_analyzed,
                 ),
-                "description": "explicit fail-open zero-start fallback",
-            }
+            )
+        total_candidates_analyzed += selection.candidates_analyzed
+        total_source_seconds_analyzed += selection.source_seconds_analyzed
+        segmentation_calls += selection.segmentation_calls
+        semantic_verifier_runs.extend(selection.verifier_runs)
+        attempt_failures.extend(selection.failures)
+
+        video_budget_exhausted = bool(video_analysis_budget) and (
+            total_candidates_analyzed >= video_analysis_budget
+        )
+        if selection.attempt is None and rewrite_enabled and video_budget_exhausted:
+            # The rewrite is the most expensive rung: a fresh requirement means a
+            # fresh search and a fresh page of analyses for an item that has already
+            # proved hard. It is also the rung the free rungs can substitute for, so
+            # a video out of budget skips it and lets the merge carry the window.
             logger.warning(
-                "winner segmentation unavailable; using explicit fail-open source "
-                f"start for slot={slot.index}, asset_id={asset_id or 'unknown'}"
+                "smart material per-video analysis budget spent; skipping the "
+                f"requirement rewrite for {item_log_name} {visual_item.index}: "
+                f"analyzed={total_candidates_analyzed}, "
+                f"budget={video_analysis_budget}"
             )
+            attempt_failures.append(
+                f"Per-video analysis budget of {video_analysis_budget} analyzed "
+                f"candidates reached before the requirement rewrite for "
+                f"{item_log_name} {visual_item.index}"
+            )
+            semantic_verifier_runs.append(
+                {
+                    "visual_item_index": visual_item.index,
+                    "visual_requirement": visual_item.visual_requirement,
+                    "final_decision": "VIDEO_ANALYSIS_BUDGET_EXHAUSTED",
+                    "candidates_analyzed": total_candidates_analyzed,
+                    "video_analysis_budget": video_analysis_budget,
+                }
+            )
+        elif selection.attempt is None and rewrite_enabled:
+            recovery = _rewrite_requirement_and_reselect(
+                visual_item=visual_item,
+                failed_requirement=visual_item.visual_requirement,
+                failure_summary="; ".join(attempt_failures),
+                query_limit=max_query_variants,
+                provider_chain=provider_chain,
+                required_source_duration=required_source_duration,
+                video_aspect=video_aspect,
+                settings=settings,
+                candidate_limit=candidate_limit,
+                normalized_speed=normalized_speed,
+                twelvelabs_service=twelvelabs_service,
+                item_asset_identities=item_asset_identities,
+                item_urls=item_urls,
+                item_name=item_name,
+                item_log_name=item_log_name,
+                analysis_budget=_effective_round_budget(
+                    analysis_budget,
+                    video_analysis_budget,
+                    total_candidates_analyzed,
+                ),
+            )
+            total_candidates_analyzed += recovery.candidates_analyzed
+            total_source_seconds_analyzed += recovery.source_seconds_analyzed
+            segmentation_calls += recovery.segmentation_calls
+            semantic_verifier_runs.extend(recovery.verifier_runs)
+            attempt_failures.extend(recovery.failures)
+            if recovery.attempt is not None:
+                selection = recovery
 
-        winner.source_start_time = float(segment["source_start_time"])
-        winner.source_end_time = float(segment["source_end_time"])
-        source = dict(source)
-        source["slot_index"] = slot.index
-        source["temporal_segment"] = dict(segment)
-        winner.source_info = source
-        logger.info(
-            "smart visual winner: "
-            f"slot={slot.index}, asset_id={asset_id or 'unknown'}, "
-            f"score={float(winner.overall_score or 0):.4f}, "
-            f"source_start={winner.source_start_time:.3f}, "
-            f"source_end={winner.source_end_time:.3f}"
-        )
+        if selection.attempt is not None:
+            winning_attempt = selection.attempt
+            winning_provider = selection.provider
+            winning_query = selection.query
+            selected_requirement = selection.requirement
 
-        saved_video_path = save_video(
-            video_url=winner.url,
-            save_dir=material_directory,
-            video_aspect=video_aspect,
+        outcome = _SmartItemOutcome(
+            visual_item=visual_item,
+            requirement=selected_requirement,
+            beat=merge_beats[item_position] if merge_beats else None,
         )
-        if not saved_video_path:
-            _persist_material_sources(task_id, material_sources)
+        outcomes.append(outcome)
+
+        def _leave_open(reasons: list[str]) -> bool:
+            """Keep this item open for a merge, or report that the video is lost.
+
+            An item stays open only while a merge could still rescue it: within the
+            merge ceiling, and with a sibling shot bordering it in the planned
+            timeline. Otherwise the run stops here rather than paying full price for
+            every remaining item of a video that is already lost.
+            """
+            outcome.failures.extend(reasons)
+            open_items = sum(
+                1 for recorded in outcomes if not recorded.filled
+            )
+            if (
+                merge_beats
+                and open_items <= merge_ceiling
+                and _has_mergeable_sibling(merge_beats, item_position)
+            ):
+                logger.warning(
+                    "no material could fill a visual item; leaving it open for a "
+                    f"sibling shot to absorb: {item_log_name}={visual_item.index}, "
+                    f"open={open_items}, ceiling={merge_ceiling}"
+                )
+                return True
+            _persist_material_sources(
+                task_id,
+                _records_from_outcomes(outcomes),
+                semantic_verifier_runs,
+            )
             raise SmartMaterialSelectionError(
-                f"The selected Pexels winner for visual slot {slot.index} could not "
-                "be downloaded"
+                "; ".join(
+                    reason
+                    for recorded in outcomes
+                    for reason in recorded.failures
+                )
             )
-        video_paths.append(saved_video_path)
-        material_sources.append(_material_source_record(winner, saved_video_path))
-        used_asset_ids.add(asset_id)
-        used_urls.add(winner.url)
+
+        if winning_attempt is None:
+            _leave_open(attempt_failures)
+            continue
+
+        winner = winning_attempt.winner
+        segment = winning_attempt.segment
+        if winner is None or segment is None:
+            # Unreachable through _SmartProviderAttempt.succeeded; kept so a
+            # future refactor cannot silently render an unbound source window.
+            raise SmartMaterialSelectionError(
+                f"{item_name} {visual_item.index} produced an incomplete "
+                "smart selection result"
+            )
+
+        download = _download_smart_winner(
+            attempt=winning_attempt,
+            visual_item=visual_item,
+            requirement=selected_requirement,
+            provider=winning_provider,
+            query=winning_query,
+            required_target_duration=required_target_duration,
+            required_source_duration=required_source_duration,
+            normalized_speed=normalized_speed,
+            settings=settings,
+            twelvelabs_service=twelvelabs_service,
+            material_directory=material_directory,
+            video_aspect=video_aspect,
+            is_visual_beat=visual_beats is not None,
+            item_name=item_name,
+            item_log_name=item_log_name,
+        )
+        segmentation_calls += download.segmentation_calls
+        semantic_verifier_runs.extend(download.verifier_runs)
+
+        if not download.video_path or download.winner is None:
+            # A verified item whose every approved candidate failed to transfer is
+            # just as open as one nothing could verify, and a sibling can absorb it
+            # on the same terms.
+            _leave_open(download.failures)
+            continue
+        outcome.provider = winning_provider
+        outcome.query = winning_query
+        outcome.video_path = download.video_path
+        outcome.winner = download.winner
+        _remember_material_identity(
+            download.winner,
+            used_asset_identities,
+            used_urls,
+        )
+
+    if any(not outcome.filled for outcome in outcomes):
+        merge = _merge_unfillable_beats(
+            outcomes=outcomes,
+            merge_ceiling=merge_ceiling,
+            resolved_specs=resolved_specs,
+            provider_chain=provider_chain,
+            required_query_limit=max_query_variants,
+            video_aspect=video_aspect,
+            settings=settings,
+            candidate_limit=candidate_limit,
+            normalized_speed=normalized_speed,
+            twelvelabs_service=twelvelabs_service,
+            material_directory=material_directory,
+            used_asset_identities=used_asset_identities,
+            used_urls=used_urls,
+            analysis_budget=_effective_round_budget(
+                analysis_budget,
+                video_analysis_budget,
+                total_candidates_analyzed,
+            ),
+            # The free rung — extending a neighbour's approved clip — stays available
+            # whatever the budget says, because it buys nothing. Only the fresh
+            # search for a merged window is refused once the video is out of money.
+            video_budget_exhausted=bool(video_analysis_budget)
+            and total_candidates_analyzed >= video_analysis_budget,
+            video_analysis_budget=video_analysis_budget,
+            item_name=item_name,
+            item_log_name=item_log_name,
+        )
+        total_candidates_analyzed += merge.candidates_analyzed
+        total_source_seconds_analyzed += merge.source_seconds_analyzed
+        segmentation_calls += merge.segmentation_calls
+        semantic_verifier_runs.extend(merge.verifier_runs)
+        still_open = [
+            outcome
+            for outcome in outcomes
+            if not outcome.filled and not outcome.absorbed_by
+        ]
+        if still_open:
+            _persist_material_sources(
+                task_id,
+                _records_from_outcomes(outcomes),
+                semantic_verifier_runs,
+            )
+            raise SmartMaterialSelectionError(
+                "; ".join(
+                    [
+                        reason
+                        for outcome in still_open
+                        for reason in outcome.failures
+                    ]
+                    + merge.failures
+                )
+            )
+
+    video_paths = [
+        outcome.video_path for outcome in outcomes if outcome.filled
+    ]
+    material_sources = _records_from_outcomes(outcomes)
+    if merge_beats and merged_beats_out is not None:
+        merged_timeline = [
+            outcome.beat
+            for outcome in outcomes
+            if outcome.filled and outcome.beat is not None
+        ]
+        if len(merged_timeline) != len(merge_beats):
+            # Only handed back when it actually differs, so a caller that merged
+            # nothing keeps using the timeline it validated at the script stage.
+            validate_merged_beat_timeline(merged_timeline)
+            merged_beats_out.clear()
+            merged_beats_out.extend(merged_timeline)
+            logger.warning(
+                "the visual beat timeline was rewritten by merging: "
+                f"planned_beats={len(merge_beats)}, "
+                f"rendered_beats={len(merged_timeline)}"
+            )
 
     logger.info(
         "TwelveLabs smart selection usage: "
         f"candidates_analyzed={total_candidates_analyzed}, "
+        f"video_analysis_budget={video_analysis_budget}, "
         f"source_seconds_analyzed={total_source_seconds_analyzed:.3f}, "
         f"segmentation_calls={segmentation_calls}"
     )
     logger.success(f"downloaded {len(video_paths)} smart ordered videos")
-    _persist_material_sources(task_id, material_sources)
+    _persist_material_sources(
+        task_id,
+        material_sources,
+        semantic_verifier_runs,
+    )
     return video_paths
 
 
@@ -1350,7 +3852,12 @@ def _download_videos_by_script_order(
     max_clip_duration: int,
     material_directory: str,
     visual_slots: list[VisualSlot] | None = None,
+    visual_beats: list[VisualBeat] | None = None,
     clip_speed: float = 1.0,
+    provider_searches: Sequence[tuple[str, Callable[..., List[MaterialInfo]]]]
+    | None = None,
+    requirement_specs: dict[str, VisualRequirementSpec] | None = None,
+    merged_beats_out: list[VisualBeat] | None = None,
 ) -> List[str]:
     """
     按脚本文案顺序下载素材。
@@ -1368,17 +3875,29 @@ def _download_videos_by_script_order(
     # key rotator defined in this module.
     from app.services import twelvelabs as twelvelabs_service
 
-    if visual_slots and twelvelabs_service.is_smart_visual_matching_enabled():
+    if (
+        visual_beats or visual_slots
+    ) and twelvelabs_service.is_smart_visual_matching_enabled():
+        # Beats own the timeline once S4 produced them; slots remain the input
+        # for older tasks and for the plain ordered path.
+        smart_items: dict[str, Any] = (
+            {"visual_beats": list(visual_beats)}
+            if visual_beats
+            else {"visual_slots": list(visual_slots or [])}
+        )
         return _download_videos_by_script_order_smart(
             task_id=task_id,
             search_terms=search_terms,
-            visual_slots=visual_slots,
             search_videos=search_videos,
+            provider_searches=provider_searches,
             video_aspect=video_aspect,
             max_clip_duration=max_clip_duration,
             material_directory=material_directory,
             clip_speed=clip_speed,
             twelvelabs_service=twelvelabs_service,
+            requirement_specs=requirement_specs,
+            merged_beats_out=merged_beats_out,
+            **smart_items,
         )
 
     semantic_qa_enabled = twelvelabs_service.is_clip_qa_enabled()

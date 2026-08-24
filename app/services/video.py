@@ -30,6 +30,7 @@ from app.config import config
 from app.models import const
 from app.models.schema import (
     MaterialInfo,
+    RenderSegment,
     VideoAspect,
     VideoConcatMode,
     VideoParams,
@@ -50,6 +51,8 @@ class SubClippedVideoClip:
         height=None,
         duration=None,
         source_file_path=None,
+        target_duration=None,
+        visual_beat_index=None,
     ):
         self.file_path = file_path
         self.start_time = start_time
@@ -57,6 +60,12 @@ class SubClippedVideoClip:
         self.width = width
         self.height = height
         self.source_file_path = source_file_path or file_path
+        # Only the smart render path sets a target duration. It is the exact,
+        # frame-aligned length this clip must occupy on the output timeline.
+        self.target_duration = target_duration
+        # Only the smart render path sets a beat index. It exists so a render
+        # failure can name the narration beat it belongs to.
+        self.visual_beat_index = visual_beat_index
         if duration is None:
             self.duration = end_time - start_time
         else:
@@ -75,6 +84,10 @@ fps = 30
 # 这里给视频素材多留一个很小的安全余量，避免音频末尾因为帧舍入出现黑屏、
 # 卡顿或最后一小段旁白没有画面的情况。
 _VIDEO_DURATION_SAFETY_MARGIN = 0.1
+# 智能渲染路径按镜头对齐输出帧。素材文件的物理时长偶尔比元数据短几十毫秒，
+# 这时允许对单个镜头做毫秒级变速补齐，超过这个上限说明选段本身有问题，
+# 必须显式失败而不是让后续所有镜头与旁白错位。
+_RENDER_SEGMENT_MAX_STRETCH_SECONDS = 0.25
 _MIN_MATERIAL_DIMENSION = 480
 # 消息类应用和部分编码器会把画面尺寸向下取整，例如 WhatsApp 会把 9:16 的
 # 素材压成 478x850，比 480 少两个像素。直接按 480 硬卡会让这类素材全部被
@@ -538,57 +551,15 @@ def get_bgm_file(bgm_type: str = "random", bgm_file: str = ""):
     return ""
 
 
-def combine_videos(
-    combined_video_path: str,
+def _build_legacy_subclipped_items(
     video_paths: List[str],
-    audio_file: str,
-    video_aspect: VideoAspect = VideoAspect.portrait,
-    video_concat_mode: VideoConcatMode = VideoConcatMode.random,
-    video_transition_mode: VideoTransitionMode = None,
-    max_clip_duration: int = 5,
-    threads: int = 2,
-    clip_speed: float = 1.0,
-    source_ranges: List[tuple[float, float]] | None = None,
-) -> str:
-    audio_clip = AudioFileClip(audio_file)
-    try:
-        # 这里只需要读取旁白音频时长来决定素材视频拼接长度；后续不会再使用
-        # audio_clip。读取完成后立即关闭，避免早退或异常路径泄漏文件句柄。
-        audio_duration = audio_clip.duration
-    finally:
-        close_clip(audio_clip)
-    logger.info(f"audio duration: {audio_duration} seconds")
-    logger.info(f"maximum clip duration: {max_clip_duration} seconds")
-    required_video_duration = _get_required_video_duration(audio_duration)
-    logger.info(
-        f"required video duration: {required_video_duration:.2f} seconds "
-        f"(audio duration + {_VIDEO_DURATION_SAFETY_MARGIN:.2f}s safety margin)"
-    )
-
-    # 兼容 API 直接调用时未传转场模式的情况，避免后续访问 .value 时崩溃。
-    transition_value = getattr(video_transition_mode, "value", video_transition_mode)
-    normalized_clip_speed = utils.normalize_clip_speed(clip_speed)
-    if normalized_clip_speed != 1.0:
-        # 只记录一次最终生效值，既方便定位 API 越界参数被归一化的问题，
-        # 也避免在逐片段热路径中重复输出相同日志。
-        logger.info(f"clip playback speed: {normalized_clip_speed:.2f}x")
-    # max_clip_duration 约束的是成片里的最终播放时长，而不是源视频读取时长。
-    # MoviePy 以 0.5 倍速播放 1.5 秒源画面会得到 3 秒片段，以 2 倍速播放
-    # 6 秒源画面同样会得到 3 秒片段。因此切片前必须按速度反推源时长；如果
-    # 仍固定读取 3 秒再慢放、裁剪，下一段却从源视频第 3 秒开始，会跳过中间
-    # 1.5 秒画面。该计算同时保证不同速度下的源时间线连续且无重叠。
-    source_clip_duration = max_clip_duration * normalized_clip_speed
-    output_dir = os.path.dirname(combined_video_path)
-
-    if source_ranges is not None and len(source_ranges) != len(video_paths):
-        raise ValueError("source range count must match video path count")
-
-    aspect = VideoAspect(video_aspect)
-    video_width, video_height = aspect.to_resolution()
-
-    processed_clips = []
-    subclipped_items = []
-    video_duration = 0
+    *,
+    source_ranges: List[tuple[float, float]] | None,
+    source_clip_duration: float,
+    video_concat_mode: VideoConcatMode,
+) -> List[SubClippedVideoClip]:
+    """Chop downloaded materials for the fixed-duration timeline."""
+    subclipped_items: List[SubClippedVideoClip] = []
     for video_index, video_path in enumerate(video_paths):
         clip = _open_video_clip_quietly(video_path)
         clip_duration = clip.duration
@@ -652,17 +623,248 @@ def combine_videos(
             start_time = end_time
             if video_concat_mode.value == VideoConcatMode.sequential.value:
                 break
+    return subclipped_items
 
-    subclipped_items = _prioritize_unique_source_clips(
-        subclipped_items=subclipped_items,
-        concat_mode=video_concat_mode,
+
+def _transition_duration_for_clip(target_duration: float | None) -> float:
+    """Scale a transition so it cannot swallow a short shot.
+
+    The legacy fixed-slot path always used one second, which is a quarter of the
+    default four-to-five second slot. Variable beats can be far shorter, and a
+    one-second fade over a 1.4s shot reads as a mistake. Keeping the same
+    quarter-of-the-shot proportion leaves the default slot length unchanged
+    (0.25 x 4s = 1.0s) while short beats get a proportionally short transition.
+    """
+    if target_duration is None:
+        return 1.0
+    return max(0.1, min(1.0, 0.25 * float(target_duration)))
+
+
+def _fit_clip_to_target_duration(clip, target_duration: float):
+    """Force one rendered clip onto its exact frame-aligned timeline slot."""
+    current = float(clip.duration)
+    if math.isclose(current, target_duration, rel_tol=0.0, abs_tol=1e-6):
+        return clip
+    if current > target_duration:
+        return clip.subclipped(0, target_duration)
+    shortfall = target_duration - current
+    if shortfall > _RENDER_SEGMENT_MAX_STRETCH_SECONDS:
+        raise ValueError(
+            f"rendered clip is {shortfall:.3f}s shorter than its timeline slot "
+            f"({target_duration:.3f}s)"
+        )
+    # The physical file ended before the selected window did. Stretching time by
+    # a few milliseconds is invisible; leaving a black gap inside a timed shot
+    # would desynchronise every later beat.
+    return clip.with_speed_scaled(final_duration=target_duration)
+
+
+def _build_render_segment_items(
+    render_segments: List[RenderSegment],
+    *,
+    audio_duration: float,
+    clip_speed: float,
+) -> List[SubClippedVideoClip]:
+    """Turn approved render segments into frame-aligned renderer work items.
+
+    Target boundaries are quantised to whole output frames cumulatively, so the
+    rendered timeline cannot drift away from the narration across dozens of
+    shots. The source window keeps its selected start; its length is recomputed
+    from the frame-aligned target so millisecond rounding in the persisted
+    record can never shorten a shot.
+    """
+    if not render_segments:
+        raise ValueError("render segments are required for the smart render path")
+
+    normalized_speed = utils.normalize_clip_speed(clip_speed)
+    timeline_end = float(render_segments[-1].target_end)
+    if not math.isfinite(timeline_end) or timeline_end <= 0:
+        raise ValueError("render segment timeline must be positive")
+    if timeline_end + _RENDER_SEGMENT_MAX_STRETCH_SECONDS < float(audio_duration):
+        raise ValueError(
+            "render segment timeline does not cover the narration audio: "
+            f"timeline={timeline_end:.3f}s, audio={float(audio_duration):.3f}s"
+        )
+    # The concat step trims the output at the audio duration, so the safety
+    # margin is pure tail padding and only the final segment needs to carry it.
+    final_extension = max(
+        0.0, _get_required_video_duration(audio_duration) - timeline_end
     )
+
+    items: List[SubClippedVideoClip] = []
+    previous_end_frame = 0
+    previous_target_end = 0.0
+    last_position = len(render_segments)
+    for position, segment in enumerate(render_segments, start=1):
+        if segment.index != position:
+            raise ValueError("render segment indexes must be sequential")
+        if abs(float(segment.target_start) - previous_target_end) > 1e-6:
+            raise ValueError(
+                f"render segment {segment.index} does not continue the timeline"
+            )
+
+        clip = _open_video_clip_quietly(segment.file_path)
+        try:
+            file_duration = float(clip.duration)
+            clip_w, clip_h = clip.size
+        finally:
+            close_clip(clip)
+        if not math.isfinite(file_duration) or file_duration <= 0:
+            raise ValueError(
+                f"render segment {segment.index} source file has no usable duration"
+            )
+
+        beat_end_frame = round(float(segment.target_end) * float(fps))
+        candidate_end_frames = [beat_end_frame]
+        if position == last_position and final_extension > 0:
+            padded_end_frame = round(
+                (float(segment.target_end) + final_extension) * float(fps)
+            )
+            if padded_end_frame > beat_end_frame:
+                # Best effort: pad the tail only when the source can serve it.
+                candidate_end_frames.insert(0, padded_end_frame)
+
+        chosen: tuple[int, float, float, float] | None = None
+        for end_frame in candidate_end_frames:
+            target_frames = end_frame - previous_end_frame
+            if target_frames <= 0:
+                raise ValueError(
+                    f"render segment {segment.index} is shorter than one output frame"
+                )
+            target_duration = target_frames / float(fps)
+            needed_source = target_duration * normalized_speed
+            source_start = max(0.0, float(segment.source_start))
+            source_end = source_start + needed_source
+            if source_end > file_duration:
+                # Stock metadata durations can be a fraction longer than the
+                # downloaded file. Shift the window back rather than shorten it.
+                source_end = file_duration
+                source_start = max(0.0, source_end - needed_source)
+            shortfall = needed_source - (source_end - source_start)
+            chosen = (end_frame, target_duration, source_start, source_end)
+            if shortfall <= _RENDER_SEGMENT_MAX_STRETCH_SECONDS:
+                break
+            chosen = None
+        if chosen is None:
+            raise ValueError(
+                f"render segment {segment.index} source file is too short for its "
+                f"{float(segment.target_duration):.3f}s timeline slot"
+            )
+
+        end_frame, target_duration, source_start, source_end = chosen
+        items.append(
+            SubClippedVideoClip(
+                file_path=segment.file_path,
+                start_time=source_start,
+                end_time=source_end,
+                width=clip_w,
+                height=clip_h,
+                source_file_path=segment.file_path,
+                target_duration=target_duration,
+                visual_beat_index=segment.visual_beat_index,
+            )
+        )
+        previous_end_frame = end_frame
+        previous_target_end = float(segment.target_end)
+
+    logger.info(
+        "render segment timeline: "
+        f"segments={len(items)}, timeline={timeline_end:.3f}s, "
+        f"audio={float(audio_duration):.3f}s, tail_padding={final_extension:.3f}s"
+    )
+    return items
+
+
+def combine_videos(
+    combined_video_path: str,
+    video_paths: List[str],
+    audio_file: str,
+    video_aspect: VideoAspect = VideoAspect.portrait,
+    video_concat_mode: VideoConcatMode = VideoConcatMode.random,
+    video_transition_mode: VideoTransitionMode = None,
+    max_clip_duration: int = 5,
+    threads: int = 2,
+    clip_speed: float = 1.0,
+    source_ranges: List[tuple[float, float]] | None = None,
+    render_segments: List[RenderSegment] | None = None,
+) -> str:
+    audio_clip = AudioFileClip(audio_file)
+    try:
+        # 这里只需要读取旁白音频时长来决定素材视频拼接长度；后续不会再使用
+        # audio_clip。读取完成后立即关闭，避免早退或异常路径泄漏文件句柄。
+        audio_duration = audio_clip.duration
+    finally:
+        close_clip(audio_clip)
+    logger.info(f"audio duration: {audio_duration} seconds")
+    logger.info(f"maximum clip duration: {max_clip_duration} seconds")
+    required_video_duration = _get_required_video_duration(audio_duration)
+    logger.info(
+        f"required video duration: {required_video_duration:.2f} seconds "
+        f"(audio duration + {_VIDEO_DURATION_SAFETY_MARGIN:.2f}s safety margin)"
+    )
+
+    # 兼容 API 直接调用时未传转场模式的情况，避免后续访问 .value 时崩溃。
+    transition_value = getattr(video_transition_mode, "value", video_transition_mode)
+    normalized_clip_speed = utils.normalize_clip_speed(clip_speed)
+    if normalized_clip_speed != 1.0:
+        # 只记录一次最终生效值，既方便定位 API 越界参数被归一化的问题，
+        # 也避免在逐片段热路径中重复输出相同日志。
+        logger.info(f"clip playback speed: {normalized_clip_speed:.2f}x")
+    # max_clip_duration 约束的是成片里的最终播放时长，而不是源视频读取时长。
+    # MoviePy 以 0.5 倍速播放 1.5 秒源画面会得到 3 秒片段，以 2 倍速播放
+    # 6 秒源画面同样会得到 3 秒片段。因此切片前必须按速度反推源时长；如果
+    # 仍固定读取 3 秒再慢放、裁剪，下一段却从源视频第 3 秒开始，会跳过中间
+    # 1.5 秒画面。该计算同时保证不同速度下的源时间线连续且无重叠。
+    source_clip_duration = max_clip_duration * normalized_clip_speed
+    output_dir = os.path.dirname(combined_video_path)
+
+    if source_ranges is not None and len(source_ranges) != len(video_paths):
+        raise ValueError("source range count must match video path count")
+
+    segments_authoritative = render_segments is not None
+    if segments_authoritative:
+        if source_ranges is not None:
+            raise ValueError(
+                "render segments and source ranges cannot both drive the timeline"
+            )
+        if len(render_segments) != len(video_paths):
+            raise ValueError("render segment count must match video path count")
+        for position, segment in enumerate(render_segments):
+            if segment.file_path != video_paths[position]:
+                raise ValueError(
+                    "render segment order must match the downloaded winner order"
+                )
+
+    aspect = VideoAspect(video_aspect)
+    video_width, video_height = aspect.to_resolution()
+
+    processed_clips = []
+    video_duration = 0
+    if segments_authoritative:
+        # The approved beat timeline is the contract: no reordering, no reuse,
+        # no padding. Every segment is rendered exactly once, in order.
+        subclipped_items = _build_render_segment_items(
+            render_segments,
+            audio_duration=audio_duration,
+            clip_speed=normalized_clip_speed,
+        )
+    else:
+        subclipped_items = _build_legacy_subclipped_items(
+            video_paths,
+            source_ranges=source_ranges,
+            source_clip_duration=source_clip_duration,
+            video_concat_mode=video_concat_mode,
+        )
+        subclipped_items = _prioritize_unique_source_clips(
+            subclipped_items=subclipped_items,
+            concat_mode=video_concat_mode,
+        )
 
     logger.debug(f"total subclipped items: {len(subclipped_items)}")
 
     # Add downloaded clips over and over until the duration of the audio (max_duration) has been reached
     for i, subclipped_item in enumerate(subclipped_items):
-        if video_duration >= required_video_duration:
+        if not segments_authoritative and video_duration >= required_video_duration:
             break
 
         logger.debug(
@@ -710,34 +912,53 @@ def combine_videos(
                     ).with_position("center")
                     clip = CompositeVideoClip([background, clip_resized])
 
+            target_duration = subclipped_item.target_duration
+            if target_duration is not None:
+                # Snap to the frame-aligned beat length *before* any transition so
+                # the effect is applied to the exact final window. Trimming after a
+                # fade-out or slide-out would cut the tail of the effect itself.
+                clip = _fit_clip_to_target_duration(clip, target_duration)
+                clip_duration = clip.duration
+
             shuffle_side = random.choice(["left", "right", "top", "bottom"])
+            # A fixed one-second transition swallows a short beat whole. Scale it
+            # with the beat length; this stays a no-op for clips of 4s or longer.
+            transition_duration = _transition_duration_for_clip(target_duration)
             if transition_value in (None, VideoTransitionMode.none.value):
                 clip = clip
             elif transition_value == VideoTransitionMode.fade_in.value:
-                clip = video_effects.fadein_transition(clip, 1)
+                clip = video_effects.fadein_transition(clip, transition_duration)
             elif transition_value == VideoTransitionMode.fade_out.value:
-                clip = video_effects.fadeout_transition(clip, 1)
+                clip = video_effects.fadeout_transition(clip, transition_duration)
             elif transition_value == VideoTransitionMode.slide_in.value:
-                clip = video_effects.slidein_transition(clip, 1, shuffle_side)
+                clip = video_effects.slidein_transition(
+                    clip, transition_duration, shuffle_side
+                )
             elif transition_value == VideoTransitionMode.slide_out.value:
-                clip = video_effects.slideout_transition(clip, 1, shuffle_side)
+                clip = video_effects.slideout_transition(
+                    clip, transition_duration, shuffle_side
+                )
             elif transition_value == VideoTransitionMode.zoom_in.value:
-                clip = video_effects.zoomin_transition(clip, 1)
+                clip = video_effects.zoomin_transition(clip, transition_duration)
             elif transition_value == VideoTransitionMode.zoom_out.value:
-                clip = video_effects.zoomout_transition(clip, 1)
+                clip = video_effects.zoomout_transition(clip, transition_duration)
             elif transition_value == VideoTransitionMode.shuffle.value:
                 transition_funcs = [
-                    lambda c: video_effects.fadein_transition(c, 1),
-                    lambda c: video_effects.fadeout_transition(c, 1),
-                    lambda c: video_effects.slidein_transition(c, 1, shuffle_side),
-                    lambda c: video_effects.slideout_transition(c, 1, shuffle_side),
-                    lambda c: video_effects.zoomin_transition(c, 1),
-                    lambda c: video_effects.zoomout_transition(c, 1),
+                    lambda c: video_effects.fadein_transition(c, transition_duration),
+                    lambda c: video_effects.fadeout_transition(c, transition_duration),
+                    lambda c: video_effects.slidein_transition(
+                        c, transition_duration, shuffle_side
+                    ),
+                    lambda c: video_effects.slideout_transition(
+                        c, transition_duration, shuffle_side
+                    ),
+                    lambda c: video_effects.zoomin_transition(c, transition_duration),
+                    lambda c: video_effects.zoomout_transition(c, transition_duration),
                 ]
                 shuffle_transition = random.choice(transition_funcs)
                 clip = shuffle_transition(clip)
 
-            if clip.duration > max_clip_duration:
+            if target_duration is None and clip.duration > max_clip_duration:
                 clip = clip.subclipped(0, max_clip_duration)
 
             # wirte clip to temp file
@@ -766,10 +987,17 @@ def combine_videos(
             video_duration += clip_duration_saved
 
         except Exception as e:
+            if segments_authoritative:
+                # Skipping a beat would silently shorten the timeline and desync
+                # every later beat from the narration. Fail loudly instead.
+                raise RuntimeError(
+                    f"failed to render visual beat "
+                    f"{subclipped_item.visual_beat_index}: {e}"
+                ) from e
             logger.error(f"failed to process clip: {str(e)}")
 
     # loop processed clips until the video duration covers the audio duration and the small safety margin.
-    if video_duration < required_video_duration:
+    if not segments_authoritative and video_duration < required_video_duration:
         logger.warning(
             f"video duration ({video_duration:.2f}s) is shorter than required duration "
             f"({required_video_duration:.2f}s), looping clips to match audio length."

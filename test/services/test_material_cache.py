@@ -80,6 +80,17 @@ class TestMaterialSearchCache(unittest.TestCase):
         self.assertEqual(loaded[0].provider, "pixabay")
         self.assertEqual(loaded[0].url, "https://example.com/video.mp4")
         self.assertEqual(loaded[0].duration, 12)
+        self.assertEqual(loaded[0].provider_asset_id, "123")
+        self.assertEqual(loaded[0].width, 1080)
+        self.assertEqual(loaded[0].height, 1920)
+        self.assertEqual(loaded[0].orientation, "portrait")
+        self.assertEqual(loaded[0].rendition_id, "large")
+        self.assertEqual(loaded[0].search_query, "nature")
+        self.assertEqual(loaded[0].query_attempt, 1)
+        self.assertEqual(
+            loaded[0].source_page_url,
+            "https://pixabay.com/videos/example-123/",
+        )
         self.assertEqual(loaded[0].source_info["search_term"], "nature")
         self.assertEqual(loaded[0].source_info["asset_id"], "123")
         self.assertEqual(
@@ -143,6 +154,31 @@ class TestMaterialSearchCache(unittest.TestCase):
 
         self.assertIsNone(loaded)
         self.assertFalse(cache_path.exists())
+
+    def test_subsecond_filesystem_mtime_skew_keeps_fresh_cache(self):
+        """Tiny Windows filesystem clock skew must not delete a new cache file."""
+        material_cache.save_material_search_cache(
+            provider="pixabay",
+            search_term="nature",
+            minimum_duration=5,
+            video_aspect=VideoAspect.portrait,
+            items=[self._item()],
+        )
+        cache_path = self._cache_path()
+        now = 2_000_000_000.0
+        near_future_mtime = now + 0.001
+        os.utime(cache_path, (near_future_mtime, near_future_mtime))
+
+        loaded = material_cache.load_material_search_cache(
+            provider="pixabay",
+            search_term="nature",
+            minimum_duration=5,
+            video_aspect=VideoAspect.portrait,
+            now=now,
+        )
+
+        self.assertEqual(len(loaded), 1)
+        self.assertTrue(cache_path.exists())
 
     def test_corrupted_cache_is_removed_without_breaking_search(self):
         """

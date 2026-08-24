@@ -4,6 +4,8 @@ import shutil
 import sys
 import tempfile
 from concurrent.futures import Future
+from contextlib import ExitStack
+from dataclasses import replace
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 from uuid import uuid4
@@ -12,7 +14,19 @@ from uuid import uuid4
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from app.services import task as tm
-from app.models.schema import MaterialInfo, NarrationSlot, VideoParams, VisualSlot
+from app.models.schema import (
+    CriticalVisualFact,
+    MaterialInfo,
+    NarrationOverlap,
+    NarrationSlot,
+    RenderSegment,
+    SemanticVisualSpan,
+    TimedNarrationUnit,
+    VideoParams,
+    VisualBeat,
+    VisualRequirementSpec,
+    VisualSlot,
+)
 from app.services.state import MemoryState, RedisState
 from app.utils import utils
 
@@ -22,6 +36,35 @@ RUN_INTEGRATION_TESTS = os.environ.get("MPT_RUN_INTEGRATION_TESTS", "").lower() 
     "true",
     "yes",
 }
+
+
+def _requirement_spec(requirement):
+    """A minimal, source-grounded decomposition of one visual requirement."""
+    return VisualRequirementSpec(
+        schema_version="visual-requirement-spec-v1",
+        generator_provider="test-provider",
+        generator_model="test-model",
+        original_requirement=requirement,
+        subjects=["subject"],
+        primary_action=None,
+        objects=[],
+        required_relations=[],
+        required_context=[],
+        required_visible_state=[],
+        optional_attributes=[],
+        critical_visual_facts=[
+            CriticalVisualFact(
+                id="f1",
+                fact=requirement,
+                mandatory=True,
+                direct_evidence_needed=True,
+                evidence_description="The defining requirement is directly visible",
+                basis_type="explicit",
+                basis_quote=requirement,
+            )
+        ],
+        ambiguity_notes=[],
+    )
 
 
 class TestTaskService(unittest.TestCase):
@@ -34,6 +77,105 @@ class TestTaskService(unittest.TestCase):
     def tearDown(self):
         with tm._cross_post_registry_lock:
             tm._cross_post_futures.clear()
+
+    @staticmethod
+    def _semantic_units(script, tokens, slot_indexes=None, boundary_type="WordBoundary"):
+        units = []
+        cursor = 0
+        slot_indexes = slot_indexes or [1] * len(tokens)
+        for index, (token, slot_index) in enumerate(
+            zip(tokens, slot_indexes),
+            start=1,
+        ):
+            start_char = script.find(token, cursor)
+            if start_char < 0:
+                raise AssertionError(f"test token is not sequentially present: {token}")
+            end_char = start_char + len(token)
+            start_time = 0.2 + (index - 1) * 0.4
+            units.append(
+                TimedNarrationUnit(
+                    index=index,
+                    text=token,
+                    start_time=start_time,
+                    end_time=start_time + 0.25,
+                    duration=0.25,
+                    timing_source="edge_tts_boundary",
+                    timing_quality="boundary",
+                    source_narration_slot_index=slot_index,
+                    source_boundary_type=boundary_type,
+                    script_start_char=start_char,
+                    script_end_char=end_char,
+                )
+            )
+            cursor = end_char
+        return units
+
+    @staticmethod
+    def _timed_units_with_ranges(script, entries):
+        """Build exact-offset units from (text, start, end, slot) entries."""
+        units = []
+        cursor = 0
+        for index, (text, start_time, end_time, slot_index) in enumerate(
+            entries,
+            start=1,
+        ):
+            start_char = script.find(text, cursor)
+            if start_char < 0:
+                raise AssertionError(f"test unit is not sequentially present: {text}")
+            end_char = start_char + len(text)
+            units.append(
+                TimedNarrationUnit(
+                    index=index,
+                    text=text,
+                    start_time=start_time,
+                    end_time=end_time,
+                    duration=end_time - start_time,
+                    timing_source="edge_tts_boundary",
+                    timing_quality="boundary",
+                    source_narration_slot_index=slot_index,
+                    source_boundary_type="WordBoundary",
+                    script_start_char=start_char,
+                    script_end_char=end_char,
+                )
+            )
+            cursor = end_char
+        return units
+
+    @staticmethod
+    def _semantic_spans_from_ranges(script, units, ranges):
+        spans = []
+        for index, (start_unit, end_unit_exclusive, requirement) in enumerate(
+            ranges,
+            start=1,
+        ):
+            source_units = units[start_unit:end_unit_exclusive]
+            spans.append(
+                SemanticVisualSpan(
+                    index=index,
+                    start_unit=start_unit,
+                    end_unit_exclusive=end_unit_exclusive,
+                    spoken_text=tm.reconstruct_semantic_spoken_text(
+                        script,
+                        units,
+                        start_unit,
+                        end_unit_exclusive,
+                    ),
+                    visual_requirement=requirement,
+                    source_narration_slot_indexes=list(
+                        dict.fromkeys(
+                            unit.source_narration_slot_index
+                            for unit in source_units
+                            if unit.source_narration_slot_index is not None
+                        )
+                    ),
+                    start_time=source_units[0].start_time,
+                    end_time=source_units[-1].end_time,
+                    timing_source="edge_tts_boundary",
+                    timing_quality="boundary",
+                    grouping_source="llm",
+                )
+            )
+        return spans
 
     def test_is_task_busy_covers_generation_and_cross_posting(self):
         """删除入口必须同时识别视频生成和跨平台发布的活跃状态。"""
@@ -664,11 +806,113 @@ class TestTaskService(unittest.TestCase):
         self.assertIsInstance(visual_slots[0], VisualSlot)
         self.assertEqual(visual_slots[0].narration_slot_indexes, [1, 2])
         self.assertEqual(visual_slots[0].narration_text, "Sentence A Sentence B")
+        self.assertEqual(visual_slots[0].primary_narration_slot_index, 1)
+        self.assertEqual(visual_slots[0].primary_narration_text, "Sentence A")
+        self.assertEqual(visual_slots[0].visual_requirement, "Sentence A")
+        overlap_durations = [
+            overlap.overlap_duration
+            for overlap in visual_slots[0].narration_overlaps
+        ]
+        self.assertAlmostEqual(overlap_durations[0], 2.8)
+        self.assertAlmostEqual(overlap_durations[1], 1.2)
         self.assertEqual(visual_slots[1].narration_slot_indexes, [2, 3])
         self.assertEqual(visual_slots[2].start_time, 8.0)
         self.assertEqual(visual_slots[2].end_time, 10.1)
         self.assertAlmostEqual(visual_slots[2].duration, 2.1)
         self.assertEqual(visual_slots[0].timing_quality, "speech_recognition")
+
+    def test_visual_slot_primary_narration_tie_uses_midpoint_then_index(self):
+        narration_slots = [
+            NarrationSlot(1, 0.0, 2.0, 2.0, "First scene", "whisper"),
+            NarrationSlot(2, 2.0, 4.0, 2.0, "Second scene", "whisper"),
+        ]
+
+        slot = tm.build_visual_slots(narration_slots, 4.0, 4.0)[0]
+
+        self.assertEqual(slot.narration_text, "First scene Second scene")
+        self.assertEqual(slot.primary_narration_slot_index, 2)
+        self.assertEqual(slot.visual_requirement, "Second scene")
+
+        same_midpoint = [
+            NarrationSlot(7, 0.0, 4.0, 4.0, "Higher index", "whisper"),
+            NarrationSlot(3, 0.0, 4.0, 4.0, "Lower index", "whisper"),
+        ]
+        stable_slot = tm.build_visual_slots(same_midpoint, 4.0, 4.0)[0]
+        self.assertEqual(stable_slot.primary_narration_slot_index, 3)
+
+    def test_visual_slot_exact_boundary_does_not_inherit_adjacent_narration(self):
+        narration_slots = [
+            NarrationSlot(1, 0.0, 4.0, 4.0, "Opening scene", "whisper"),
+            NarrationSlot(2, 4.0, 8.0, 4.0, "Following scene", "whisper"),
+        ]
+
+        visual_slots = tm.build_visual_slots(narration_slots, 8.0, 4.0)
+
+        self.assertEqual(visual_slots[0].narration_slot_indexes, [1])
+        self.assertEqual(visual_slots[0].visual_requirement, "Opening scene")
+        self.assertEqual(visual_slots[1].narration_slot_indexes, [2])
+        self.assertEqual(visual_slots[1].visual_requirement, "Following scene")
+
+    def test_visual_slot_selects_largest_of_three_overlaps(self):
+        narration_slots = [
+            NarrationSlot(1, 0.0, 1.0, 1.0, "Brief opening", "whisper"),
+            NarrationSlot(2, 1.0, 3.5, 2.5, "Dominant action", "whisper"),
+            NarrationSlot(3, 3.5, 4.0, 0.5, "Brief ending", "whisper"),
+        ]
+
+        slot = tm.build_visual_slots(narration_slots, 4.0, 4.0)[0]
+
+        self.assertEqual(slot.narration_slot_indexes, [1, 2, 3])
+        self.assertEqual(slot.primary_narration_slot_index, 2)
+        self.assertEqual(slot.visual_requirement, "Dominant action")
+        self.assertEqual(
+            [overlap.narration_slot_index for overlap in slot.narration_overlaps],
+            [1, 2, 3],
+        )
+
+    def test_coffee_slot_keeps_context_but_uses_largest_overlap_requirement(self):
+        picking = (
+            "A farm worker reaches between the leaves and hand-picks the ripe "
+            "cherries into a basket."
+        )
+        drying = (
+            "Pale coffee beans spread across drying beds and sit under the warm sun."
+        )
+        narration_slots = [
+            NarrationSlot(1, 0.0, 4.0, 4.0, "Coffee farm introduction.", "whisper"),
+            NarrationSlot(2, 4.0, 9.2, 5.2, picking, "whisper"),
+            NarrationSlot(3, 9.2, 14.0, 4.8, drying, "whisper"),
+        ]
+        visual_slots = tm.build_visual_slots(narration_slots, 14.0, 4.0)
+        coffee_slot = visual_slots[2]
+
+        self.assertEqual(coffee_slot.start_time, 8.0)
+        self.assertEqual(coffee_slot.end_time, 12.0)
+        self.assertEqual(coffee_slot.narration_slot_indexes, [2, 3])
+        self.assertEqual(coffee_slot.narration_text, f"{picking} {drying}")
+        self.assertEqual(coffee_slot.primary_narration_slot_index, 3)
+        self.assertEqual(coffee_slot.visual_requirement, drying)
+        self.assertAlmostEqual(
+            coffee_slot.narration_overlaps[0].overlap_duration, 1.2
+        )
+        self.assertAlmostEqual(
+            coffee_slot.narration_overlaps[1].overlap_duration, 2.8
+        )
+
+        params = VideoParams(
+            video_subject="coffee production",
+            match_materials_to_script=True,
+        )
+        with patch.object(
+            tm.llm,
+            "generate_visual_slot_queries",
+            return_value={slot.index: [f"query {slot.index}"] for slot in visual_slots},
+        ) as generate:
+            tm.generate_visual_slot_search_queries(params, visual_slots)
+
+        sent_slot = generate.call_args.kwargs["visual_slots"][2]
+        self.assertEqual(sent_slot["visual_requirement"], drying)
+        self.assertNotIn("narration_text", sent_slot)
 
     def test_visual_slot_queries_stay_attached_to_their_indexes(self):
         narration_slots = [
@@ -703,7 +947,7 @@ class TestTaskService(unittest.TestCase):
         self.assertEqual(visual_slots[4].search_queries, ["visible query 5"])
         sent_slots = generate.call_args.kwargs["visual_slots"]
         self.assertEqual(sent_slots[4]["slot_index"], 5)
-        self.assertEqual(sent_slots[4]["narration_text"], "Narration for slot 5")
+        self.assertEqual(sent_slots[4]["visual_requirement"], "Narration for slot 5")
 
     def test_estimated_tts_timing_is_explicitly_marked_estimated(self):
         params = VideoParams(
@@ -721,17 +965,36 @@ class TestTaskService(unittest.TestCase):
 
     def test_timeline_artifact_contains_slot_text_queries_and_timing_quality(self):
         narration_slots = [NarrationSlot(1, 0.0, 3.0, 3.0, "Sentence A", "estimated")]
+        timed_units = [
+            TimedNarrationUnit(
+                index=1,
+                text="Sentence A",
+                start_time=0.2,
+                end_time=2.8,
+                duration=2.6,
+                timing_source="estimated",
+                timing_quality="estimated",
+                source_narration_slot_index=1,
+                source_boundary_type="EstimatedScriptSegment",
+                script_start_char=0,
+                script_end_char=10,
+            )
+        ]
         visual_slots = [
             VisualSlot(
-                1,
-                0.0,
-                3.0,
-                3.0,
-                [1],
-                "Sentence A",
-                ["visible subject action"],
-                "estimated",
-                "estimated",
+                index=1,
+                start_time=0.0,
+                end_time=3.0,
+                duration=3.0,
+                narration_slot_indexes=[1],
+                narration_text="Sentence A",
+                primary_narration_slot_index=1,
+                primary_narration_text="Sentence A",
+                visual_requirement="Sentence A",
+                narration_overlaps=[NarrationOverlap(1, 0.0, 3.0, 3.0)],
+                search_queries=["visible subject action"],
+                timing_source="estimated",
+                timing_quality="estimated",
             )
         ]
 
@@ -741,13 +1004,1288 @@ class TestTaskService(unittest.TestCase):
                 narration_slots=narration_slots,
                 visual_slots=visual_slots,
                 video_terms=["visible subject action"],
+                timed_narration_units=timed_units,
             )
 
         saved_visual = persist.call_args.kwargs["visual_slots"][0]
         self.assertEqual(saved_visual["narration_text"], "Sentence A")
+        self.assertEqual(saved_visual["primary_narration_slot_index"], 1)
+        self.assertEqual(saved_visual["primary_narration_text"], "Sentence A")
+        self.assertEqual(saved_visual["visual_requirement"], "Sentence A")
+        self.assertEqual(
+            saved_visual["narration_overlaps"],
+            [
+                {
+                    "narration_slot_index": 1,
+                    "overlap_start_time": 0.0,
+                    "overlap_end_time": 3.0,
+                    "overlap_duration": 3.0,
+                }
+            ],
+        )
         self.assertEqual(saved_visual["search_queries"], ["visible subject action"])
         self.assertEqual(saved_visual["timing_source"], "estimated")
         self.assertEqual(saved_visual["timing_quality"], "estimated")
+        self.assertEqual(persist.call_args.kwargs["timeline_schema_version"], 2)
+        self.assertEqual(
+            persist.call_args.kwargs["timed_narration_units"],
+            [
+                {
+                    "index": 1,
+                    "text": "Sentence A",
+                    "start_time": 0.2,
+                    "end_time": 2.8,
+                    "duration": 2.6,
+                    "source_narration_slot_index": 1,
+                    "timing_source": "estimated",
+                    "timing_quality": "estimated",
+                    "source_boundary_type": "EstimatedScriptSegment",
+                    "script_start_char": 0,
+                    "script_end_char": 10,
+                }
+            ],
+        )
+
+    def test_timed_units_associate_by_order_and_leave_crossing_cue_unassigned(self):
+        narration_slots = [
+            NarrationSlot(1, 0.0, 1.0, 1.0, "Bright red", "edge_tts_boundary"),
+            NarrationSlot(2, 1.0, 2.0, 1.0, "coffee cherries", "edge_tts_boundary"),
+        ]
+        timed_units = [
+            TimedNarrationUnit(
+                1,
+                "Bright",
+                0.1,
+                0.5,
+                0.4,
+                "edge_tts_boundary",
+                "boundary",
+                source_boundary_type="WordBoundary",
+                script_start_char=0,
+                script_end_char=6,
+            ),
+            TimedNarrationUnit(
+                2,
+                "red coffee",
+                0.6,
+                1.4,
+                0.8,
+                "edge_tts_boundary",
+                "boundary",
+                source_boundary_type="SentenceBoundary",
+                script_start_char=7,
+                script_end_char=17,
+            ),
+            TimedNarrationUnit(
+                3,
+                "cherries",
+                1.5,
+                1.9,
+                0.4,
+                "edge_tts_boundary",
+                "boundary",
+                source_boundary_type="WordBoundary",
+                script_start_char=18,
+                script_end_char=26,
+            ),
+        ]
+
+        associated = tm.associate_timed_units_with_narration_slots(
+            timed_units,
+            narration_slots,
+        )
+
+        self.assertEqual(
+            [unit.source_narration_slot_index for unit in associated],
+            [1, None, 2],
+        )
+
+    def test_timed_unit_association_rejects_equal_length_different_text(self):
+        narration_slots = [
+            NarrationSlot(1, 0.0, 1.0, 1.0, "red", "edge_tts_boundary")
+        ]
+        timed_units = [
+            TimedNarrationUnit(
+                1,
+                "bed",
+                0.1,
+                0.9,
+                0.8,
+                "edge_tts_boundary",
+                "boundary",
+                source_boundary_type="WordBoundary",
+                script_start_char=0,
+                script_end_char=3,
+            )
+        ]
+
+        with self.assertRaisesRegex(ValueError, "do not align"):
+            tm.associate_timed_units_with_narration_slots(
+                timed_units,
+                narration_slots,
+            )
+
+    def test_old_script_json_without_timed_units_remains_readable(self):
+        with tempfile.TemporaryDirectory() as tmp_dir, patch.object(
+            tm.utils,
+            "task_dir",
+            return_value=tmp_dir,
+        ):
+            legacy_payload = {
+                "script": "Legacy narration.",
+                "narration_slots": [],
+                "visual_slots": [],
+            }
+            tm.task_artifacts.write_script_data("legacy", legacy_payload)
+
+            self.assertEqual(
+                tm.task_artifacts.read_script_data("legacy"),
+                legacy_payload,
+            )
+
+            timed_unit = TimedNarrationUnit(
+                1,
+                "Legacy narration",
+                0.1,
+                0.9,
+                0.8,
+                "estimated",
+                "estimated",
+                source_boundary_type="EstimatedScriptSegment",
+                script_start_char=0,
+                script_end_char=16,
+            )
+            tm.persist_narration_timeline(
+                task_id="legacy",
+                narration_slots=[],
+                visual_slots=[],
+                video_terms=[],
+                timed_narration_units=[timed_unit],
+            )
+            upgraded = tm.task_artifacts.read_script_data("legacy")
+            self.assertEqual(upgraded["script"], "Legacy narration.")
+            self.assertEqual(upgraded["timeline_schema_version"], 2)
+            self.assertEqual(upgraded["timed_narration_units"][0]["text"], "Legacy narration")
+
+    def test_one_visible_concept_stays_one_semantic_span_across_punctuation(self):
+        cases = (
+            "The worker removes damaged boards from the wall.",
+            (
+                "The beans enter the roaster. They tumble continuously. "
+                "They slowly turn brown."
+            ),
+            "Coffee beans tumble inside the drum.\n\nThey slowly turn brown.",
+            "The worker carefully removes three damaged boards, from the wall.",
+        )
+        for script in cases:
+            tokens = [token.strip(".,") for token in script.split()]
+            units = self._semantic_units(script, tokens)
+            slots = [
+                NarrationSlot(
+                    1,
+                    0.0,
+                    units[-1].end_time,
+                    units[-1].end_time,
+                    script,
+                    "edge_tts_boundary",
+                )
+            ]
+            specs = [
+                {
+                    "start_unit": 0,
+                    "end_unit_exclusive": len(units),
+                    "visual_requirement": "Continuous visible process",
+                }
+            ]
+
+            with self.subTest(script=script):
+                spans = tm.build_semantic_visual_spans_from_specs(
+                    script,
+                    units,
+                    slots,
+                    specs,
+                )
+                self.assertEqual(len(spans), 1)
+                self.assertEqual(spans[0].spoken_text, script)
+                self.assertEqual(spans[0].start_unit, 0)
+                self.assertEqual(spans[0].end_unit_exclusive, len(units))
+
+    def test_one_sentence_can_form_two_true_semantic_visual_spans(self):
+        script = "The worker removes damaged boards and installs fresh insulation."
+        tokens = [
+            "The",
+            "worker",
+            "removes",
+            "damaged",
+            "boards",
+            "and",
+            "installs",
+            "fresh",
+            "insulation",
+        ]
+        units = self._semantic_units(script, tokens)
+        slots = [
+            NarrationSlot(1, 0.0, 4.0, 4.0, script, "edge_tts_boundary")
+        ]
+        spans = tm.build_semantic_visual_spans_from_specs(
+            script,
+            units,
+            slots,
+            [
+                {
+                    "start_unit": 0,
+                    "end_unit_exclusive": 5,
+                    "visual_requirement": "Worker removing damaged boards",
+                },
+                {
+                    "start_unit": 5,
+                    "end_unit_exclusive": 9,
+                    "visual_requirement": "Worker installing fresh insulation",
+                },
+            ],
+        )
+
+        self.assertEqual(len(spans), 2)
+        self.assertEqual(spans[0].spoken_text, "The worker removes damaged boards")
+        self.assertEqual(spans[1].spoken_text, "and installs fresh insulation.")
+        self.assertEqual(spans[0].end_time, units[4].end_time)
+        self.assertEqual(spans[1].start_time, units[5].start_time)
+
+    def test_repeated_words_and_non_visual_clause_keep_exact_unit_coverage(self):
+        repeated_script = (
+            "Workers pick coffee cherries while other workers sort cherries."
+        )
+        repeated_tokens = [
+            "Workers",
+            "pick",
+            "coffee",
+            "cherries",
+            "while",
+            "other",
+            "workers",
+            "sort",
+            "cherries",
+        ]
+        repeated_units = self._semantic_units(repeated_script, repeated_tokens)
+        repeated_spans = tm.build_semantic_visual_spans_from_specs(
+            repeated_script,
+            repeated_units,
+            [NarrationSlot(1, 0.0, 4.0, 4.0, repeated_script, "edge_tts_boundary")],
+            [
+                {
+                    "start_unit": 0,
+                    "end_unit_exclusive": 4,
+                    "visual_requirement": "Workers picking coffee cherries",
+                },
+                {
+                    "start_unit": 4,
+                    "end_unit_exclusive": 9,
+                    "visual_requirement": "Workers sorting coffee cherries",
+                },
+            ],
+        )
+        self.assertEqual(repeated_spans[0].spoken_text, "Workers pick coffee cherries")
+        self.assertEqual(
+            repeated_spans[1].spoken_text,
+            "while other workers sort cherries.",
+        )
+        self.assertLess(
+            repeated_units[3].script_start_char,
+            repeated_units[8].script_start_char,
+        )
+
+        abstract_script = (
+            "The beans dry in the sun, improving flavor before roasting."
+        )
+        abstract_tokens = [token.strip(".,") for token in abstract_script.split()]
+        abstract_units = self._semantic_units(abstract_script, abstract_tokens)
+        abstract_spans = tm.build_semantic_visual_spans_from_specs(
+            abstract_script,
+            abstract_units,
+            [NarrationSlot(1, 0.0, 4.0, 4.0, abstract_script, "edge_tts_boundary")],
+            [
+                {
+                    "start_unit": 0,
+                    "end_unit_exclusive": 9,
+                    "visual_requirement": "Coffee beans drying in sunlight",
+                },
+                {
+                    "start_unit": 9,
+                    "end_unit_exclusive": 10,
+                    "visual_requirement": "Coffee beans roasting",
+                },
+            ],
+        )
+        self.assertIn("improving flavor before", abstract_spans[0].spoken_text)
+        self.assertNotEqual(
+            abstract_spans[0].visual_requirement.lower(),
+            "improving flavor",
+        )
+        self.assertEqual(abstract_spans[-1].end_unit_exclusive, len(abstract_units))
+
+    def test_semantic_span_validator_rejects_untrusted_range_shapes(self):
+        valid_requirement = "Visible action"
+        invalid_cases = {
+            "gap": [
+                {"start_unit": 0, "end_unit_exclusive": 1, "visual_requirement": valid_requirement},
+                {"start_unit": 2, "end_unit_exclusive": 4, "visual_requirement": valid_requirement},
+            ],
+            "overlap": [
+                {"start_unit": 0, "end_unit_exclusive": 3, "visual_requirement": valid_requirement},
+                {"start_unit": 2, "end_unit_exclusive": 4, "visual_requirement": valid_requirement},
+            ],
+            "reordered": [
+                {"start_unit": 2, "end_unit_exclusive": 4, "visual_requirement": valid_requirement},
+                {"start_unit": 0, "end_unit_exclusive": 2, "visual_requirement": valid_requirement},
+            ],
+            "invalid index": [
+                {"start_unit": 0, "end_unit_exclusive": 5, "visual_requirement": valid_requirement}
+            ],
+            "incomplete final coverage": [
+                {"start_unit": 0, "end_unit_exclusive": 3, "visual_requirement": valid_requirement}
+            ],
+            "boolean index": [
+                {"start_unit": False, "end_unit_exclusive": 4, "visual_requirement": valid_requirement}
+            ],
+            "zero length": [
+                {"start_unit": 0, "end_unit_exclusive": 0, "visual_requirement": valid_requirement}
+            ],
+            "empty requirement": [
+                {"start_unit": 0, "end_unit_exclusive": 4, "visual_requirement": " "}
+            ],
+            "oversized requirement": [
+                {
+                    "start_unit": 0,
+                    "end_unit_exclusive": 4,
+                    "visual_requirement": "x" * 241,
+                }
+            ],
+            "fabricated timestamp": [
+                {
+                    "start_unit": 0,
+                    "end_unit_exclusive": 4,
+                    "visual_requirement": valid_requirement,
+                    "start_time": 9.9,
+                }
+            ],
+            "fabricated unit ids": [
+                {
+                    "start_unit": 0,
+                    "end_unit_exclusive": 4,
+                    "visual_requirement": valid_requirement,
+                    "unit_ids": [0, 1, 2, 3],
+                }
+            ],
+        }
+        for name, specs in invalid_cases.items():
+            with self.subTest(name=name), self.assertRaises(ValueError):
+                tm.validate_semantic_visual_span_specs(specs, 4)
+
+    def test_semantic_llm_failure_and_missing_units_use_slot_fallback(self):
+        script = "Boards are removed. Insulation is installed."
+        tokens = ["Boards", "are", "removed", "Insulation", "is", "installed"]
+        units = self._semantic_units(script, tokens, [1, 1, 1, 2, 2, 2])
+        slots = [
+            NarrationSlot(1, 0.0, 1.4, 1.4, "Boards are removed", "edge_tts_boundary"),
+            NarrationSlot(2, 1.4, 2.8, 1.4, "Insulation is installed", "edge_tts_boundary"),
+        ]
+
+        with patch.object(
+            tm.llm,
+            "generate_semantic_visual_span_specs",
+            return_value=None,
+        ), patch.object(
+            # Grouping failing is what makes the fallback run; the repair failing
+            # too is what makes the fallback's spoken requirements survive. This
+            # test is about the shape of that timeline, so both are pinned off.
+            tm.llm,
+            "generate_narration_visual_requirements",
+            return_value=None,
+        ):
+            fallback = tm.generate_semantic_visual_spans(script, units, slots)
+
+        self.assertEqual(len(fallback), 2)
+        self.assertTrue(
+            all(span.grouping_source == "narration_slot_fallback" for span in fallback)
+        )
+        self.assertEqual(
+            [(span.start_unit, span.end_unit_exclusive) for span in fallback],
+            [(0, 3), (3, 6)],
+        )
+
+        with patch.object(
+            tm.llm,
+            "generate_semantic_visual_span_specs",
+        ) as semantic_llm, patch.object(
+            tm.llm,
+            "generate_narration_visual_requirements",
+            return_value=None,
+        ):
+            no_units = tm.generate_semantic_visual_spans(script, [], slots)
+
+        semantic_llm.assert_not_called()
+        self.assertEqual(len(no_units), 2)
+        self.assertIsNone(no_units[0].start_unit)
+        self.assertEqual(no_units[1].source_narration_slot_indexes, [2])
+
+    def test_coarse_unit_is_indivisible_and_multilingual_units_are_supported(self):
+        coarse_script = "Boards are removed. Insulation is installed."
+        coarse_units = self._semantic_units(
+            coarse_script,
+            ["Boards are removed. Insulation is installed"],
+            [None],
+            boundary_type="SentenceBoundary",
+        )
+        coarse_slots = [
+            NarrationSlot(1, 0.0, 1.0, 1.0, "Boards are removed", "edge_tts_boundary"),
+            NarrationSlot(2, 1.0, 2.0, 1.0, "Insulation is installed", "edge_tts_boundary"),
+        ]
+        with patch.object(
+            tm.llm,
+            "generate_semantic_visual_span_specs",
+            return_value=[
+                {"start_unit": 0, "end_unit_exclusive": 1, "visual_requirement": "Removing boards"},
+                {"start_unit": 1, "end_unit_exclusive": 2, "visual_requirement": "Installing insulation"},
+            ],
+        ), patch.object(
+            # Two spans over one indivisible unit is invalid, so this reaches the
+            # slot-led fallback. Its requirement repair is pinned off: the subject
+            # here is unit indivisibility, not what the shot has to show.
+            tm.llm,
+            "generate_narration_visual_requirements",
+            return_value=None,
+        ):
+            coarse_fallback = tm.generate_semantic_visual_spans(
+                coarse_script,
+                coarse_units,
+                coarse_slots,
+            )
+        self.assertEqual(len(coarse_fallback), 1)
+        self.assertEqual((coarse_fallback[0].start_unit, coarse_fallback[0].end_unit_exclusive), (0, 1))
+        self.assertEqual(coarse_fallback[0].source_narration_slot_indexes, [1, 2])
+
+        multilingual_script = "العامل يزيل الألواح.\n工人挑选咖啡豆。"
+        multilingual_units = self._semantic_units(
+            multilingual_script,
+            ["العامل يزيل الألواح", "工人挑选咖啡豆"],
+            [1, 2],
+            boundary_type="SentenceBoundary",
+        )
+        multilingual_slots = [
+            NarrationSlot(1, 0.0, 0.8, 0.8, "العامل يزيل الألواح", "edge_tts_boundary"),
+            NarrationSlot(2, 0.8, 1.5, 0.7, "工人挑选咖啡豆", "edge_tts_boundary"),
+        ]
+        multilingual_spans = tm.build_semantic_visual_spans_from_specs(
+            multilingual_script,
+            multilingual_units,
+            multilingual_slots,
+            [
+                {"start_unit": 0, "end_unit_exclusive": 1, "visual_requirement": "عامل يزيل ألواحاً"},
+                {"start_unit": 1, "end_unit_exclusive": 2, "visual_requirement": "工人挑选咖啡豆"},
+            ],
+        )
+        self.assertEqual(multilingual_spans[0].spoken_text, "العامل يزيل الألواح.")
+        self.assertEqual(multilingual_spans[1].spoken_text, "工人挑选咖啡豆。")
+
+    def _abstract_narration_fixture(self):
+        """A narration whose second and third lines show nothing on their own.
+
+        "Patient." and "Not loud." are the shape of the lines that made every
+        beat of a recorded run unfillable: they are true sentences of the
+        narration and complete nonsense as a description of footage.
+        """
+        script = (
+            "Patient. Rain falls on a dry field. "
+            "Not loud. A green shoot breaks the soil."
+        )
+        tokens = [
+            "Patient",
+            "Rain",
+            "falls",
+            "on",
+            "a",
+            "dry",
+            "field",
+            "Not",
+            "loud",
+            "A",
+            "green",
+            "shoot",
+            "breaks",
+            "the",
+            "soil",
+        ]
+        units = self._semantic_units(script, tokens, [1] + [2] * 6 + [3] * 2 + [4] * 6)
+        slots = [
+            NarrationSlot(1, 0.0, 0.6, 0.6, "Patient", "edge_tts_boundary"),
+            NarrationSlot(
+                2, 0.6, 3.0, 2.4, "Rain falls on a dry field", "edge_tts_boundary"
+            ),
+            NarrationSlot(3, 3.0, 3.7, 0.7, "Not loud", "edge_tts_boundary"),
+            NarrationSlot(
+                4, 3.7, 6.4, 2.7, "A green shoot breaks the soil", "edge_tts_boundary"
+            ),
+        ]
+        return script, units, slots
+
+    def test_a_line_with_nothing_to_show_is_absorbed_by_a_filmable_neighbour(self):
+        script, units, slots = self._abstract_narration_fixture()
+        repaired = {
+            1: "",
+            2: "Heavy rain falls on cracked dry earth",
+            4: "A green seedling pushes up through dark soil",
+        }
+
+        with patch.object(
+            tm.llm,
+            "generate_semantic_visual_span_specs",
+            return_value=None,
+        ), patch.object(
+            tm.llm,
+            "generate_narration_visual_requirements",
+            return_value=repaired,
+        ) as repair:
+            spans = tm.generate_semantic_visual_spans(script, units, slots)
+
+        self.assertEqual(repair.call_args.kwargs["narration_text"], script)
+        self.assertEqual(
+            [line["index"] for line in repair.call_args.kwargs["narration_lines"]],
+            [1, 2, 3, 4],
+        )
+        self.assertEqual(
+            repair.call_args.kwargs["narration_lines"][2]["spoken_text"],
+            "Not loud.",
+        )
+        # Line 1 came back empty and line 3 never came back at all. Both mean the
+        # same thing -- the line has no visible content of its own -- and both
+        # must be absorbed here, for free, instead of buying a search and a round
+        # of candidate analysis apiece before the failure ladder gives up.
+        self.assertEqual(len(spans), 2)
+        self.assertEqual([span.index for span in spans], [1, 2])
+        self.assertTrue(
+            all(span.grouping_source == "narration_slot_repaired" for span in spans)
+        )
+        self.assertEqual(
+            [span.visual_requirement for span in spans],
+            [repaired[2], repaired[4]],
+        )
+        self.assertEqual(
+            [(span.start_unit, span.end_unit_exclusive) for span in spans],
+            [(0, 9), (9, 15)],
+        )
+        # The absorbing span carries the absorbed narration and its slots, so no
+        # narration is dropped from the timeline and none of it is searched for.
+        self.assertEqual(
+            spans[0].spoken_text,
+            script[: script.index("A green")].strip(),
+        )
+        self.assertNotIn("Patient", spans[0].visual_requirement)
+        self.assertEqual(spans[0].source_narration_slot_indexes, [1, 2, 3])
+        self.assertEqual(spans[1].source_narration_slot_indexes, [4])
+        self.assertEqual(spans[0].start_time, units[0].start_time)
+        self.assertEqual(spans[0].end_time, units[8].end_time)
+        self.assertEqual(spans[1].start_time, units[9].start_time)
+        self.assertEqual(spans[1].end_time, units[-1].end_time)
+
+    def test_a_repaired_timeline_is_a_valid_input_for_the_beat_stage(self):
+        script, units, slots = self._abstract_narration_fixture()
+        repaired = {
+            2: "Heavy rain falls on cracked dry earth",
+            4: "A green seedling pushes up through dark soil",
+        }
+
+        with patch.object(
+            tm.llm,
+            "generate_semantic_visual_span_specs",
+            return_value=None,
+        ), patch.object(
+            tm.llm,
+            "generate_narration_visual_requirements",
+            return_value=repaired,
+        ):
+            spans = tm.generate_semantic_visual_spans(script, units, slots)
+        audio_duration = 6.4
+        beats = tm.build_visual_beats(script, spans, units, slots, audio_duration)
+
+        # Consolidation rewrote the span indexes and unit ranges, so the beat
+        # stage's own validation is the proof that it stayed a legal timeline.
+        self.assertTrue(beats)
+        self.assertEqual(
+            {beat.visual_requirement for beat in beats},
+            set(repaired.values()),
+        )
+        self.assertEqual(beats[0].start_time, 0.0)
+        self.assertEqual(beats[-1].end_time, audio_duration)
+        for previous, following in zip(beats, beats[1:]):
+            self.assertEqual(previous.end_time, following.start_time)
+
+    def test_an_overlong_repaired_requirement_is_treated_as_unfilmable(self):
+        script, units, slots = self._abstract_narration_fixture()
+        bloated = "A dry field " + "with cracked earth everywhere " * 12
+        self.assertGreater(len(bloated), tm._SEMANTIC_VISUAL_REQUIREMENT_MAX_CHARS)
+
+        with patch.object(
+            tm.llm,
+            "generate_semantic_visual_span_specs",
+            return_value=None,
+        ), patch.object(
+            tm.llm,
+            "generate_narration_visual_requirements",
+            return_value={
+                2: bloated,
+                4: "A green seedling pushes up through dark soil",
+            },
+        ):
+            spans = tm.generate_semantic_visual_spans(script, units, slots)
+
+        # A requirement over the span limit is carried into the checklist and into
+        # every adjudication prompt of its beat, so it is refused here and the
+        # line is absorbed like any other line with nothing to show.
+        self.assertEqual(len(spans), 1)
+        self.assertEqual(
+            spans[0].visual_requirement,
+            "A green seedling pushes up through dark soil",
+        )
+        self.assertEqual((spans[0].start_unit, spans[0].end_unit_exclusive), (0, 15))
+        self.assertEqual(spans[0].grouping_source, "narration_slot_repaired")
+        self.assertEqual(spans[0].spoken_text, script)
+        self.assertEqual(spans[0].source_narration_slot_indexes, [1, 2, 3, 4])
+
+    def test_a_narration_with_nothing_filmable_keeps_its_spoken_requirements(self):
+        script, units, slots = self._abstract_narration_fixture()
+
+        with patch.object(
+            tm.llm,
+            "generate_semantic_visual_span_specs",
+            return_value=None,
+        ), patch.object(
+            tm.llm,
+            "generate_narration_visual_requirements",
+            return_value={1: "", 2: "   ", 3: "", 4: ""},
+        ):
+            nothing_visible = tm.generate_semantic_visual_spans(script, units, slots)
+
+        # Absorbing every line into nothing is not a timeline. The spoken
+        # requirements survive so the failure stays visible in the provenance
+        # instead of looking like a planned set of shots.
+        self.assertEqual(len(nothing_visible), 4)
+        self.assertTrue(
+            all(
+                span.grouping_source == "narration_slot_fallback"
+                for span in nothing_visible
+            )
+        )
+        self.assertEqual(nothing_visible[0].visual_requirement, "Patient.")
+        self.assertTrue(
+            tm.semantic_visual_requirements_are_spoken_narration(nothing_visible)
+        )
+
+        with patch.object(
+            tm.llm,
+            "generate_semantic_visual_span_specs",
+            return_value=None,
+        ), patch.object(
+            tm.llm,
+            "generate_narration_visual_requirements",
+            side_effect=RuntimeError("provider is unreachable"),
+        ):
+            unavailable = tm.generate_semantic_visual_spans(script, units, slots)
+
+        # A provider outage must read as "repair unavailable", never as "this
+        # narration has nothing to show", and it must not fail the run.
+        self.assertEqual(
+            [span.visual_requirement for span in unavailable],
+            [span.visual_requirement for span in nothing_visible],
+        )
+        self.assertTrue(
+            tm.semantic_visual_requirements_are_spoken_narration(unavailable)
+        )
+        # An empty timeline has no spoken requirement to protect against, and a
+        # repaired one describes footage, so neither triggers the guard.
+        self.assertFalse(tm.semantic_visual_requirements_are_spoken_narration([]))
+
+    def test_realistic_coffee_semantic_spans_own_exact_text_and_derived_timing(self):
+        lines = [
+            "Bright red coffee cherries grow on the plant.",
+            "Workers pick the ripe cherries by hand.",
+            "The beans are spread out to dry in the sun.",
+            "Coffee beans roast inside a heated drum.",
+        ]
+        script = "\n".join(lines)
+        token_groups = [
+            ["Bright", "red", "coffee", "cherries", "grow", "on", "the", "plant"],
+            ["Workers", "pick", "the", "ripe", "cherries", "by", "hand"],
+            ["The", "beans", "are", "spread", "out", "to", "dry", "in", "the", "sun"],
+            ["Coffee", "beans", "roast", "inside", "a", "heated", "drum"],
+        ]
+        tokens = [token for group in token_groups for token in group]
+        slot_indexes = [
+            slot_index
+            for slot_index, group in enumerate(token_groups, start=1)
+            for _ in group
+        ]
+        units = self._semantic_units(script, tokens, slot_indexes)
+        slots = [
+            NarrationSlot(
+                index,
+                units[sum(len(group) for group in token_groups[: index - 1])].start_time,
+                units[sum(len(group) for group in token_groups[:index]) - 1].end_time,
+                1.0,
+                line,
+                "edge_tts_boundary",
+            )
+            for index, line in enumerate(lines, start=1)
+        ]
+        boundaries = [0, 8, 15, 25, 32]
+        requirements = [
+            "Ripe coffee cherries growing on coffee plants",
+            "Worker hand-picking ripe coffee cherries",
+            "Coffee beans drying in sunlight",
+            "Coffee beans roasting inside a heated drum",
+        ]
+        raw_specs = [
+            {
+                "start_unit": start,
+                "end_unit_exclusive": end,
+                "visual_requirement": requirement,
+            }
+            for start, end, requirement in zip(
+                boundaries,
+                boundaries[1:],
+                requirements,
+            )
+        ]
+        spans = tm.build_semantic_visual_spans_from_specs(
+            script,
+            units,
+            slots,
+            raw_specs,
+        )
+
+        self.assertEqual([span.source_narration_slot_indexes for span in spans], [[1], [2], [3], [4]])
+        self.assertIn("pick the ripe cherries", spans[1].spoken_text)
+        self.assertNotIn("dry", spans[1].spoken_text)
+        self.assertIn("spread out to dry", spans[2].spoken_text)
+        self.assertNotIn("roast", spans[2].spoken_text)
+        self.assertIn("roast inside", spans[3].spoken_text)
+        for span, start, end in zip(spans, boundaries, boundaries[1:]):
+            self.assertEqual(span.start_time, units[start].start_time)
+            self.assertEqual(span.end_time, units[end - 1].end_time)
+            self.assertEqual(span.grouping_source, "llm")
+
+    def test_visual_beats_follow_realistic_coffee_semantic_timing(self):
+        lines = [
+            "Coffee cherries grow on the plant.",
+            "Workers pick ripe cherries by hand.",
+            "Coffee beans dry in the sun.",
+            "Coffee beans roast inside a heated drum.",
+        ]
+        script = "\n".join(lines)
+        units = self._timed_units_with_ranges(
+            script,
+            [
+                (lines[0], 0.0, 3.1, 1),
+                (lines[1], 3.2, 5.9, 2),
+                (lines[2], 6.0, 9.8, 3),
+                (lines[3], 10.0, 12.8, 4),
+            ],
+        )
+        requirements = [
+            "Coffee cherries growing on coffee plants",
+            "Worker hand-picking ripe coffee cherries",
+            "Coffee beans drying in sunlight",
+            "Coffee beans roasting inside a heated drum",
+        ]
+        spans = self._semantic_spans_from_ranges(
+            script,
+            units,
+            [
+                (index, index + 1, requirement)
+                for index, requirement in enumerate(requirements)
+            ],
+        )
+
+        beats = tm.build_visual_beats(script, spans, units, [], 12.8)
+
+        self.assertEqual(len(beats), 4)
+        self.assertEqual(
+            [(beat.start_time, beat.end_time) for beat in beats],
+            [(0.0, 3.2), (3.2, 6.0), (6.0, 10.0), (10.0, 12.8)],
+        )
+        self.assertEqual(
+            [beat.visual_requirement for beat in beats],
+            requirements,
+        )
+        self.assertEqual([beat.semantic_group_id for beat in beats], [1, 2, 3, 4])
+        self.assertEqual(
+            [beat.duration_policy for beat in beats],
+            ["semantic_original"] * 4,
+        )
+        self.assertAlmostEqual(sum(beat.duration for beat in beats), 12.8)
+        self.assertNotIn(4.0, [beat.end_time for beat in beats])
+
+    def test_visual_beat_queries_use_only_requirements_and_reuse_siblings(self):
+        requirements = [
+            "Coffee cherries growing on a plant",
+            "Coffee beans drying in sunlight",
+            "Coffee beans drying in sunlight",
+        ]
+        beats = [
+            VisualBeat(
+                index=index,
+                semantic_group_id=1 if index == 1 else 2,
+                shot_index=1 if index < 3 else 2,
+                start_time=float(index - 1),
+                end_time=float(index),
+                duration=1.0,
+                spoken_text=(
+                    "Neighbor context mentions picking and roasting, but it must "
+                    "not enter the search query."
+                ),
+                visual_requirement=requirement,
+                source_semantic_span_index=1 if index == 1 else 2,
+                source_narration_slot_indexes=[index],
+                start_unit=index - 1,
+                end_unit_exclusive=index,
+                timing_source="edge_tts_boundary",
+                timing_quality="boundary",
+                duration_policy="short_semantic_preserved",
+                rapid_cut=True,
+            )
+            for index, requirement in enumerate(requirements, start=1)
+        ]
+
+        def fake_queries(**kwargs):
+            self.assertEqual(kwargs["video_subject"], "")
+            payload = kwargs["visual_slots"]
+            self.assertEqual(len(payload), 2)
+            self.assertEqual(
+                [item["visual_requirement"] for item in payload],
+                requirements[:2],
+            )
+            self.assertNotIn("Neighbor context", str(payload))
+            return {
+                1: ["coffee cherries growing"],
+                2: ["coffee beans drying sun"],
+            }
+
+        with patch.object(
+            tm.llm,
+            "generate_visual_slot_queries",
+            side_effect=fake_queries,
+        ) as generate:
+            flat_queries = tm.generate_visual_beat_search_queries(beats)
+
+        generate.assert_called_once()
+        self.assertEqual(
+            flat_queries,
+            [
+                "coffee cherries growing",
+                "coffee beans drying sun",
+                "coffee beans drying sun",
+            ],
+        )
+        self.assertEqual(beats[1].search_queries, beats[2].search_queries)
+        self.assertIsNot(beats[1].search_queries, beats[2].search_queries)
+
+    def test_beat_queries_request_as_many_phrasings_as_selection_may_try(self):
+        # Material selection tries a beat's alternative phrasings on the current
+        # provider before it changes catalog. Asking the script stage for exactly
+        # one phrasing would leave it nothing to retry with.
+        beats = [
+            VisualBeat(
+                index=index,
+                semantic_group_id=1,
+                shot_index=index,
+                start_time=float(index - 1),
+                end_time=float(index),
+                duration=1.0,
+                spoken_text="A worker digs a hole.",
+                visual_requirement="A worker digs a hole.",
+                source_semantic_span_index=1,
+                source_narration_slot_indexes=[index],
+                start_unit=index - 1,
+                end_unit_exclusive=index,
+                timing_source="edge_tts_boundary",
+                timing_quality="boundary",
+                duration_policy="semantic_original",
+                rapid_cut=True,
+            )
+            for index in (1, 2)
+        ]
+        phrasings = ["worker digging hole", "shovel breaking soil", "hands in earth"]
+
+        # The count travels from the real config knob through the real material
+        # predicate, so this test fails if either side stops agreeing.
+        with (
+            patch.dict(tm.config.app, {"smart_material_max_query_variants": 3}),
+            patch.object(
+                tm.llm,
+                "generate_visual_slot_queries",
+                return_value={1: phrasings},
+            ) as generate,
+        ):
+            flat_queries = tm.generate_visual_beat_search_queries(
+                beats,
+                queries_per_beat=tm.material.max_query_variants_per_provider(),
+            )
+
+        self.assertEqual(generate.call_args.kwargs["queries_per_slot"], 3)
+        # The flat return stays the planned query per beat; the alternates travel
+        # on the beats themselves, so they reach the manifest and selection.
+        self.assertEqual(flat_queries, [phrasings[0], phrasings[0]])
+        self.assertEqual(beats[0].search_queries, phrasings)
+        self.assertEqual(beats[1].search_queries, phrasings)
+
+    def test_visual_beats_assign_initial_interspan_and_trailing_silence(self):
+        script = "Cherries grow. Workers sort beans."
+        units = self._timed_units_with_ranges(
+            script,
+            [
+                ("Cherries grow", 0.3, 2.0, 1),
+                ("Workers sort beans", 2.3, 9.7, 2),
+            ],
+        )
+        spans = self._semantic_spans_from_ranges(
+            script,
+            units,
+            [
+                (0, 1, "Coffee cherries growing"),
+                (1, 2, "Workers sorting coffee beans"),
+            ],
+        )
+
+        beats = tm.build_visual_beats(script, spans, units, [], 10.2)
+
+        self.assertEqual(len(beats), 2)
+        self.assertEqual((beats[0].start_time, beats[0].end_time), (0.0, 2.3))
+        self.assertEqual((beats[1].start_time, beats[1].end_time), (2.3, 10.2))
+        self.assertEqual(beats[0].end_time, beats[1].start_time)
+        self.assertAlmostEqual(sum(beat.duration for beat in beats), 10.2)
+
+    def test_visual_beats_preserve_short_and_very_short_distinct_concepts(self):
+        script = "A match ignites. A door slams. Smoke fills the room."
+        units = self._timed_units_with_ranges(
+            script,
+            [
+                ("A match ignites", 0.0, 1.7, 1),
+                ("A door slams", 1.7, 2.5, 2),
+                ("Smoke fills the room", 2.5, 5.0, 3),
+            ],
+        )
+        requirements = [
+            "A match igniting",
+            "A door slamming shut",
+            "Smoke filling a room",
+        ]
+        spans = self._semantic_spans_from_ranges(
+            script,
+            units,
+            [
+                (index, index + 1, requirement)
+                for index, requirement in enumerate(requirements)
+            ],
+        )
+
+        beats = tm.build_visual_beats(script, spans, units, [], 5.0)
+
+        self.assertEqual(len(beats), 3)
+        self.assertEqual([beat.visual_requirement for beat in beats], requirements)
+        self.assertEqual(beats[0].duration_policy, "short_semantic_preserved")
+        self.assertFalse(beats[0].rapid_cut)
+        self.assertEqual(beats[1].duration_policy, "short_semantic_preserved")
+        self.assertTrue(beats[1].rapid_cut)
+        self.assertEqual(beats[1].semantic_group_id, 2)
+
+    def test_visual_beats_split_long_concepts_at_balanced_unit_boundaries(self):
+        cases = (
+            (
+                8.0,
+                [0.0, 2.0, 4.0, 6.0],
+                [1.8, 3.8, 5.8, 8.0],
+                [4.0],
+            ),
+            (
+                11.4,
+                [0.0, 1.9, 3.8, 5.7, 7.6, 9.5],
+                [1.7, 3.6, 5.5, 7.4, 9.3, 11.4],
+                [3.8, 7.6],
+            ),
+        )
+        tokens = ["Coffee", "beans", "keep", "roasting", "inside", "drum"]
+        for audio_duration, starts, ends, expected_cuts in cases:
+            selected_tokens = tokens[: len(starts)]
+            script = " ".join(selected_tokens) + "."
+            units = self._timed_units_with_ranges(
+                script,
+                [
+                    (token, start, end, 1)
+                    for token, start, end in zip(selected_tokens, starts, ends)
+                ],
+            )
+            spans = self._semantic_spans_from_ranges(
+                script,
+                units,
+                [(0, len(units), "Coffee beans roasting inside a roaster")],
+            )
+
+            with self.subTest(audio_duration=audio_duration):
+                beats = tm.build_visual_beats(
+                    script,
+                    spans,
+                    units,
+                    [],
+                    audio_duration,
+                )
+                self.assertEqual(
+                    [beat.end_time for beat in beats[:-1]],
+                    expected_cuts,
+                )
+                self.assertEqual(
+                    [beat.start_time for beat in beats[1:]],
+                    expected_cuts,
+                )
+                self.assertTrue(
+                    all(
+                        beat.duration_policy == "long_span_split"
+                        for beat in beats
+                    )
+                )
+                self.assertEqual(
+                    {beat.semantic_group_id for beat in beats},
+                    {1},
+                )
+                self.assertEqual(
+                    {beat.visual_requirement for beat in beats},
+                    {"Coffee beans roasting inside a roaster"},
+                )
+                valid_boundaries = {unit.start_time for unit in units[1:]}
+                self.assertTrue(set(expected_cuts).issubset(valid_boundaries))
+
+    def test_visual_beats_keep_multiple_concepts_in_one_sentence_separate(self):
+        script = "The mechanic removes the wheel and installs a tire before lowering the car."
+        units = self._timed_units_with_ranges(
+            script,
+            [
+                ("The mechanic removes the wheel", 0.0, 2.0, 1),
+                ("and installs a tire", 2.0, 4.0, 1),
+                ("before lowering the car", 4.0, 6.0, 1),
+            ],
+        )
+        requirements = [
+            "Mechanic removing a damaged wheel",
+            "Mechanic installing a new tire",
+            "Mechanic lowering the car",
+        ]
+        spans = self._semantic_spans_from_ranges(
+            script,
+            units,
+            [
+                (index, index + 1, requirement)
+                for index, requirement in enumerate(requirements)
+            ],
+        )
+
+        beats = tm.build_visual_beats(script, spans, units, [], 6.0)
+
+        self.assertEqual(len(beats), 3)
+        self.assertEqual([beat.visual_requirement for beat in beats], requirements)
+        self.assertEqual([beat.semantic_group_id for beat in beats], [1, 2, 3])
+
+    def test_visual_beats_keep_one_multisentence_semantic_identity_when_split(self):
+        lines = [
+            "The beans enter the roaster.",
+            "They tumble continuously.",
+            "They slowly turn brown.",
+        ]
+        script = "\n".join(lines)
+        units = self._timed_units_with_ranges(
+            script,
+            [
+                (lines[0], 0.0, 2.2, 1),
+                (lines[1], 2.3, 4.5, 2),
+                (lines[2], 4.6, 7.0, 3),
+            ],
+        )
+        requirement = "Coffee beans roasting inside a roaster"
+        spans = self._semantic_spans_from_ranges(
+            script,
+            units,
+            [(0, 3, requirement)],
+        )
+
+        beats = tm.build_visual_beats(script, spans, units, [], 7.0)
+
+        self.assertEqual(len(beats), 2)
+        self.assertEqual({beat.semantic_group_id for beat in beats}, {1})
+        self.assertEqual({beat.visual_requirement for beat in beats}, {requirement})
+        self.assertEqual([beat.shot_index for beat in beats], [1, 2])
+        self.assertIn("enter the roaster", beats[0].spoken_text)
+        self.assertIn("turn brown", beats[1].spoken_text)
+
+    def test_visual_beat_timing_quality_is_conservative_and_deterministic(self):
+        script = "Coffee beans roast inside the drum."
+        units = self._timed_units_with_ranges(
+            script,
+            [
+                ("Coffee beans", 0.0, 1.8, 1),
+                ("roast inside", 2.0, 3.8, 1),
+                ("the drum", 4.0, 8.0, 1),
+            ],
+        )
+        units[1].timing_source = "estimated"
+        units[1].timing_quality = "estimated"
+        spans = self._semantic_spans_from_ranges(
+            script,
+            units,
+            [(0, 3, "Coffee beans roasting inside a drum")],
+        )
+        spans[0].timing_source = "estimated"
+        spans[0].timing_quality = "estimated"
+
+        first = tm.build_visual_beats(script, spans, units, [], 8.0)
+        second = tm.build_visual_beats(script, spans, units, [], 8.0)
+
+        self.assertEqual(first, second)
+        self.assertTrue(all(beat.timing_quality == "estimated" for beat in first))
+        self.assertTrue(all(beat.timing_source == "estimated" for beat in first))
+
+    def test_visual_beats_use_narration_fallback_then_leave_legacy_available(self):
+        script = "Boards are removed. Insulation is installed."
+        units = self._timed_units_with_ranges(
+            script,
+            [
+                ("Boards are removed", 0.0, 2.0, 1),
+                ("Insulation is installed", 2.0, 4.0, 2),
+            ],
+        )
+        slots = [
+            NarrationSlot(1, 0.0, 2.0, 2.0, "Boards are removed", "edge_tts_boundary"),
+            NarrationSlot(2, 2.0, 4.0, 2.0, "Insulation is installed", "edge_tts_boundary"),
+        ]
+
+        fallback = tm.build_visual_beats(script, None, units, slots, 4.0)
+        invalid_semantic = SemanticVisualSpan(
+            index=2,
+            start_unit=0,
+            end_unit_exclusive=2,
+            spoken_text=script,
+            visual_requirement="Invalid reordered semantic metadata",
+            source_narration_slot_indexes=[1, 2],
+            start_time=0.0,
+            end_time=4.0,
+            timing_source="edge_tts_boundary",
+            timing_quality="boundary",
+            grouping_source="llm",
+        )
+        invalid_fallback = tm.build_visual_beats(
+            script,
+            [invalid_semantic],
+            units,
+            slots,
+            4.0,
+        )
+        legacy = tm.build_visual_beats(script, None, [], [], 4.0)
+
+        self.assertEqual(len(fallback), 2)
+        self.assertTrue(
+            all(beat.source_semantic_span_index is None for beat in fallback)
+        )
+        self.assertEqual([beat.semantic_group_id for beat in fallback], [1, 2])
+        self.assertEqual(
+            [beat.visual_requirement for beat in invalid_fallback],
+            [beat.visual_requirement for beat in fallback],
+        )
+        self.assertEqual(legacy, [])
+
+    def test_visual_beats_persist_additively_and_old_manifests_stay_readable(self):
+        beat = VisualBeat(
+            index=1,
+            semantic_group_id=1,
+            shot_index=1,
+            start_time=0.0,
+            end_time=2.0,
+            duration=2.0,
+            spoken_text="Coffee beans roast.",
+            visual_requirement="Coffee beans roasting",
+            source_semantic_span_index=1,
+            source_narration_slot_indexes=[1],
+            start_unit=0,
+            end_unit_exclusive=1,
+            timing_source="edge_tts_boundary",
+            timing_quality="boundary",
+            duration_policy="semantic_original",
+            rapid_cut=False,
+            search_queries=["coffee beans roasting"],
+        )
+        with tempfile.TemporaryDirectory() as tmp_dir, patch.object(
+            tm.utils,
+            "task_dir",
+            return_value=tmp_dir,
+        ):
+            old_payload = {"script": "Coffee beans roast.", "visual_slots": []}
+            tm.task_artifacts.write_script_data("beats", old_payload)
+            self.assertEqual(
+                tm.task_artifacts.read_script_data("beats"),
+                old_payload,
+            )
+            tm.persist_narration_timeline(
+                task_id="beats",
+                narration_slots=[],
+                visual_slots=[],
+                video_terms=[],
+                visual_beats=[beat],
+            )
+            persisted = tm.task_artifacts.read_script_data("beats")
+
+        self.assertEqual(persisted["timeline_schema_version"], 2)
+        self.assertEqual(persisted["visual_beats"][0]["semantic_group_id"], 1)
+        self.assertEqual(
+            persisted["visual_beats"][0]["duration_policy"],
+            "semantic_original",
+        )
+        self.assertEqual(
+            persisted["visual_beats"][0]["search_queries"],
+            ["coffee beans roasting"],
+        )
+        self.assertNotIn("api_key", persisted["visual_beats"][0])
+
+    def test_semantic_visual_spans_persist_round_trip_without_raw_llm_data(self):
+        semantic_span = SemanticVisualSpan(
+            index=1,
+            start_unit=0,
+            end_unit_exclusive=1,
+            spoken_text="Coffee beans roast.",
+            visual_requirement="Coffee beans roasting",
+            source_narration_slot_indexes=[1],
+            start_time=0.2,
+            end_time=1.1,
+            timing_source="edge_tts_boundary",
+            timing_quality="boundary",
+            grouping_source="llm",
+        )
+        with tempfile.TemporaryDirectory() as tmp_dir, patch.object(
+            tm.utils,
+            "task_dir",
+            return_value=tmp_dir,
+        ):
+            tm.task_artifacts.write_script_data("semantic", {"script": "Coffee beans roast."})
+            tm.persist_narration_timeline(
+                task_id="semantic",
+                narration_slots=[],
+                visual_slots=[],
+                video_terms=[],
+                semantic_visual_spans=[semantic_span],
+            )
+            persisted = tm.task_artifacts.read_script_data("semantic")
+
+        self.assertEqual(persisted["timeline_schema_version"], 2)
+        self.assertEqual(persisted["semantic_visual_spans"][0]["start_unit"], 0)
+        self.assertEqual(
+            persisted["semantic_visual_spans"][0]["spoken_text"],
+            "Coffee beans roast.",
+        )
+        self.assertNotIn("raw_response", persisted["semantic_visual_spans"][0])
 
     def test_start_stops_before_materials_when_term_provider_fails(self):
         """
@@ -872,6 +2410,35 @@ class TestTaskService(unittest.TestCase):
         failed_task = state.get_task(task_id)
         self.assertEqual(failed_task["failed_stage"], "audio")
         self.assertIn("does not exist", failed_task["error"])
+
+    def test_generate_audio_exposes_classified_tts_voice_error(self):
+        task_id = "test-classified-tts-error"
+        params = VideoParams(
+            video_subject="voice failure",
+            voice_name="invalid-edge-voice",
+        )
+        state = MemoryState()
+        safe_message = (
+            "Edge TTS voice problem; verify the selected voice and its language"
+        )
+
+        try:
+            with (
+                patch.object(
+                    tm.voice,
+                    "tts",
+                    side_effect=tm.voice.TTSServiceError("voice", safe_message),
+                ),
+                patch.object(tm.sm, "state", state),
+            ):
+                result = tm.generate_audio(task_id, params, "script")
+        finally:
+            shutil.rmtree(utils.task_dir(task_id), ignore_errors=True)
+
+        self.assertEqual(result, (None, None, None))
+        failed_task = state.get_task(task_id)
+        self.assertEqual(failed_task["failed_stage"], "audio")
+        self.assertEqual(failed_task["error"], safe_message)
 
     def test_generate_subtitle_uses_whisper_for_custom_audio_without_sub_maker(self):
         """
@@ -1091,15 +2658,33 @@ class TestTaskService(unittest.TestCase):
         ]
         visual_slots = [
             VisualSlot(
-                1,
-                0.0,
-                4.0,
-                4.0,
-                [1],
-                "Workers inspect railway tracks",
-                [],
-                "edge_tts_boundary",
-                "boundary",
+                index=1,
+                start_time=0.0,
+                end_time=4.0,
+                duration=4.0,
+                narration_slot_indexes=[1],
+                narration_text="Workers inspect railway tracks",
+                primary_narration_slot_index=1,
+                primary_narration_text="Workers inspect railway tracks",
+                visual_requirement="Workers inspect railway tracks",
+                narration_overlaps=[NarrationOverlap(1, 0.0, 4.0, 4.0)],
+                search_queries=[],
+                timing_source="edge_tts_boundary",
+                timing_quality="boundary",
+            )
+        ]
+        timed_units = [
+            TimedNarrationUnit(
+                index=1,
+                text="Workers inspect railway tracks",
+                start_time=0.2,
+                end_time=3.8,
+                duration=3.6,
+                timing_source="edge_tts_boundary",
+                timing_quality="boundary",
+                source_boundary_type="SentenceBoundary",
+                script_start_char=0,
+                script_end_char=30,
             )
         ]
         events = []
@@ -1125,34 +2710,92 @@ class TestTaskService(unittest.TestCase):
             visual_slots[0].search_queries = ["workers inspecting railway tracks"]
             return ["workers inspecting railway tracks"]
 
+        def fake_beat_queries(beats, queries_per_beat=1):
+            events.append("beat_queries")
+            beats[0].search_queries = ["workers inspecting railway tracks"]
+            return ["workers inspecting railway tracks"]
+
         with (
             patch.object(tm, "generate_script", return_value=params.video_script),
             patch.object(tm, "generate_terms") as legacy_terms,
+            # This test is about stage order, not about the checklist. Without this
+            # patch the checklist gate reads the real config and the script stage
+            # sends a live decomposition request to the configured LLM provider.
+            patch.object(
+                tm.twelvelabs, "is_smart_visual_matching_enabled", return_value=False
+            ),
             patch.object(tm, "save_script_data"),
             patch.object(tm, "generate_audio", side_effect=fake_audio),
             patch.object(
                 tm, "generate_subtitle", side_effect=fake_subtitle
             ) as subtitles,
             patch.object(tm.voice, "get_audio_duration", return_value=4.0),
+            patch.object(
+                tm.voice,
+                "extract_timed_narration_units",
+                return_value=timed_units,
+            ) as extract_timing,
+            patch.object(
+                tm.llm,
+                "generate_semantic_visual_span_specs",
+                return_value=[
+                    {
+                        "start_unit": 0,
+                        "end_unit_exclusive": 1,
+                        "visual_requirement": "Workers inspecting railway tracks",
+                    }
+                ],
+            ) as semantic_grouping,
             patch.object(tm, "build_narration_slots", side_effect=fake_narration),
             patch.object(tm, "build_visual_slots", side_effect=fake_visual),
+            patch.object(
+                tm,
+                "generate_visual_beat_search_queries",
+                side_effect=fake_beat_queries,
+            ),
             patch.object(
                 tm,
                 "generate_visual_slot_search_queries",
                 side_effect=fake_queries,
             ),
-            patch.object(tm, "persist_narration_timeline"),
+            patch.object(tm, "persist_narration_timeline") as persist_timeline,
             patch.object(tm.sm.state, "update_task"),
         ):
             result = tm.start("ordered-timeline", params, stop_at="terms")
 
         self.assertEqual(
             events,
-            ["audio", "subtitle", "narration_slots", "visual_slots", "slot_queries"],
+            [
+                "audio",
+                "subtitle",
+                "narration_slots",
+                "visual_slots",
+                "beat_queries",
+                "slot_queries",
+            ],
         )
         self.assertEqual(result["terms"], ["workers inspecting railway tracks"])
         legacy_terms.assert_not_called()
         self.assertTrue(subtitles.call_args.kwargs["force_timeline"])
+        extract_timing.assert_called_once()
+        semantic_grouping.assert_called_once()
+        persisted_units = persist_timeline.call_args.kwargs["timed_narration_units"]
+        self.assertIs(persisted_units[0], timed_units[0])
+        self.assertEqual(persisted_units[0].source_narration_slot_index, 1)
+        persisted_spans = persist_timeline.call_args.kwargs["semantic_visual_spans"]
+        self.assertEqual(persisted_spans[0].spoken_text, params.video_script)
+        self.assertEqual(persisted_spans[0].visual_requirement, "Workers inspecting railway tracks")
+        persisted_beats = persist_timeline.call_args.kwargs["visual_beats"]
+        self.assertEqual(len(persisted_beats), 1)
+        self.assertEqual((persisted_beats[0].start_time, persisted_beats[0].end_time), (0.0, 4.0))
+        self.assertEqual(
+            persisted_beats[0].visual_requirement,
+            "Workers inspecting railway tracks",
+        )
+        self.assertEqual(
+            persisted_beats[0].search_queries,
+            ["workers inspecting railway tracks"],
+        )
 
     def test_smart_material_failure_is_exposed_as_material_stage_error(self):
         params = VideoParams(
@@ -1174,15 +2817,19 @@ class TestTaskService(unittest.TestCase):
         ]
         visual_slots = [
             VisualSlot(
-                1,
-                0.0,
-                4.0,
-                4.0,
-                [1],
-                "Workers inspect railway tracks",
-                ["workers inspecting railway tracks"],
-                "edge_tts_boundary",
-                "boundary",
+                index=1,
+                start_time=0.0,
+                end_time=4.0,
+                duration=4.0,
+                narration_slot_indexes=[1],
+                narration_text="Workers inspect railway tracks",
+                primary_narration_slot_index=1,
+                primary_narration_text="Workers inspect railway tracks",
+                visual_requirement="Workers inspect railway tracks",
+                narration_overlaps=[NarrationOverlap(1, 0.0, 4.0, 4.0)],
+                search_queries=["workers inspecting railway tracks"],
+                timing_source="edge_tts_boundary",
+                timing_quality="boundary",
             )
         ]
         state = MemoryState()
@@ -1200,8 +2847,21 @@ class TestTaskService(unittest.TestCase):
             ),
             patch.object(tm, "generate_subtitle", return_value="subtitle.srt"),
             patch.object(tm.voice, "get_audio_duration", return_value=4.0),
+            # Without timed units the semantic stage skips grouping and builds the
+            # slot-led fallback, whose spoken requirements are then repaired by a
+            # second provider call. Both are pinned off so this test cannot depend
+            # on a provider being reachable, or bill one.
+            patch.object(tm.voice, "extract_timed_narration_units", return_value=[]),
+            patch.object(
+                tm.llm, "generate_narration_visual_requirements", return_value=None
+            ),
             patch.object(tm, "build_narration_slots", return_value=narration_slots),
             patch.object(tm, "build_visual_slots", return_value=visual_slots),
+            # A patched narration slot is enough for `build_visual_beats` to reach
+            # its fallback and produce a beat, and the beat timeline then asks the
+            # configured LLM provider for phrasings. Unpatched that is a real,
+            # billable request inside a unit test about a material-stage failure.
+            patch.object(tm, "generate_visual_beat_search_queries", return_value=[]),
             patch.object(
                 tm,
                 "generate_visual_slot_search_queries",
@@ -1224,6 +2884,855 @@ class TestTaskService(unittest.TestCase):
         self.assertEqual(failed_task["state"], tm.const.TASK_STATE_FAILED)
         self.assertEqual(failed_task["failed_stage"], "materials")
         self.assertEqual(failed_task["error"], "TwelveLabs quota is exhausted")
+
+    @staticmethod
+    def _railway_beat_timeline():
+        """One narration slot, one fixed visual slot and two variable beats."""
+        narration_slots = [
+            NarrationSlot(
+                1,
+                0.0,
+                5.6,
+                5.6,
+                "Workers inspect railway tracks",
+                "edge_tts_boundary",
+            )
+        ]
+        visual_slots = [
+            VisualSlot(
+                index=1,
+                start_time=0.0,
+                end_time=5.6,
+                duration=5.6,
+                narration_slot_indexes=[1],
+                narration_text="Workers inspect railway tracks",
+                primary_narration_slot_index=1,
+                primary_narration_text="Workers inspect railway tracks",
+                visual_requirement="Workers inspect railway tracks",
+                narration_overlaps=[NarrationOverlap(1, 0.0, 5.6, 5.6)],
+                search_queries=[],
+                timing_source="edge_tts_boundary",
+                timing_quality="boundary",
+            )
+        ]
+        visual_beats = [
+            VisualBeat(
+                index=index,
+                semantic_group_id=index,
+                shot_index=index,
+                start_time=(index - 1) * 2.8,
+                end_time=index * 2.8,
+                duration=2.8,
+                spoken_text="Workers inspect railway tracks",
+                visual_requirement=requirement,
+                source_semantic_span_index=index,
+                source_narration_slot_indexes=[1],
+                start_unit=index - 1,
+                end_unit_exclusive=index,
+                timing_source="edge_tts_boundary",
+                timing_quality="boundary",
+                duration_policy="semantic_original",
+                rapid_cut=False,
+                search_queries=[],
+            )
+            for index, requirement in enumerate(
+                (
+                    "Workers walk along the railway track",
+                    "A worker tightens a rail bolt",
+                ),
+                start=1,
+            )
+        ]
+        return narration_slots, visual_slots, visual_beats
+
+    @staticmethod
+    def _assign_beat_queries(visual_beats, queries_per_beat=1):
+        """Stand in for the LLM query stage, including the phrasings it was asked for.
+
+        The primary phrasing keeps its stable name so existing assertions on the
+        search terms still read the same; the alternates only exist so a caller
+        can prove the pipeline requested more than one.
+        """
+        variants = max(1, int(queries_per_beat))
+        for position, beat in enumerate(visual_beats, start=1):
+            beat.search_queries = [f"beat {position} query"] + [
+                f"beat {position} query variant {variant}"
+                for variant in range(2, variants + 1)
+            ]
+        return [beat.search_queries[0] for beat in visual_beats]
+
+    def _beat_pipeline_patchers(
+        self,
+        *,
+        video_script,
+        narration_slots,
+        visual_slots,
+        visual_beats,
+        beat_queries,
+        audio_duration=5.6,
+    ):
+        """Patch every stage that runs before material selection in a beat task.
+
+        Returned as a list instead of a nested ``with`` block: the beat pipeline
+        needs more patches than CPython allows statically nested blocks, so the
+        callers enter them through an ``ExitStack``.
+        """
+        return [
+            patch.object(
+                tm.twelvelabs, "visual_matching_requested", return_value=True
+            ),
+            # The script stage decomposes the visual-requirement checklist behind
+            # this credential-aware gate. Left unpatched it reads the developer's
+            # real config, and on a machine with TwelveLabs keys and clip QA on it
+            # calls the configured LLM provider for real — a billable network
+            # request inside a unit test. Tests that are about the checklist
+            # re-patch this after the shared patchers so their own value wins.
+            patch.object(
+                tm.twelvelabs, "is_smart_visual_matching_enabled", return_value=False
+            ),
+            patch.object(tm, "generate_script", return_value=video_script),
+            patch.object(tm, "save_script_data"),
+            patch.object(
+                tm,
+                "generate_audio",
+                return_value=("audio.mp3", audio_duration, object()),
+            ),
+            patch.object(tm, "generate_subtitle", return_value="subtitle.srt"),
+            patch.object(tm.voice, "get_audio_duration", return_value=audio_duration),
+            patch.object(tm.voice, "extract_timed_narration_units", return_value=[]),
+            patch.object(tm, "build_narration_slots", return_value=narration_slots),
+            patch.object(tm, "build_visual_slots", return_value=visual_slots),
+            patch.object(tm, "generate_semantic_visual_spans", return_value=[]),
+            patch.object(tm, "build_visual_beats", return_value=visual_beats),
+            patch.object(
+                tm, "generate_visual_beat_search_queries", **beat_queries
+            ),
+            patch.object(
+                tm, "generate_visual_slot_search_queries", return_value=["slot query"]
+            ),
+            patch.object(tm, "persist_narration_timeline"),
+            patch.object(
+                tm.upload_post.upload_post_service, "is_configured", return_value=False
+            ),
+            patch.object(tm.sm.state, "update_task"),
+        ]
+
+    def test_visual_beat_timeline_reaches_the_renderer_as_render_segments(self):
+        # pixabay also proves the smart path is no longer pexels-only.
+        params = VideoParams(
+            video_subject="Railway",
+            video_script="Workers inspect railway tracks.",
+            subtitle_enabled=False,
+            match_materials_to_script=True,
+            video_clip_duration=4,
+            video_source="pixabay",
+        )
+        narration_slots, visual_slots, visual_beats = self._railway_beat_timeline()
+        winners = ["D:/task/first.mp4", "D:/task/second.mp4"]
+        segments = [
+            RenderSegment(
+                index=1,
+                file_path=winners[0],
+                source_start=1.0,
+                source_end=3.8,
+                target_start=0.0,
+                target_end=2.8,
+                target_duration=2.8,
+                playback_speed=1.0,
+                visual_beat_index=1,
+                semantic_group_id=1,
+                provider="pixabay",
+            ),
+            RenderSegment(
+                index=2,
+                file_path=winners[1],
+                source_start=4.0,
+                source_end=6.8,
+                target_start=2.8,
+                target_end=5.6,
+                target_duration=2.8,
+                playback_speed=1.0,
+                visual_beat_index=2,
+                semantic_group_id=2,
+                provider="coverr",
+            ),
+        ]
+
+        with ExitStack() as stack:
+            for patcher in self._beat_pipeline_patchers(
+                video_script=params.video_script,
+                narration_slots=narration_slots,
+                visual_slots=visual_slots,
+                visual_beats=visual_beats,
+                beat_queries={"side_effect": self._assign_beat_queries},
+            ):
+                stack.enter_context(patcher)
+            stack.enter_context(
+                patch.object(
+                    tm.twelvelabs,
+                    "validate_smart_visual_matching_configuration",
+                    return_value="",
+                )
+            )
+            download = stack.enter_context(
+                patch.object(tm.material, "download_videos", return_value=winners)
+            )
+            load_segments = stack.enter_context(
+                patch.object(
+                    tm.material, "load_render_segments", return_value=segments
+                )
+            )
+            load_ranges = stack.enter_context(
+                patch.object(tm.material, "load_selected_source_ranges")
+            )
+            generate_final = stack.enter_context(
+                patch.object(
+                    tm,
+                    "generate_final_videos",
+                    return_value=(["final.mp4"], ["combined.mp4"], []),
+                )
+            )
+            result = tm.start("beat-render", params)
+
+        self.assertEqual(result["videos"], ["final.mp4"])
+        # Beats carry their own queries; pairing them with the slot queries would
+        # search for the wrong thing in every beat.
+        self.assertEqual(
+            download.call_args.kwargs["search_terms"],
+            ["beat 1 query", "beat 2 query"],
+        )
+        self.assertEqual(download.call_args.kwargs["visual_beats"], visual_beats)
+        self.assertIsNone(download.call_args.kwargs["visual_slots"])
+        self.assertTrue(download.call_args.kwargs["match_script_order"])
+        load_ranges.assert_not_called()
+        load_segments.assert_called_once()
+        self.assertEqual(load_segments.call_args.args[1], winners)
+        self.assertEqual(load_segments.call_args.args[2], visual_beats)
+        self.assertEqual(load_segments.call_args.kwargs["audio_duration"], 5.6)
+        self.assertEqual(generate_final.call_args.kwargs["render_segments"], segments)
+        self.assertIsNone(generate_final.call_args.kwargs["source_ranges"])
+
+    def test_beat_query_failure_keeps_the_fixed_slot_render_path(self):
+        params = VideoParams(
+            video_subject="Railway",
+            video_script="Workers inspect railway tracks.",
+            subtitle_enabled=False,
+            match_materials_to_script=True,
+            video_clip_duration=4,
+        )
+        narration_slots, visual_slots, visual_beats = self._railway_beat_timeline()
+        selected_ranges = [(1.0, 5.0)]
+
+        with ExitStack() as stack:
+            for patcher in self._beat_pipeline_patchers(
+                video_script=params.video_script,
+                narration_slots=narration_slots,
+                visual_slots=visual_slots,
+                visual_beats=visual_beats,
+                beat_queries={
+                    "side_effect": ValueError("beat 2 has no usable search query")
+                },
+            ):
+                stack.enter_context(patcher)
+            stack.enter_context(
+                patch.object(
+                    tm.twelvelabs,
+                    "validate_smart_visual_matching_configuration",
+                    return_value="",
+                )
+            )
+            download = stack.enter_context(
+                patch.object(
+                    tm.material, "download_videos", return_value=["D:/task/slot.mp4"]
+                )
+            )
+            load_segments = stack.enter_context(
+                patch.object(tm.material, "load_render_segments")
+            )
+            load_ranges = stack.enter_context(
+                patch.object(
+                    tm.material,
+                    "load_selected_source_ranges",
+                    return_value=selected_ranges,
+                )
+            )
+            generate_final = stack.enter_context(
+                patch.object(
+                    tm,
+                    "generate_final_videos",
+                    return_value=(["final.mp4"], ["combined.mp4"], []),
+                )
+            )
+            result = tm.start("beat-query-failure", params)
+
+        # Losing the per-beat queries degrades to the proven fixed-slot timeline
+        # instead of failing the task.
+        self.assertEqual(result["videos"], ["final.mp4"])
+        self.assertEqual(download.call_args.kwargs["search_terms"], ["slot query"])
+        self.assertIsNone(download.call_args.kwargs["visual_beats"])
+        self.assertEqual(download.call_args.kwargs["visual_slots"], visual_slots)
+        load_segments.assert_not_called()
+        load_ranges.assert_called_once()
+        self.assertEqual(
+            generate_final.call_args.kwargs["source_ranges"], selected_ranges
+        )
+        self.assertIsNone(generate_final.call_args.kwargs["render_segments"])
+
+    def test_spoken_visual_requirements_never_reach_the_paid_beat_stages(self):
+        params = VideoParams(
+            video_subject="Railway",
+            video_script="Workers inspect railway tracks.",
+            subtitle_enabled=False,
+            match_materials_to_script=True,
+            video_clip_duration=4,
+        )
+        narration_slots, visual_slots, visual_beats = self._railway_beat_timeline()
+        spoken_spans = [
+            SemanticVisualSpan(
+                index=1,
+                start_unit=None,
+                end_unit_exclusive=None,
+                spoken_text="Workers inspect railway tracks",
+                visual_requirement="Workers inspect railway tracks",
+                source_narration_slot_indexes=[1],
+                start_time=0.0,
+                end_time=5.6,
+                timing_source="edge_tts_boundary",
+                timing_quality="boundary",
+                grouping_source="narration_slot_fallback",
+            )
+        ]
+
+        with ExitStack() as stack:
+            for patcher in self._beat_pipeline_patchers(
+                video_script=params.video_script,
+                narration_slots=narration_slots,
+                visual_slots=visual_slots,
+                visual_beats=visual_beats,
+                beat_queries={"return_value": []},
+            ):
+                stack.enter_context(patcher)
+            spans = stack.enter_context(
+                patch.object(
+                    tm, "generate_semantic_visual_spans", return_value=spoken_spans
+                )
+            )
+            # Both credential gates are opened on purpose: the guard, not a
+            # missing key, has to be what keeps the paid stages out of this run.
+            stack.enter_context(
+                patch.object(
+                    tm.twelvelabs,
+                    "is_smart_visual_matching_enabled",
+                    return_value=True,
+                )
+            )
+            stack.enter_context(
+                patch.object(
+                    tm.twelvelabs,
+                    "validate_smart_visual_matching_configuration",
+                    return_value="",
+                )
+            )
+            beat_query_stage = stack.enter_context(
+                patch.object(
+                    tm, "generate_visual_beat_search_queries", return_value=[]
+                )
+            )
+            checklist = stack.enter_context(
+                patch.object(tm.llm, "generate_visual_requirement_specs")
+            )
+            persist = stack.enter_context(
+                patch.object(tm, "persist_narration_timeline")
+            )
+            download = stack.enter_context(
+                patch.object(
+                    tm.material, "download_videos", return_value=["D:/task/slot.mp4"]
+                )
+            )
+            load_segments = stack.enter_context(
+                patch.object(tm.material, "load_render_segments")
+            )
+            stack.enter_context(
+                patch.object(
+                    tm.material,
+                    "load_selected_source_ranges",
+                    return_value=[(1.0, 5.0)],
+                )
+            )
+            generate_final = stack.enter_context(
+                patch.object(
+                    tm,
+                    "generate_final_videos",
+                    return_value=(["final.mp4"], ["combined.mp4"], []),
+                )
+            )
+            result = tm.start("spoken-requirement-guard", params)
+
+        # The beat timeline was built and then dropped, so neither paid script
+        # stage is asked to do anything: no phrasings for sentences, no checklist
+        # decomposition of sentences.
+        spans.assert_called_once()
+        self.assertEqual(beat_query_stage.call_args.args[0], [])
+        checklist.assert_not_called()
+        self.assertEqual(persist.call_args.kwargs["visual_beats"], [])
+        self.assertIsNone(persist.call_args.kwargs["visual_requirement_specs"])
+        # The failed grouping stays legible in the persisted provenance instead
+        # of being erased along with the beats it produced.
+        self.assertEqual(
+            persist.call_args.kwargs["semantic_visual_spans"], spoken_spans
+        )
+        # And the run still renders, on the proven fixed-slot path.
+        self.assertEqual(result["videos"], ["final.mp4"])
+        self.assertEqual(download.call_args.kwargs["search_terms"], ["slot query"])
+        self.assertIsNone(download.call_args.kwargs["visual_beats"])
+        load_segments.assert_not_called()
+        self.assertIsNone(generate_final.call_args.kwargs["render_segments"])
+
+    def test_the_merged_beat_channel_reaches_material_selection(self):
+        """选择阶段重写后的时间线必须有一条回传通道，否则渲染仍绑定旧时间线。"""
+        params = VideoParams(
+            video_subject="Railway",
+            video_source="pexels",
+            match_materials_to_script=True,
+        )
+        _, _, visual_beats = self._railway_beat_timeline()
+        self._assign_beat_queries(visual_beats)
+        merged_beats_out: list[VisualBeat] = []
+
+        with patch.object(
+            tm.material, "download_videos", return_value=["D:/task/first.mp4"]
+        ) as download:
+            result = tm.get_video_materials(
+                "merge-channel",
+                params,
+                ["fallback term"],
+                5.6,
+                visual_beats=visual_beats,
+                merged_beats_out=merged_beats_out,
+            )
+
+        self.assertEqual(result, ["D:/task/first.mp4"])
+        # Selection appends to this list in place, so it has to be the caller's own
+        # object. A copy would carry every merge it recorded into a local that the
+        # orchestrator never reads, and the renderer would bind to the timeline the
+        # script stage planned instead of the one the downloads were made for.
+        self.assertIs(download.call_args.kwargs["merged_beats_out"], merged_beats_out)
+
+    def test_a_merged_timeline_is_what_the_renderer_and_the_artifact_receive(self):
+        # Merging is the last resort before a video fails, so its whole value
+        # depends on the shorter timeline actually being adopted: the material
+        # records were written against it, and the renderer pairs clips to beats
+        # by position.
+        params = VideoParams(
+            video_subject="Railway",
+            video_script="Workers inspect railway tracks.",
+            subtitle_enabled=False,
+            match_materials_to_script=True,
+            video_clip_duration=4,
+        )
+        narration_slots, visual_slots, visual_beats = self._railway_beat_timeline()
+        # Only shots of one semantic group may absorb each other, because that is
+        # what makes the neighbour's approved clip valid for the open window. The
+        # fixture has to agree with that rule or this scenario could not occur.
+        visual_beats = [
+            replace(
+                beat,
+                semantic_group_id=1,
+                shot_index=position,
+                visual_requirement="Workers walk along the railway track",
+            )
+            for position, beat in enumerate(visual_beats, start=1)
+        ]
+        planned = list(visual_beats)
+        # The second beat could not be filled, so the first one absorbed its window.
+        merged_beat = replace(
+            planned[0],
+            end_time=5.6,
+            duration=5.6,
+            end_unit_exclusive=2,
+            duration_policy="unfillable_beat_merged",
+        )
+
+        def _merge_while_downloading(**kwargs):
+            kwargs["merged_beats_out"].append(merged_beat)
+            return ["D:/task/first.mp4"]
+
+        with ExitStack() as stack:
+            for patcher in self._beat_pipeline_patchers(
+                video_script=params.video_script,
+                narration_slots=narration_slots,
+                visual_slots=visual_slots,
+                visual_beats=visual_beats,
+                beat_queries={"side_effect": self._assign_beat_queries},
+            ):
+                stack.enter_context(patcher)
+            stack.enter_context(
+                patch.object(
+                    tm.twelvelabs,
+                    "validate_smart_visual_matching_configuration",
+                    return_value="",
+                )
+            )
+            download = stack.enter_context(
+                patch.object(
+                    tm.material,
+                    "download_videos",
+                    side_effect=_merge_while_downloading,
+                )
+            )
+            load_segments = stack.enter_context(
+                patch.object(tm.material, "load_render_segments", return_value=[])
+            )
+            patch_script = stack.enter_context(
+                patch.object(tm.task_artifacts, "patch_script_data")
+            )
+            stack.enter_context(
+                patch.object(
+                    tm,
+                    "generate_final_videos",
+                    return_value=(["final.mp4"], ["combined.mp4"], []),
+                )
+            )
+            result = tm.start("beat-merge-adoption", params)
+
+        self.assertEqual(result["videos"], ["final.mp4"])
+        # Two beats were planned and one clip was downloaded; binding the renderer
+        # to the planned pair is exactly the length mismatch that would abort here.
+        self.assertEqual(len(planned), 2)
+        self.assertIs(
+            load_segments.call_args.args[2],
+            download.call_args.kwargs["merged_beats_out"],
+        )
+        self.assertEqual(load_segments.call_args.args[2], [merged_beat])
+        # The narration span is unchanged, so the renderer still fills the audio.
+        self.assertEqual(load_segments.call_args.kwargs["audio_duration"], 5.6)
+        # script.json is rewritten too: a beat list naming a shot the video does
+        # not contain would disagree with its own material records.
+        persisted = patch_script.call_args.kwargs["visual_beats"]
+        self.assertEqual(len(persisted), 1)
+        self.assertEqual(persisted[0]["end_time"], 5.6)
+        self.assertEqual(persisted[0]["duration_policy"], "unfillable_beat_merged")
+
+    def test_the_pipeline_requests_the_configured_number_of_beat_phrasings(self):
+        # The script stage is the only place a beat can get alternative phrasings,
+        # so if the pipeline asks for one, the per-provider retry in material
+        # selection has nothing to spend and the whole knob is dead weight.
+        params = VideoParams(
+            video_subject="Railway",
+            video_script="Workers inspect railway tracks.",
+            subtitle_enabled=False,
+            match_materials_to_script=True,
+            video_clip_duration=4,
+        )
+        narration_slots, visual_slots, visual_beats = self._railway_beat_timeline()
+
+        with ExitStack() as stack:
+            stack.enter_context(
+                patch.dict(tm.config.app, {"smart_material_max_query_variants": 4})
+            )
+            for patcher in self._beat_pipeline_patchers(
+                video_script=params.video_script,
+                narration_slots=narration_slots,
+                visual_slots=visual_slots,
+                visual_beats=visual_beats,
+                beat_queries={"side_effect": self._assign_beat_queries},
+            ):
+                stack.enter_context(patcher)
+            # Re-patched after the shared patchers so this mock is the one the
+            # pipeline reaches, and its call can be inspected here.
+            beat_queries = stack.enter_context(
+                patch.object(
+                    tm,
+                    "generate_visual_beat_search_queries",
+                    side_effect=self._assign_beat_queries,
+                )
+            )
+            stack.enter_context(
+                patch.object(
+                    tm.twelvelabs,
+                    "validate_smart_visual_matching_configuration",
+                    return_value="",
+                )
+            )
+            download = stack.enter_context(
+                patch.object(
+                    tm.material,
+                    "download_videos",
+                    return_value=["D:/task/first.mp4", "D:/task/second.mp4"],
+                )
+            )
+            stack.enter_context(
+                patch.object(tm.material, "load_render_segments", return_value=[])
+            )
+            stack.enter_context(
+                patch.object(tm.material, "load_selected_source_ranges")
+            )
+            stack.enter_context(
+                patch.object(
+                    tm,
+                    "generate_final_videos",
+                    return_value=(["final.mp4"], ["combined.mp4"], []),
+                )
+            )
+            result = tm.start("beat-query-variants", params)
+
+        self.assertEqual(result["videos"], ["final.mp4"])
+        self.assertEqual(beat_queries.call_args.kwargs["queries_per_beat"], 4)
+        # Only the planned phrasing is searched first; the alternates ride along on
+        # the beats for material selection to fall back to.
+        self.assertEqual(
+            download.call_args.kwargs["search_terms"],
+            ["beat 1 query", "beat 2 query"],
+        )
+        self.assertEqual(len(visual_beats[0].search_queries), 4)
+
+    def test_a_source_without_a_catalog_never_enters_the_smart_render_path(self):
+        params = VideoParams(
+            video_subject="Railway",
+            video_script="Workers inspect railway tracks.",
+            subtitle_enabled=False,
+            match_materials_to_script=True,
+            video_clip_duration=4,
+            video_source="loomloom",
+        )
+        narration_slots, visual_slots, visual_beats = self._railway_beat_timeline()
+        self.assertFalse(tm.material.supports_smart_visual_matching("loomloom"))
+
+        with ExitStack() as stack:
+            for patcher in self._beat_pipeline_patchers(
+                video_script=params.video_script,
+                narration_slots=narration_slots,
+                visual_slots=visual_slots,
+                visual_beats=visual_beats,
+                beat_queries={"side_effect": self._assign_beat_queries},
+            ):
+                stack.enter_context(patcher)
+            preflight = stack.enter_context(
+                patch.object(
+                    tm.twelvelabs, "validate_smart_visual_matching_configuration"
+                )
+            )
+            stack.enter_context(
+                patch.object(tm, "get_video_materials", return_value=["clip.mp4"])
+            )
+            load_segments = stack.enter_context(
+                patch.object(tm.material, "load_render_segments")
+            )
+            load_ranges = stack.enter_context(
+                patch.object(tm.material, "load_selected_source_ranges")
+            )
+            generate_final = stack.enter_context(
+                patch.object(
+                    tm,
+                    "generate_final_videos",
+                    return_value=(["final.mp4"], ["combined.mp4"], []),
+                )
+            )
+            result = tm.start("no-catalog-source", params)
+
+        self.assertEqual(result["videos"], ["final.mp4"])
+        # A source with no searchable catalog must not even reach the smart
+        # matching preflight, let alone the beat render contract.
+        preflight.assert_not_called()
+        load_segments.assert_not_called()
+        load_ranges.assert_not_called()
+        self.assertIsNone(generate_final.call_args.kwargs["render_segments"])
+        self.assertIsNone(generate_final.call_args.kwargs["source_ranges"])
+
+    def _run_beat_pipeline_for_checklist(self, *, smart_verification_enabled):
+        """Run a beat task and report what the checklist stage did.
+
+        Returns the recorded call order plus the decomposition, persistence and
+        download mocks, so each test can assert on the part it cares about.
+        """
+        params = VideoParams(
+            video_subject="Railway",
+            video_script="Workers inspect railway tracks.",
+            subtitle_enabled=False,
+            match_materials_to_script=True,
+            video_clip_duration=4,
+            video_source="pexels",
+        )
+        narration_slots, visual_slots, visual_beats = self._railway_beat_timeline()
+        checklist = {
+            tm.llm.normalize_visual_requirement(beat.visual_requirement): object()
+            for beat in visual_beats
+        }
+        order: list[str] = []
+
+        with ExitStack() as stack:
+            for patcher in self._beat_pipeline_patchers(
+                video_script=params.video_script,
+                narration_slots=narration_slots,
+                visual_slots=visual_slots,
+                visual_beats=visual_beats,
+                beat_queries={"side_effect": self._assign_beat_queries},
+            ):
+                stack.enter_context(patcher)
+            stack.enter_context(
+                patch.object(
+                    tm.twelvelabs,
+                    "validate_smart_visual_matching_configuration",
+                    return_value="",
+                )
+            )
+            stack.enter_context(
+                patch.object(
+                    tm.twelvelabs,
+                    "is_smart_visual_matching_enabled",
+                    return_value=smart_verification_enabled,
+                )
+            )
+            decompose = stack.enter_context(
+                patch.object(
+                    tm.llm,
+                    "generate_visual_requirement_specs",
+                    side_effect=lambda requirements: (
+                        order.append("decompose") or checklist
+                    ),
+                )
+            )
+            # Entered after the shared patchers so this mock, not theirs, is the
+            # one the pipeline calls and the one this test can inspect.
+            persist = stack.enter_context(
+                patch.object(
+                    tm,
+                    "persist_narration_timeline",
+                    side_effect=lambda **kwargs: order.append("persist"),
+                )
+            )
+            download = stack.enter_context(
+                patch.object(
+                    tm.material,
+                    "download_videos",
+                    side_effect=lambda **kwargs: (
+                        order.append("download") or ["D:/task/first.mp4"]
+                    ),
+                )
+            )
+            stack.enter_context(
+                patch.object(
+                    tm.material, "load_render_segments", return_value=[]
+                )
+            )
+            stack.enter_context(
+                patch.object(
+                    tm,
+                    "generate_final_videos",
+                    return_value=(["final.mp4"], ["combined.mp4"], []),
+                )
+            )
+            tm.start("beat-checklist", params)
+
+        return order, decompose, persist, download, visual_beats, checklist
+
+    def test_requirement_checklist_is_planned_and_persisted_before_any_download(self):
+        (
+            order,
+            decompose,
+            persist,
+            download,
+            visual_beats,
+            checklist,
+        ) = self._run_beat_pipeline_for_checklist(smart_verification_enabled=True)
+
+        # The point of moving the checklist into the script stage: it is decided
+        # and written to the manifest before a single stock request is paid for.
+        self.assertEqual(order, ["decompose", "persist", "download"])
+        self.assertEqual(
+            decompose.call_args.args[0],
+            [beat.visual_requirement for beat in visual_beats],
+        )
+        self.assertEqual(
+            persist.call_args.kwargs["visual_requirement_specs"], checklist
+        )
+        # Same object in both stages, so verification cannot gate on a second,
+        # differently decomposed checklist.
+        self.assertIs(download.call_args.kwargs["requirement_specs"], checklist)
+
+    def test_checklist_is_skipped_when_verification_cannot_run(self):
+        (
+            order,
+            decompose,
+            persist,
+            download,
+            _visual_beats,
+            _checklist,
+        ) = self._run_beat_pipeline_for_checklist(smart_verification_enabled=False)
+
+        # Without credentials no candidate can be verified, so paying an LLM
+        # provider to decompose the timeline would buy nothing.
+        decompose.assert_not_called()
+        self.assertEqual(order, ["persist", "download"])
+        self.assertIsNone(persist.call_args.kwargs["visual_requirement_specs"])
+        self.assertIsNone(download.call_args.kwargs["requirement_specs"])
+
+    def test_persisted_checklist_names_the_beats_it_could_not_decompose(self):
+        beats = [
+            VisualBeat(
+                index=index,
+                semantic_group_id=index,
+                shot_index=1,
+                start_time=float(index - 1),
+                end_time=float(index),
+                duration=1.0,
+                spoken_text="Slow change becomes sudden change.",
+                visual_requirement=requirement,
+                source_semantic_span_index=index,
+                source_narration_slot_indexes=[index],
+                start_unit=index - 1,
+                end_unit_exclusive=index,
+                timing_source="edge_tts_boundary",
+                timing_quality="boundary",
+                duration_policy="semantic_original",
+                rapid_cut=False,
+                search_queries=[f"query {index}"],
+            )
+            for index, requirement in enumerate(
+                ("A crack widens in dry soil", "A dam wall collapses"), start=1
+            )
+        ]
+        resolved = {
+            tm.llm.normalize_visual_requirement(
+                beats[0].visual_requirement
+            ): _requirement_spec(beats[0].visual_requirement)
+        }
+
+        with (
+            tempfile.TemporaryDirectory() as tmp_dir,
+            patch.object(tm.utils, "task_dir", return_value=tmp_dir),
+            patch.object(
+                tm.llm, "generate_visual_requirement_specs", return_value=resolved
+            ),
+        ):
+            tm.task_artifacts.write_script_data("checklist", {"script": "Slow change."})
+            checklist = tm.generate_visual_requirement_checklist(beats)
+            tm.persist_narration_timeline(
+                task_id="checklist",
+                narration_slots=[],
+                visual_slots=[],
+                video_terms=[],
+                visual_beats=beats,
+                visual_requirement_specs=checklist,
+            )
+            persisted = tm.task_artifacts.read_script_data("checklist")
+
+        # A requirement the provider could not decompose stays absent instead of
+        # being replaced by an invented spec, and the gap is named explicitly.
+        self.assertEqual(checklist, resolved)
+        self.assertEqual(
+            persisted["visual_requirement_specs_missing_beat_indexes"], [2]
+        )
+        self.assertEqual(len(persisted["visual_requirement_specs"]), 1)
+        record = persisted["visual_requirement_specs"][0]
+        self.assertEqual(
+            record["normalized_requirement"],
+            tm.llm.normalize_visual_requirement(beats[0].visual_requirement),
+        )
+        self.assertEqual(
+            record["spec"]["original_requirement"], beats[0].visual_requirement
+        )
+        self.assertNotIn("api_key", record["spec"])
 
     def test_start_returns_each_intermediate_result(self):
         """

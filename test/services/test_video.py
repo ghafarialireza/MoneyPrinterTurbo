@@ -18,7 +18,7 @@ from moviepy import (
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from app.config import config
-from app.models.schema import MaterialInfo
+from app.models.schema import MaterialInfo, RenderSegment
 from app.services import video as vd
 from app.utils import utils
 
@@ -1060,6 +1060,308 @@ class TestMaterialResolutionTolerance(unittest.TestCase):
 
     def test_rejects_genuinely_low_resolution_material(self):
         self.assertFalse(vd.is_material_resolution_acceptable(320, 240))
+
+
+class TestRenderSegmentTimeline(unittest.TestCase):
+    """The beat-driven renderer path must reproduce the approved timeline exactly."""
+
+    def _segment(
+        self,
+        index,
+        file_path,
+        source_start,
+        source_end,
+        target_start,
+        target_end,
+        playback_speed=1.0,
+    ):
+        return RenderSegment(
+            index=index,
+            file_path=file_path,
+            source_start=source_start,
+            source_end=source_end,
+            target_start=target_start,
+            target_end=target_end,
+            target_duration=target_end - target_start,
+            playback_speed=playback_speed,
+            visual_beat_index=index,
+            semantic_group_id=index,
+            provider="pexels",
+        )
+
+    def _render(
+        self,
+        segments,
+        *,
+        audio_duration,
+        clip_speed=1.0,
+        source_durations=None,
+        video_transition_mode=None,
+        fail_on_write=None,
+    ):
+        """Run combine_videos over fake clips and report what it actually cut."""
+        source_ranges = []
+        written_durations = []
+        transition_durations = []
+        source_durations = source_durations or {}
+
+        class _FakeAudioClip:
+            duration = audio_duration
+
+            def close(self):
+                pass
+
+        class _FakeVideoClip:
+            def __init__(self, duration, records_source_range=False):
+                self.duration = duration
+                self.size = (1080, 1920)
+                self.w = 1080
+                self.h = 1920
+                self.records_source_range = records_source_range
+
+            def subclipped(self, start_time, end_time):
+                if self.records_source_range:
+                    source_ranges.append((start_time, end_time))
+                return _FakeVideoClip(end_time - start_time)
+
+            def with_speed_scaled(self, factor=None, final_duration=None):
+                if final_duration is not None:
+                    return _FakeVideoClip(final_duration)
+                return _FakeVideoClip(self.duration / factor)
+
+            def close(self):
+                pass
+
+        def _open_fake_video_clip(video_path):
+            return _FakeVideoClip(
+                source_durations.get(video_path, 30.0),
+                records_source_range=True,
+            )
+
+        def _capture_written_clip(clip, clip_file, *_args, **_kwargs):
+            if fail_on_write is not None and len(written_durations) == fail_on_write:
+                raise RuntimeError("encoder exploded")
+            written_durations.append(clip.duration)
+
+        def _record_transition(clip, duration, *_args, **_kwargs):
+            transition_durations.append(duration)
+            return clip
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            combined_video_path = os.path.join(temp_dir, "combined.mp4")
+            with (
+                patch.object(vd, "AudioFileClip", return_value=_FakeAudioClip()),
+                patch.object(
+                    vd,
+                    "_open_video_clip_quietly",
+                    side_effect=_open_fake_video_clip,
+                ),
+                patch.object(
+                    vd,
+                    "_write_videofile_with_codec_fallback",
+                    side_effect=_capture_written_clip,
+                ),
+                patch.object(
+                    vd.video_effects,
+                    "fadein_transition",
+                    side_effect=_record_transition,
+                ),
+                patch.object(vd, "concat_video_clips_with_ffmpeg") as concat,
+                patch.object(vd, "delete_files"),
+            ):
+                vd.combine_videos(
+                    combined_video_path=combined_video_path,
+                    video_paths=[segment.file_path for segment in segments],
+                    audio_file="audio.mp3",
+                    video_concat_mode=vd.VideoConcatMode.sequential,
+                    video_transition_mode=video_transition_mode,
+                    max_clip_duration=3,
+                    clip_speed=clip_speed,
+                    render_segments=segments,
+                )
+
+        return types.SimpleNamespace(
+            source_ranges=source_ranges,
+            written_durations=written_durations,
+            transition_durations=transition_durations,
+            concat=concat,
+        )
+
+    def test_variable_beat_durations_survive_the_clip_duration_cap(self):
+        # max_clip_duration=3 must not touch a 7.4s beat: the beat length is
+        # decided by the narration, not by the fixed-slot setting.
+        segments = [
+            self._segment(1, "a.mp4", 4.0, 11.4, 0.0, 7.4),
+            self._segment(2, "b.mp4", 2.0, 4.6, 7.4, 10.0),
+        ]
+
+        result = self._render(segments, audio_duration=10.0)
+
+        self.assertEqual(result.source_ranges[0], (4.0, 11.4))
+        self.assertAlmostEqual(result.written_durations[0], 7.4, places=6)
+        self.assertEqual(len(result.written_durations), 2)
+
+    def test_target_boundaries_are_quantised_without_cumulative_drift(self):
+        # 0.333s beats are not representable in whole 30fps frames. Rounding each
+        # beat independently would drift; cumulative rounding must not.
+        boundaries = [round(i * 0.333, 3) for i in range(1, 10)]
+        segments = []
+        previous = 0.0
+        for index, boundary in enumerate(boundaries, start=1):
+            segments.append(
+                self._segment(index, f"clip-{index}.mp4", 1.0, 1.0 + 0.333,
+                              previous, boundary)
+            )
+            previous = boundary
+
+        result = self._render(segments, audio_duration=boundaries[-1])
+
+        for duration in result.written_durations:
+            self.assertAlmostEqual(duration * vd.fps, round(duration * vd.fps), places=6)
+        rendered_total = sum(result.written_durations)
+        # The last beat absorbs the tail safety margin, so compare against it.
+        expected = vd._get_required_video_duration(boundaries[-1])
+        self.assertLess(abs(rendered_total - expected), 1.0 / vd.fps)
+
+    def test_playback_speed_scales_the_source_window_not_the_target(self):
+        segments = [self._segment(1, "a.mp4", 3.0, 9.0, 0.0, 3.0, playback_speed=2.0)]
+
+        result = self._render(segments, audio_duration=3.0, clip_speed=2.0)
+
+        self.assertEqual(result.source_ranges[0][0], 3.0)
+        # 3.1s of output at 2x needs 6.2s of source, taken from the same start.
+        self.assertAlmostEqual(result.source_ranges[0][1], 9.2, places=3)
+        self.assertAlmostEqual(result.written_durations[0], 3.1, places=6)
+
+    def test_final_segment_carries_the_tail_safety_margin(self):
+        segments = [
+            self._segment(1, "a.mp4", 0.0, 5.0, 0.0, 5.0),
+            self._segment(2, "b.mp4", 0.0, 5.0, 5.0, 10.0),
+        ]
+
+        result = self._render(segments, audio_duration=10.0)
+
+        self.assertAlmostEqual(result.written_durations[0], 5.0, places=6)
+        self.assertGreater(result.written_durations[1], 5.0)
+        self.assertAlmostEqual(
+            sum(result.written_durations),
+            vd._get_required_video_duration(10.0),
+            places=6,
+        )
+        self.assertEqual(result.concat.call_args.kwargs["max_duration"], 10.0)
+
+    def test_short_source_file_shifts_the_window_back_instead_of_shortening(self):
+        segments = [self._segment(1, "a.mp4", 8.0, 12.0, 0.0, 4.0)]
+
+        result = self._render(
+            segments,
+            audio_duration=4.0,
+            source_durations={"a.mp4": 11.5},
+        )
+
+        start, end = result.source_ranges[0]
+        self.assertAlmostEqual(end, 11.5, places=6)
+        self.assertAlmostEqual(end - start, 4.1, places=6)
+
+    def test_transition_duration_scales_with_short_beats(self):
+        segments = [
+            self._segment(1, "a.mp4", 0.0, 1.2, 0.0, 1.2),
+            self._segment(2, "b.mp4", 0.0, 8.8, 1.2, 10.0),
+        ]
+
+        result = self._render(
+            segments,
+            audio_duration=10.0,
+            video_transition_mode=vd.VideoTransitionMode.fade_in,
+        )
+
+        self.assertAlmostEqual(result.transition_durations[0], 0.3, places=6)
+        self.assertEqual(result.transition_durations[1], 1.0)
+
+    def test_a_failed_beat_fails_the_render_instead_of_desyncing_it(self):
+        segments = [
+            self._segment(1, "a.mp4", 0.0, 5.0, 0.0, 5.0),
+            self._segment(2, "b.mp4", 0.0, 5.0, 5.0, 10.0),
+        ]
+
+        with self.assertRaisesRegex(RuntimeError, "visual beat 2"):
+            self._render(segments, audio_duration=10.0, fail_on_write=1)
+
+    def test_render_segments_and_source_ranges_cannot_both_drive_the_timeline(self):
+        segments = [self._segment(1, "a.mp4", 0.0, 4.0, 0.0, 4.0)]
+
+        class _FakeAudioClip:
+            duration = 4.0
+
+            def close(self):
+                pass
+
+        with patch.object(vd, "AudioFileClip", return_value=_FakeAudioClip()):
+            with self.assertRaisesRegex(ValueError, "cannot both drive"):
+                vd.combine_videos(
+                    combined_video_path="/tmp/unused.mp4",
+                    video_paths=["a.mp4"],
+                    audio_file="audio.mp3",
+                    source_ranges=[(0.0, 4.0)],
+                    render_segments=segments,
+                )
+
+    def test_render_segments_must_match_the_downloaded_winner_order(self):
+        segments = [
+            self._segment(1, "a.mp4", 0.0, 4.0, 0.0, 4.0),
+            self._segment(2, "b.mp4", 0.0, 4.0, 4.0, 8.0),
+        ]
+
+        class _FakeAudioClip:
+            duration = 8.0
+
+            def close(self):
+                pass
+
+        with patch.object(vd, "AudioFileClip", return_value=_FakeAudioClip()):
+            with self.assertRaisesRegex(ValueError, "must match the downloaded winner"):
+                vd.combine_videos(
+                    combined_video_path="/tmp/unused.mp4",
+                    video_paths=["b.mp4", "a.mp4"],
+                    audio_file="audio.mp3",
+                    render_segments=segments,
+                )
+
+    def test_gapped_timeline_is_rejected(self):
+        segments = [
+            self._segment(1, "a.mp4", 0.0, 4.0, 0.0, 4.0),
+            self._segment(2, "b.mp4", 0.0, 4.0, 4.5, 8.5),
+        ]
+
+        class _FakeVideoClip:
+            duration = 30.0
+            size = (1080, 1920)
+
+            def close(self):
+                pass
+
+        with patch.object(
+            vd, "_open_video_clip_quietly", return_value=_FakeVideoClip()
+        ):
+            with self.assertRaisesRegex(ValueError, "does not continue the timeline"):
+                vd._build_render_segment_items(
+                    segments, audio_duration=8.5, clip_speed=1.0
+                )
+
+    def test_timeline_shorter_than_the_audio_is_rejected(self):
+        segments = [self._segment(1, "a.mp4", 0.0, 4.0, 0.0, 4.0)]
+
+        with self.assertRaisesRegex(ValueError, "does not cover the narration audio"):
+            vd._build_render_segment_items(
+                segments, audio_duration=9.0, clip_speed=1.0
+            )
+
+    def test_transition_duration_helper_stays_a_no_op_for_long_clips(self):
+        self.assertEqual(vd._transition_duration_for_clip(None), 1.0)
+        self.assertEqual(vd._transition_duration_for_clip(4.0), 1.0)
+        self.assertEqual(vd._transition_duration_for_clip(12.0), 1.0)
+        self.assertAlmostEqual(vd._transition_duration_for_clip(2.0), 0.5)
+        self.assertAlmostEqual(vd._transition_duration_for_clip(0.2), 0.1)
 
 
 if __name__ == "__main__":

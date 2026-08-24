@@ -1,4 +1,5 @@
 import warnings
+from dataclasses import field
 from enum import Enum
 from typing import Any, List, Literal, Optional, Union
 
@@ -63,6 +64,19 @@ class MaterialInfo:
     # 本地上传素材不需要填写；写入任务文件前仍会按字段白名单重新构造，
     # 避免外部请求传入的签名 URL、凭据或无关字段进入持久化数据。
     source_info: Optional[dict[str, Any]] = None
+    # Provider-neutral stock identity and lightweight rendition metadata. These
+    # fields intentionally follow the legacy fields so positional construction
+    # of MaterialInfo remains backward compatible. ``source_info.asset_id`` and
+    # the other legacy keys remain readable during the migration.
+    provider_asset_id: Optional[str] = None
+    preview_url: Optional[str] = None
+    width: Optional[int] = None
+    height: Optional[int] = None
+    orientation: Optional[str] = None
+    rendition_id: Optional[str] = None
+    search_query: Optional[str] = None
+    query_attempt: Optional[int] = None
+    source_page_url: Optional[str] = None
 
 
 NarrationTimingSource = Literal[
@@ -89,6 +103,207 @@ class NarrationSlot:
 
 
 @pydantic.dataclasses.dataclass(config=_Config)
+class TimedNarrationUnit:
+    """One provider timing unit aligned to an exact span of narration text."""
+
+    index: int
+    text: str
+    start_time: float
+    end_time: float
+    duration: float
+    timing_source: NarrationTimingSource
+    timing_quality: NarrationTimingQuality
+    source_narration_slot_index: Optional[int] = None
+    source_boundary_type: Optional[str] = None
+    script_start_char: Optional[int] = None
+    script_end_char: Optional[int] = None
+
+
+SemanticGroupingSource = Literal[
+    "llm",
+    # Semantic grouping failed, so the timeline is one span per narration line,
+    # but a second call replaced each spoken line with a camera-visible
+    # requirement and lines with no visible content of their own were absorbed
+    # by a filmable neighbour. The requirement is describable footage.
+    "narration_slot_repaired",
+    # Both calls failed. The requirement is the spoken narration itself, which
+    # is not a description of footage and must not be searched or verified as if
+    # it were.
+    "narration_slot_fallback",
+]
+VisualBeatDurationPolicy = Literal[
+    "semantic_original",
+    "long_span_split",
+    "short_semantic_preserved",
+    # A sibling shot of the same semantic group could not be filled by any
+    # provider, phrasing, or rewritten requirement, so this beat absorbed its
+    # window. The narration timeline is unchanged; only the cut is gone.
+    "unfillable_beat_merged",
+]
+
+# A beat shorter than this reads as punctuation rather than as a scene of its own.
+# It lives next to the field it fills so the timeline builder and the merge that
+# later rewrites that timeline cannot drift apart on what "rapid" means.
+VISUAL_BEAT_RAPID_CUT_SECONDS = 1.5
+
+CriticalVisualFactBasis = Literal["explicit", "logically_necessary"]
+CriticalFactStatus = Literal[
+    "OBSERVED",
+    "NOT_OBSERVED",
+    "CONTRADICTED",
+    "UNCERTAIN",
+]
+ObservedActionDirectness = Literal[
+    "DIRECTLY_OBSERVED",
+    "PARTIALLY_OBSERVED",
+    "INFERRED",
+]
+SemanticDecision = Literal["ACCEPT", "REJECT", "UNCERTAIN"]
+CriticalGateDecision = Literal["PASS", "REJECT", "UNCERTAIN"]
+
+
+@pydantic.dataclasses.dataclass(config=_Config)
+class CriticalVisualFact:
+    """One source-grounded fact whose visual evidence can be checked directly."""
+
+    id: str
+    fact: str
+    mandatory: bool
+    direct_evidence_needed: bool
+    evidence_description: str
+    basis_type: CriticalVisualFactBasis
+    basis_quote: str
+
+
+@pydantic.dataclasses.dataclass(config=_Config)
+class VisualRequirementSpec:
+    """A provider-neutral decomposition of one immutable visual requirement."""
+
+    schema_version: str
+    generator_provider: str
+    generator_model: str
+    original_requirement: str
+    subjects: List[str]
+    primary_action: Optional[str]
+    objects: List[str]
+    required_relations: List[str]
+    required_context: List[str]
+    required_visible_state: List[str]
+    optional_attributes: List[str]
+    critical_visual_facts: List[CriticalVisualFact]
+    ambiguity_notes: List[str]
+
+
+@pydantic.dataclasses.dataclass(config=_Config)
+class ObservedAction:
+    actor: str
+    action: str
+    object: str
+    source_or_target: str
+    directness: ObservedActionDirectness
+    evidence: str
+
+
+@pydantic.dataclasses.dataclass(config=_Config)
+class CriticalFactEvidence:
+    fact_id: str
+    status: CriticalFactStatus
+    evidence: str
+
+
+@pydantic.dataclasses.dataclass(config=_Config)
+class ObservedVisualFacts:
+    """Evidence-first video observations returned by the video model."""
+
+    video_summary: str
+    observed_subjects: List[str]
+    observed_actions: List[ObservedAction]
+    observed_objects: List[str]
+    observed_relations: List[str]
+    observed_context: List[str]
+    visible_state: List[str]
+    critical_fact_evidence: List[CriticalFactEvidence]
+    missing_required_facts: List[str]
+    contradictory_facts: List[str]
+    uncertainty: List[str]
+    inference_warnings: List[str]
+
+
+@pydantic.dataclasses.dataclass(config=_Config)
+class MandatoryFactResult:
+    fact_id: str
+    status: CriticalFactStatus
+
+
+@pydantic.dataclasses.dataclass(config=_Config)
+class CriticalGateResult:
+    decision: CriticalGateDecision
+    mandatory_fact_results: List[MandatoryFactResult]
+    missing_fact_ids: List[str]
+    contradictory_fact_ids: List[str]
+    uncertain_fact_ids: List[str]
+
+
+@pydantic.dataclasses.dataclass(config=_Config)
+class SemanticAdjudication:
+    """A text-only decision over an immutable requirement and observation set."""
+
+    candidate_id: str
+    decision: SemanticDecision
+    mandatory_fact_results: List[MandatoryFactResult]
+    missing_or_contradictory_facts: List[str]
+    reason: str
+
+
+@pydantic.dataclasses.dataclass(config=_Config)
+class SemanticVisualSpan:
+    """A validated visible concept covering an ordered narration-unit range."""
+
+    index: int
+    start_unit: Optional[int]
+    end_unit_exclusive: Optional[int]
+    spoken_text: str
+    visual_requirement: str
+    source_narration_slot_indexes: List[int]
+    start_time: float
+    end_time: float
+    timing_source: NarrationTimingSource
+    timing_quality: NarrationTimingQuality
+    grouping_source: SemanticGroupingSource
+
+
+@pydantic.dataclasses.dataclass(config=_Config)
+class VisualBeat:
+    """One actual shot interval derived from an approved semantic concept."""
+
+    index: int
+    semantic_group_id: int
+    shot_index: int
+    start_time: float
+    end_time: float
+    duration: float
+    spoken_text: str
+    visual_requirement: str
+    source_semantic_span_index: Optional[int]
+    source_narration_slot_indexes: List[int]
+    start_unit: Optional[int]
+    end_unit_exclusive: Optional[int]
+    timing_source: NarrationTimingSource
+    timing_quality: NarrationTimingQuality
+    duration_policy: VisualBeatDurationPolicy
+    rapid_cut: bool
+    search_queries: List[str] = field(default_factory=list)
+
+
+@pydantic.dataclasses.dataclass(config=_Config)
+class NarrationOverlap:
+    narration_slot_index: int
+    overlap_start_time: float
+    overlap_end_time: float
+    overlap_duration: float
+
+
+@pydantic.dataclasses.dataclass(config=_Config)
 class VisualSlot:
     index: int
     start_time: float
@@ -96,9 +311,41 @@ class VisualSlot:
     duration: float
     narration_slot_indexes: List[int]
     narration_text: str
+    primary_narration_slot_index: int
+    primary_narration_text: str
+    visual_requirement: str
+    narration_overlaps: List[NarrationOverlap]
     search_queries: List[str]
     timing_source: NarrationTimingSource
     timing_quality: NarrationTimingQuality
+
+
+@pydantic.dataclasses.dataclass(config=_Config)
+class RenderSegment:
+    """One rendered timeline interval bound to an exact source window.
+
+    A render segment is the renderer-facing contract of the smart path: the
+    target interval comes from an approved :class:`VisualBeat`, the source
+    window comes from the winner that was actually selected and downloaded for
+    that beat.  Both sides are carried together so the renderer never has to
+    re-derive timing from a fixed clip duration.
+    """
+
+    index: int
+    file_path: str
+    source_start: float
+    source_end: float
+    target_start: float
+    target_end: float
+    target_duration: float
+    playback_speed: float
+    visual_beat_index: int
+    semantic_group_id: int
+    provider: str = ""
+
+    @property
+    def source_duration(self) -> float:
+        return self.source_end - self.source_start
 
 
 class VideoParams(BaseModel):

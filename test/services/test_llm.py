@@ -31,6 +31,14 @@ RUN_INTEGRATION_TESTS = os.environ.get("MPT_RUN_INTEGRATION_TESTS", "").lower() 
 
 
 class TestScriptPromptOptions(unittest.TestCase):
+    def test_normalize_text_response_preserves_internal_newlines(self):
+        result = llm._normalize_text_response(
+            "\n  First line\nSecond line\n\nThird paragraph  \n",
+            "openai",
+        )
+
+        self.assertEqual(result, "First line\nSecond line\n\nThird paragraph")
+
     def test_normalize_text_response_removes_think_blocks(self):
         """
         reasoning 模型可能返回 `<think>...</think>`。脚本生成链路必须只保留
@@ -217,13 +225,13 @@ class TestScriptPromptOptions(unittest.TestCase):
                 "slot_index": 1,
                 "start_time": 0.0,
                 "end_time": 4.0,
-                "narration_text": "Workers inspect the railway tracks.",
+                "visual_requirement": "Workers inspect the railway tracks.",
             },
             {
                 "slot_index": 5,
                 "start_time": 16.0,
                 "end_time": 20.0,
-                "narration_text": "Workers remove damaged wooden sleepers.",
+                "visual_requirement": "Workers remove damaged wooden sleepers.",
             },
         ]
 
@@ -254,7 +262,10 @@ class TestScriptPromptOptions(unittest.TestCase):
         self.assertIn(
             "Workers remove damaged wooden sleepers.", captured["prompt"]
         )
-        self.assertIn("Derive each query only from that slot's narration_text", captured["prompt"])
+        self.assertIn(
+            "Derive each query only from that slot's visual_requirement",
+            captured["prompt"],
+        )
 
     def test_generate_visual_slot_queries_supports_future_multiple_queries(self):
         response = (
@@ -269,13 +280,196 @@ class TestScriptPromptOptions(unittest.TestCase):
                         "slot_index": 1,
                         "start_time": 0.0,
                         "end_time": 4.0,
-                        "narration_text": "Workers spread ballast under the rails.",
+                        "visual_requirement": "Workers spread ballast under the rails.",
                     }
                 ],
                 queries_per_slot=2,
             )
 
         self.assertEqual(len(result[1]), 2)
+
+    def test_fewer_phrasings_than_requested_are_kept_instead_of_rejected(self):
+        # Alternative phrasings are fallbacks material selection tries in order.
+        # Rejecting the slot because two arrived instead of three would throw away
+        # the phrasing that works and drop the whole beat timeline.
+        captured = {}
+
+        def fake_generate_response(prompt, app_config=None):
+            captured["prompt"] = prompt
+            return (
+                '[{"slot_index": 1, "queries": '
+                '["worker digging hole", "Worker Digging Hole", "shovel in soil"]},'
+                ' {"slot_index": 2, "queries": ["rain flooding field"]}]'
+            )
+
+        with patch.object(
+            llm, "_generate_response", side_effect=fake_generate_response
+        ):
+            result = llm.generate_visual_slot_queries(
+                video_subject="slow change in nature",
+                visual_slots=[
+                    {
+                        "slot_index": 1,
+                        "start_time": 0.0,
+                        "end_time": 4.0,
+                        "visual_requirement": "A worker digs a hole.",
+                    },
+                    {
+                        "slot_index": 2,
+                        "start_time": 4.0,
+                        "end_time": 8.0,
+                        "visual_requirement": "Rain floods a dry field.",
+                    },
+                ],
+                queries_per_slot=3,
+            )
+
+        # A case-only repeat buys a second search and no new candidates.
+        self.assertEqual(result[1], ["worker digging hole", "shovel in soil"])
+        self.assertEqual(result[2], ["rain flooding field"])
+        self.assertIn("Order each slot's queries as fallbacks", captured["prompt"])
+
+    def test_extra_phrasings_beyond_the_request_are_truncated(self):
+        response = (
+            '[{"slot_index": 1, "queries": '
+            '["worker digging hole", "shovel in soil", "hands in wet earth"]}]'
+        )
+        with patch.object(llm, "_generate_response", return_value=response):
+            result = llm.generate_visual_slot_queries(
+                video_subject="slow change in nature",
+                visual_slots=[
+                    {
+                        "slot_index": 1,
+                        "start_time": 0.0,
+                        "end_time": 4.0,
+                        "visual_requirement": "A worker digs a hole.",
+                    }
+                ],
+                queries_per_slot=2,
+            )
+
+        self.assertEqual(result[1], ["worker digging hole", "shovel in soil"])
+
+    def test_a_slot_with_no_usable_query_is_still_rejected(self):
+        response = '[{"slot_index": 1, "queries": ["   "]}]'
+        with patch.object(llm, "_generate_response", return_value=response):
+            result = llm.generate_visual_slot_queries(
+                video_subject="slow change in nature",
+                visual_slots=[
+                    {
+                        "slot_index": 1,
+                        "start_time": 0.0,
+                        "end_time": 4.0,
+                        "visual_requirement": "A worker digs a hole.",
+                    }
+                ],
+                queries_per_slot=2,
+            )
+
+        self.assertEqual(result, {})
+
+    def test_a_single_query_request_does_not_ask_for_ordered_fallbacks(self):
+        captured = {}
+
+        def fake_generate_response(prompt, app_config=None):
+            captured["prompt"] = prompt
+            return '[{"slot_index": 1, "queries": ["worker digging hole"]}]'
+
+        with patch.object(
+            llm, "_generate_response", side_effect=fake_generate_response
+        ):
+            llm.generate_visual_slot_queries(
+                video_subject="slow change in nature",
+                visual_slots=[
+                    {
+                        "slot_index": 1,
+                        "start_time": 0.0,
+                        "end_time": 4.0,
+                        "visual_requirement": "A worker digs a hole.",
+                    }
+                ],
+                queries_per_slot=1,
+            )
+
+        self.assertNotIn("fallbacks", captured["prompt"])
+
+    def test_semantic_grouping_uses_selected_provider_path_and_stable_unit_ids(self):
+        captured = {}
+        app_config = {
+            "llm_provider": "openai",
+            "openai_api_key": "test-only-key",
+            "openai_model_name": "test-model",
+        }
+
+        def fake_generate_response(prompt, app_config=None):
+            captured["prompt"] = prompt
+            captured["app_config"] = app_config
+            return (
+                '[{"start_unit":0,"end_unit_exclusive":2,'
+                '"visual_requirement":"Worker removing boards"}]'
+            )
+
+        with patch.object(
+            llm,
+            "_generate_response",
+            side_effect=fake_generate_response,
+        ) as generate:
+            result = llm.generate_semantic_visual_span_specs(
+                narration_text="Worker removes boards.",
+                timed_units=[
+                    {"text": "Worker", "source_narration_slot_index": 1},
+                    {"text": "removes boards", "source_narration_slot_index": 1},
+                ],
+                app_config=app_config,
+            )
+
+        self.assertEqual(result[0]["start_unit"], 0)
+        self.assertEqual(result[0]["end_unit_exclusive"], 2)
+        self.assertEqual(generate.call_count, 1)
+        self.assertIs(captured["app_config"], app_config)
+        self.assertIn('0|1|"Worker"', captured["prompt"])
+        self.assertIn('1|1|"removes boards"', captured["prompt"])
+        self.assertIn("SMALLEST number of spans", captured["prompt"])
+        self.assertIn("Do not return timestamps", captured["prompt"])
+
+    def test_semantic_grouping_malformed_json_fails_after_bounded_retry(self):
+        """畸形 JSON 必须在有限次重试后失败，绝不能返回猜测出的分组。"""
+        with patch.object(
+            llm,
+            "_generate_response",
+            return_value="not json",
+        ) as generate:
+            result = llm.generate_semantic_visual_span_specs(
+                narration_text="Worker removes boards.",
+                timed_units=[{"text": "Worker removes boards"}],
+            )
+
+        self.assertIsNone(result)
+        self.assertEqual(generate.call_count, llm._MAX_STRUCTURED_RESPONSE_ATTEMPTS)
+
+    def test_semantic_grouping_recovers_a_chatty_array_reply(self):
+        """语义分组的根是数组；被散文包裹时必须整体恢复，而不是只取第一个对象。"""
+        payload = (
+            '[{"start_unit":0,"end_unit_exclusive":1,"visual_requirement":"Worker"},'
+            '{"start_unit":1,"end_unit_exclusive":2,"visual_requirement":"Boards"}]'
+        )
+
+        with patch.object(
+            llm,
+            "_generate_response",
+            return_value=f"Here are the spans:\n```json\n{payload}\n```\nDone.",
+        ) as generate:
+            result = llm.generate_semantic_visual_span_specs(
+                narration_text="Worker removes boards.",
+                timed_units=[
+                    {"text": "Worker", "source_narration_slot_index": 1},
+                    {"text": "removes boards", "source_narration_slot_index": 1},
+                ],
+            )
+
+        self.assertEqual(generate.call_count, 1)
+        self.assertEqual(len(result), 2)
+        self.assertEqual(result[1]["visual_requirement"], "Boards")
 
     def test_generate_terms_returns_empty_list_on_provider_error(self):
         """
@@ -672,7 +866,7 @@ class TestLiteLLMProvider(unittest.TestCase):
                 "messages": [{"role": "user", "content": "Say hello"}],
             },
         )
-        self.assertEqual(result, "hellopollinations")
+        self.assertEqual(result, "hello\npollinations")
 
     def test_gemini_uses_google_genai_client(self):
         """Gemini 适配器应通过新版 SDK 的统一 Client 发起内容生成请求。"""
@@ -705,14 +899,16 @@ class TestLiteLLMProvider(unittest.TestCase):
         with patch("google.genai.Client", FakeClient):
             result = llm._generate_response("Say hello")
 
-        self.assertEqual(result, "hellogemini")
+        self.assertEqual(result, "hello\ngemini")
         self.assertEqual(
             captured["client_kwargs"],
             {"api_key": "gemini-test-key", "http_options": None},
         )
         self.assertEqual(captured["model"], "gemini-test-model")
         self.assertEqual(captured["contents"], "Say hello")
-        self.assertEqual(captured["config"].max_output_tokens, 2048)
+        self.assertEqual(
+            captured["config"].max_output_tokens, llm._DEFAULT_MAX_OUTPUT_TOKENS
+        )
         self.assertTrue(captured["closed"])
 
     def test_cloudflare_requires_account_id_before_request(self):
@@ -782,7 +978,7 @@ class TestLiteLLMProvider(unittest.TestCase):
                 "messages": [{"role": "user", "content": "Say hello"}],
             },
         )
-        self.assertEqual(result, "gatewayresponse")
+        self.assertEqual(result, "gateway\nresponse")
 
     def _use_litellm_provider(self, model_name="openai/gpt-4o-mini"):
         config.app["llm_provider"] = "litellm"
@@ -815,7 +1011,7 @@ class TestLiteLLMProvider(unittest.TestCase):
         with patch.dict(sys.modules, {"litellm": fake_litellm}):
             result = llm._generate_response("Say hello")
 
-        self.assertEqual(result, "helloworld")
+        self.assertEqual(result, "hello\nworld")
 
     def test_litellm_provider_uses_registry_default_model(self):
         self._use_litellm_provider(model_name="")
@@ -978,7 +1174,7 @@ class TestLiteLLMProvider(unittest.TestCase):
         with self._patch_dashscope_generation(response):
             result = llm._generate_response("Say hello")
 
-        self.assertEqual(result, "你好世界")
+        self.assertEqual(result, "你好\n世界")
 
     def test_qwen_provider_falls_back_to_output_text(self):
         """保留旧 DashScope completion 响应结构的兼容路径。"""
@@ -988,7 +1184,7 @@ class TestLiteLLMProvider(unittest.TestCase):
         with self._patch_dashscope_generation(response):
             result = llm._generate_response("Say hello")
 
-        self.assertEqual(result, "旧格式响应")
+        self.assertEqual(result, "旧格式\n响应")
 
     def test_qwen_provider_reports_empty_text(self):
         """Qwen 空响应应返回可诊断错误，而不是底层 AttributeError。"""
@@ -1056,7 +1252,7 @@ class TestLiteLLMProvider(unittest.TestCase):
                 "messages": [{"role": "user", "content": "Say hello"}],
             },
         )
-        self.assertEqual(result, "helloaihubmix")
+        self.assertEqual(result, "hello\naihubmix")
 
     def test_aimlapi_provider_uses_openai_compatible_client(self):
         config.app["llm_provider"] = "aimlapi"
@@ -1093,7 +1289,7 @@ class TestLiteLLMProvider(unittest.TestCase):
                 "messages": [{"role": "user", "content": "Say hello"}],
             },
         )
-        self.assertEqual(result, "helloaimlapi")
+        self.assertEqual(result, "hello\naimlapi")
 
     def test_evolink_provider_uses_openai_compatible_client(self):
         """
@@ -1135,7 +1331,7 @@ class TestLiteLLMProvider(unittest.TestCase):
                 "messages": [{"role": "user", "content": "Say hello"}],
             },
         )
-        self.assertEqual(result, "helloevolink")
+        self.assertEqual(result, "hello\nevolink")
 
     def test_volcengine_provider_uses_openai_compatible_client(self):
         """
@@ -1177,7 +1373,7 @@ class TestLiteLLMProvider(unittest.TestCase):
                 "messages": [{"role": "user", "content": "Say hello"}],
             },
         )
-        self.assertEqual(result, "hellovolcengine")
+        self.assertEqual(result, "hello\nvolcengine")
 
     def test_grok_provider_still_uses_existing_path(self):
         config.app["llm_provider"] = "grok"
@@ -1232,7 +1428,7 @@ class TestLiteLLMProvider(unittest.TestCase):
             api_key="groq-test-key",
             base_url="https://api.groq.com/openai/v1",
         )
-        self.assertEqual(result, "hellogroq")
+        self.assertEqual(result, "hello\ngroq")
 
     def _use_ollama_provider(self, base_url=""):
         config.app["llm_provider"] = "ollama"
@@ -1270,7 +1466,7 @@ class TestLiteLLMProvider(unittest.TestCase):
                 "messages": [{"role": "user", "content": "Say hello"}],
             },
         )
-        self.assertEqual(result, "helloollama")
+        self.assertEqual(result, "hello\nollama")
 
     def test_ollama_default_base_url_uses_localhost_outside_container(self):
         """
@@ -1359,7 +1555,7 @@ class TestLiteLLMProvider(unittest.TestCase):
                 "messages": [{"role": "user", "content": "Say hello"}],
             },
         )
-        self.assertEqual(result, "hellomimo")
+        self.assertEqual(result, "hello\nmimo")
 
     def test_azure_provider_uses_azure_client_directly(self):
         """
@@ -1405,7 +1601,7 @@ class TestLiteLLMProvider(unittest.TestCase):
                 "messages": [{"role": "user", "content": "Say hello"}],
             },
         )
-        self.assertEqual(result, "helloazure")
+        self.assertEqual(result, "hello\nazure")
 
     def test_unsupported_provider_returns_clear_error(self):
         config.app["llm_provider"] = "g" + "4f"
@@ -1653,6 +1849,1239 @@ class TestSocialMetadata(unittest.TestCase):
                 },
             },
         )
+
+
+class TestGeneralSemanticVerifierLLM(unittest.TestCase):
+    @staticmethod
+    def _spec_response(requirement: str, **overrides) -> str:
+        spec = {
+            "requirement_id": 0,
+            "original_requirement": requirement,
+            "subjects": ["Worker"],
+            "primary_action": "installs",
+            "objects": ["tire"],
+            "required_relations": [],
+            "required_context": [],
+            "required_visible_state": [],
+            "optional_attributes": [],
+            "critical_visual_facts": [
+                {
+                    "id": "f1",
+                    "fact": requirement,
+                    "mandatory": True,
+                    "direct_evidence_needed": True,
+                    "evidence_description": (
+                        "The worker visibly installs the tire."
+                    ),
+                    "basis_type": "logically_necessary",
+                    "basis_quote": requirement,
+                }
+            ],
+            "ambiguity_notes": [],
+        }
+        spec.update(overrides)
+        return json.dumps({"specs": [spec]})
+
+    def test_requirement_decomposition_is_cached_per_normalized_unique_text(self):
+        requirement = "Worker installs a new tire"
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with (
+                patch.object(
+                    llm,
+                    "_visual_requirement_spec_cache_dir",
+                    return_value=Path(temp_dir),
+                ),
+                patch.object(
+                    llm,
+                    "_selected_llm_identity",
+                    return_value=("test-provider", "test-model"),
+                ),
+                patch.object(
+                    llm,
+                    "_generate_response",
+                    return_value=self._spec_response(requirement),
+                ) as generate,
+            ):
+                first = llm.generate_visual_requirement_specs(
+                    [requirement, f"  {requirement}  "]
+                )
+                second = llm.generate_visual_requirement_specs([requirement])
+
+        normalized = llm.normalize_visual_requirement(requirement)
+        self.assertEqual(generate.call_count, 1)
+        self.assertEqual(set(first), {normalized})
+        self.assertEqual(set(second), {normalized})
+        self.assertEqual(first[normalized].generator_provider, "test-provider")
+
+    def test_malformed_decomposition_does_not_invent_a_spec(self):
+        with (
+            patch.object(
+                llm,
+                "_selected_llm_identity",
+                return_value=("test-provider", "test-model"),
+            ),
+            patch.object(llm, "_load_visual_requirement_spec_cache", return_value=None),
+            patch.object(llm, "_generate_response", return_value='{"specs": []}'),
+        ):
+            result = llm.generate_visual_requirement_specs(
+                ["Worker installs a new tire"]
+            )
+
+        self.assertEqual(result, {})
+
+    @classmethod
+    def _specs_response(cls, requirements: list[str]) -> str:
+        """Build one well-formed batch response for the requested requirements."""
+        specs = []
+        for requirement_id, requirement in enumerate(requirements):
+            spec = json.loads(cls._spec_response(requirement))["specs"][0]
+            spec["requirement_id"] = requirement_id
+            specs.append(spec)
+        return json.dumps({"specs": specs})
+
+    @staticmethod
+    def _requested_requirements(prompt: str) -> list[str]:
+        payload = json.loads(prompt.rsplit("Inputs:", 1)[1].strip())
+        return [item["visual_requirement"] for item in payload]
+
+    @staticmethod
+    def _batch_requirements() -> list[str]:
+        # Every requirement keeps the words the spec fields are grounded in, so
+        # the strict validator stays in play while the batch size is exercised.
+        return [
+            f"Worker installs a new tire {suffix}"
+            for suffix in ("one", "two", "three", "four", "five", "six")
+        ]
+
+    def test_decomposition_is_requested_in_small_batches(self):
+        """整条时间线一次请求会被 Provider 截断，因此必须分批请求。"""
+        requirements = self._batch_requirements()
+        batch_sizes: list[int] = []
+
+        def fake_generate(prompt, app_config=None):
+            requested = self._requested_requirements(prompt)
+            batch_sizes.append(len(requested))
+            return self._specs_response(requested)
+
+        with (
+            patch.object(
+                llm, "_selected_llm_identity", return_value=("test-provider", "test-model")
+            ),
+            patch.object(llm, "_load_visual_requirement_spec_cache", return_value=None),
+            patch.object(llm, "_save_visual_requirement_spec_cache"),
+            patch.object(llm, "_generate_response", side_effect=fake_generate),
+        ):
+            resolved = llm.generate_visual_requirement_specs(requirements)
+
+        self.assertEqual(batch_sizes, [llm._VISUAL_REQUIREMENT_BATCH_SIZE, 2])
+        self.assertEqual(
+            set(resolved),
+            {llm.normalize_visual_requirement(value) for value in requirements},
+        )
+
+    def test_one_unusable_batch_does_not_discard_the_usable_ones(self):
+        """单个批次不可用时，已解析成功的批次必须保留。"""
+        requirements = self._batch_requirements()
+        batch_sizes: list[int] = []
+
+        def fake_generate(prompt, app_config=None):
+            requested = self._requested_requirements(prompt)
+            batch_sizes.append(len(requested))
+            if len(requested) == llm._VISUAL_REQUIREMENT_BATCH_SIZE:
+                return self._specs_response(requested)
+            return "the provider explained itself instead of answering"
+
+        with (
+            patch.object(
+                llm, "_selected_llm_identity", return_value=("test-provider", "test-model")
+            ),
+            patch.object(llm, "_load_visual_requirement_spec_cache", return_value=None),
+            patch.object(llm, "_save_visual_requirement_spec_cache"),
+            patch.object(llm, "_generate_response", side_effect=fake_generate),
+        ):
+            resolved = llm.generate_visual_requirement_specs(requirements)
+
+        self.assertEqual(
+            batch_sizes,
+            [llm._VISUAL_REQUIREMENT_BATCH_SIZE]
+            + [2] * llm._MAX_STRUCTURED_RESPONSE_ATTEMPTS,
+        )
+        self.assertEqual(
+            set(resolved),
+            {
+                llm.normalize_visual_requirement(value)
+                for value in requirements[: llm._VISUAL_REQUIREMENT_BATCH_SIZE]
+            },
+        )
+
+    def test_structured_payload_is_recovered_from_a_chatty_reply(self):
+        """Provider 在 JSON 前后添加解释时也必须能解析。"""
+        requirement = "Worker installs a new tire"
+        chatty = (
+            "Sure, here is the decomposition:\n```json\n"
+            f"{self._spec_response(requirement)}\n"
+            "```\nLet me know if you need changes."
+        )
+
+        with (
+            patch.object(
+                llm, "_selected_llm_identity", return_value=("test-provider", "test-model")
+            ),
+            patch.object(llm, "_load_visual_requirement_spec_cache", return_value=None),
+            patch.object(llm, "_save_visual_requirement_spec_cache"),
+            patch.object(llm, "_generate_response", return_value=chatty) as generate,
+        ):
+            resolved = llm.generate_visual_requirement_specs([requirement])
+
+        self.assertEqual(generate.call_count, 1)
+        self.assertEqual(
+            set(resolved), {llm.normalize_visual_requirement(requirement)}
+        )
+
+    def test_unparsable_structured_response_is_retried_before_giving_up(self):
+        """空响应（被截断或被拒答）必须重试一次后才放弃。"""
+        with (
+            patch.object(
+                llm, "_selected_llm_identity", return_value=("test-provider", "test-model")
+            ),
+            patch.object(llm, "_load_visual_requirement_spec_cache", return_value=None),
+            patch.object(llm, "_generate_response", return_value="") as generate,
+        ):
+            resolved = llm.generate_visual_requirement_specs(
+                ["Worker installs a new tire"]
+            )
+
+        self.assertEqual(resolved, {})
+        self.assertEqual(generate.call_count, llm._MAX_STRUCTURED_RESPONSE_ATTEMPTS)
+
+    def test_provider_unavailability_is_not_retried(self):
+        """Provider 不可用时 _generate_response 已内部重试，这里不再重复请求。"""
+        with (
+            patch.object(
+                llm, "_selected_llm_identity", return_value=("test-provider", "test-model")
+            ),
+            patch.object(llm, "_load_visual_requirement_spec_cache", return_value=None),
+            patch.object(
+                llm, "_generate_response", return_value="Error: provider exploded"
+            ) as generate,
+        ):
+            resolved = llm.generate_visual_requirement_specs(
+                ["Worker installs a new tire"]
+            )
+
+        self.assertEqual(resolved, {})
+        self.assertEqual(generate.call_count, 1)
+
+    def test_configured_output_ceiling_overrides_the_default(self):
+        """显式上限优先；无效值回落到默认值，避免再次截断结构化响应。"""
+        self.assertEqual(
+            llm._resolved_max_output_tokens({"llm_max_output_tokens": 4096}), 4096
+        )
+        self.assertEqual(
+            llm._resolved_max_output_tokens({}), llm._DEFAULT_MAX_OUTPUT_TOKENS
+        )
+        for invalid in ("", "abc", 0, -5, None):
+            self.assertEqual(
+                llm._resolved_max_output_tokens({"llm_max_output_tokens": invalid}),
+                llm._DEFAULT_MAX_OUTPUT_TOKENS,
+            )
+
+    def test_json_payload_recovery_accepts_only_complete_documents(self):
+        """截断的响应必须保持不可解析，不能被"恢复"成其中一个内层对象。"""
+        payload = self._spec_response("Worker installs a new tire")
+        array_payload = json.dumps([{"a": 1}, {"b": 2}])
+
+        for raw, expected in (
+            (payload, payload),
+            (f"```json\n{payload}\n```", payload),
+            (f"Here you go:\n{payload}\nHope that helps.", payload),
+            (array_payload, array_payload),
+            (f"```\n{array_payload}\n```", array_payload),
+            (f"here: {array_payload} done", array_payload),
+        ):
+            with self.subTest(recover=raw[:40]):
+                self.assertEqual(
+                    json.loads(llm._extract_json_payload(raw)), json.loads(expected)
+                )
+
+        for raw in (
+            "",
+            "   ",
+            "I cannot help with that.",
+            payload[: len(payload) // 2],
+            # A truncated array still contains a complete first object; returning
+            # it would look like a successful parse of a partial timeline.
+            array_payload[:12],
+            f"```json\n{payload[: len(payload) // 2]}",
+        ):
+            with self.subTest(reject=raw[:40]):
+                with self.assertRaises(json.JSONDecodeError):
+                    json.loads(llm._extract_json_payload(raw))
+
+    def test_response_diagnostic_reports_length_and_a_bounded_preview(self):
+        """空响应、截断响应与拒答必须在日志中可区分。"""
+        self.assertEqual(
+            llm._response_diagnostic(""),
+            "response_length=0, response_preview=''",
+        )
+
+        long_diagnostic = llm._response_diagnostic("x" * 5000)
+        self.assertIn("response_length=5000", long_diagnostic)
+        self.assertIn("x" * llm._LOGGED_RESPONSE_PREVIEW_LENGTH, long_diagnostic)
+        self.assertNotIn(
+            "x" * (llm._LOGGED_RESPONSE_PREVIEW_LENGTH + 1), long_diagnostic
+        )
+
+        multiline = llm._response_diagnostic("line one\nline two")
+        self.assertIn("line one line two", multiline)
+        self.assertNotIn("\n", multiline)
+
+    def test_unsupported_mandatory_environment_is_rejected_by_validator(self):
+        requirement = "Worker installs a new tire"
+        raw = json.loads(
+            self._spec_response(
+                requirement,
+                required_context=["sunny outdoor workshop"],
+                critical_visual_facts=[
+                    {
+                        "id": "f1",
+                        "fact": "Worker installs a new tire in sunny weather",
+                        "mandatory": True,
+                        "direct_evidence_needed": True,
+                        "evidence_description": "The installation happens in sun.",
+                        "basis_type": "explicit",
+                        "basis_quote": requirement,
+                    }
+                ],
+            )
+        )["specs"][0]
+
+        with self.assertRaisesRegex(ValueError, "source-grounded|unsupported"):
+            llm._validate_visual_requirement_spec_item(
+                raw,
+                requirement_id=0,
+                original_requirement=requirement,
+                provider_id="test-provider",
+                model_name="test-model",
+            )
+
+    def test_action_requires_a_defining_logically_necessary_fact(self):
+        requirement = "Worker installs a new tire"
+        raw = json.loads(self._spec_response(requirement))["specs"][0]
+        raw["critical_visual_facts"][0]["basis_type"] = "explicit"
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "defining logically necessary evidence fact",
+        ):
+            llm._validate_visual_requirement_spec_item(
+                raw,
+                requirement_id=0,
+                original_requirement=requirement,
+                provider_id="test-provider",
+                model_name="test-model",
+            )
+
+    def test_logically_necessary_action_fact_may_use_grounded_paraphrase(self):
+        requirement = "Worker installs a new tire"
+        raw = json.loads(self._spec_response(requirement))["specs"][0]
+        raw["critical_visual_facts"][0].update(
+            {
+                "fact": (
+                    "The worker visibly fits and secures the new tire into its "
+                    "installed position rather than only holding it"
+                ),
+                "basis_quote": requirement,
+            }
+        )
+
+        spec = llm._validate_visual_requirement_spec_item(
+            raw,
+            requirement_id=0,
+            original_requirement=requirement,
+            provider_id="test-provider",
+            model_name="test-model",
+        )
+
+        self.assertEqual(
+            spec.critical_visual_facts[0].basis_type,
+            "logically_necessary",
+        )
+
+    def test_continuous_visible_state_does_not_require_invented_action(self):
+        requirement = "Coffee beans are dark brown inside the roaster"
+        raw = json.loads(
+            self._spec_response(
+                requirement,
+                subjects=["Coffee beans"],
+                primary_action=None,
+                objects=["roaster"],
+                required_visible_state=["Coffee beans are dark brown"],
+                critical_visual_facts=[
+                    {
+                        "id": "f1",
+                        "fact": requirement,
+                        "mandatory": True,
+                        "direct_evidence_needed": False,
+                        "evidence_description": "Dark brown beans are visible.",
+                        "basis_type": "explicit",
+                        "basis_quote": requirement,
+                    }
+                ],
+            )
+        )["specs"][0]
+
+        spec = llm._validate_visual_requirement_spec_item(
+            raw,
+            requirement_id=0,
+            original_requirement=requirement,
+            provider_id="test-provider",
+            model_name="test-model",
+        )
+
+        self.assertIsNone(spec.primary_action)
+        self.assertFalse(spec.critical_visual_facts[0].direct_evidence_needed)
+
+    def test_text_adjudicator_cannot_modify_supplied_fact_status(self):
+        requirement = "Worker installs a new tire"
+        raw = json.loads(self._spec_response(requirement))["specs"][0]
+        spec = llm._validate_visual_requirement_spec_item(
+            raw,
+            requirement_id=0,
+            original_requirement=requirement,
+            provider_id="test-provider",
+            model_name="test-model",
+        )
+        candidate = {
+            "candidate_id": "pexels:123",
+            "observed_facts": {
+                "critical_fact_evidence": [
+                    {
+                        "fact_id": "f1",
+                        "status": "OBSERVED",
+                        "evidence": "The installation itself is directly visible.",
+                    }
+                ]
+            },
+        }
+        accepted_response = json.dumps(
+            {
+                "decisions": [
+                    {
+                        "candidate_id": "pexels:123",
+                        "decision": "ACCEPT",
+                        "mandatory_fact_results": [
+                            {"fact_id": "f1", "status": "OBSERVED"}
+                        ],
+                        "missing_or_contradictory_facts": [],
+                        "reason": "All mandatory evidence is directly observed.",
+                    }
+                ]
+            }
+        )
+        modified_response = accepted_response.replace(
+            '"status": "OBSERVED"',
+            '"status": "NOT_OBSERVED"',
+        )
+
+        # Both calls must actually reach the adjudicator: this test is about
+        # rejecting a tampered response, and the verdict cache would otherwise
+        # answer the second call from the first one's stored ACCEPT.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with (
+                patch.object(
+                    llm,
+                    "_semantic_adjudication_cache_dir",
+                    return_value=Path(temp_dir),
+                ),
+                patch.object(
+                    llm, "_load_semantic_adjudication_cache", return_value=None
+                ),
+            ):
+                with patch.object(
+                    llm, "_generate_response", return_value=accepted_response
+                ):
+                    accepted = llm.adjudicate_visual_candidates(spec, [candidate])
+                with patch.object(
+                    llm, "_generate_response", return_value=modified_response
+                ):
+                    rejected_as_malformed = llm.adjudicate_visual_candidates(
+                        spec, [candidate]
+                    )
+
+        self.assertEqual(accepted["pexels:123"].decision, "ACCEPT")
+        self.assertEqual(rejected_as_malformed, {})
+
+
+class TestSemanticAdjudicationCache(unittest.TestCase):
+    """The paid observation behind a verdict is already cached; the verdict was not.
+
+    Re-running the same script therefore used to cost nothing at the video model and
+    full token price at the adjudicator. These tests pin down the two things that
+    make reuse safe: the key must cover everything the verdict depends on, and a
+    stored verdict must be re-checked against the evidence of the run reusing it.
+    """
+
+    def setUp(self):
+        temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(temp_dir.cleanup)
+        self.cache_dir = Path(temp_dir.name)
+        for patcher in (
+            patch.object(
+                llm,
+                "_semantic_adjudication_cache_dir",
+                return_value=self.cache_dir,
+            ),
+            patch.object(
+                llm,
+                "_selected_llm_identity",
+                return_value=("test-provider", "test-model"),
+            ),
+        ):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    @staticmethod
+    def _spec(requirement: str = "Worker installs a new tire"):
+        raw = json.loads(
+            TestGeneralSemanticVerifierLLM._spec_response(requirement)
+        )["specs"][0]
+        return llm._validate_visual_requirement_spec_item(
+            raw,
+            requirement_id=0,
+            original_requirement=requirement,
+            provider_id="test-provider",
+            model_name="test-model",
+        )
+
+    @staticmethod
+    def _candidate(
+        candidate_id: str,
+        *,
+        status: str = "OBSERVED",
+        evidence: str = "The installation itself is directly visible.",
+    ) -> dict:
+        return {
+            "candidate_id": candidate_id,
+            "observed_facts": {
+                "critical_fact_evidence": [
+                    {"fact_id": "f1", "status": status, "evidence": evidence}
+                ]
+            },
+        }
+
+    @staticmethod
+    def _decision(
+        candidate_id: str,
+        *,
+        decision: str = "ACCEPT",
+        status: str = "OBSERVED",
+        reason: str = "All mandatory evidence is directly observed.",
+        missing: list | None = None,
+    ) -> dict:
+        return {
+            "candidate_id": candidate_id,
+            "decision": decision,
+            "mandatory_fact_results": [{"fact_id": "f1", "status": status}],
+            "missing_or_contradictory_facts": list(missing or []),
+            "reason": reason,
+        }
+
+    @staticmethod
+    def _response(*decisions: dict) -> str:
+        return json.dumps({"decisions": list(decisions)})
+
+    def _digest(self, spec, candidate: dict, **overrides) -> str:
+        params = {
+            "candidate_id": candidate["candidate_id"],
+            "observed_facts": candidate["observed_facts"],
+            "requirement_spec_digest": llm.visual_requirement_spec_digest(spec),
+            "provider_id": "test-provider",
+            "model_name": "test-model",
+        }
+        params.update(overrides)
+        return llm._semantic_adjudication_cache_digest(
+            params["candidate_id"],
+            params["observed_facts"],
+            params["requirement_spec_digest"],
+            params["provider_id"],
+            params["model_name"],
+        )
+
+    def _adjudicate(self, spec, candidates: list[dict], response: str | None = None):
+        """Run one adjudication, returning the verdicts and the provider mock."""
+        with patch.object(
+            llm, "_generate_response", return_value=response
+        ) as generate:
+            verdicts = llm.adjudicate_visual_candidates(spec, candidates)
+        return verdicts, generate
+
+    def test_a_repeated_verdict_is_reused_without_paying_for_it_again(self):
+        spec = self._spec()
+        candidate = self._candidate("pexels:1")
+
+        first, first_generate = self._adjudicate(
+            spec, [candidate], self._response(self._decision("pexels:1"))
+        )
+        second, second_generate = self._adjudicate(spec, [candidate])
+
+        self.assertEqual(first_generate.call_count, 1)
+        second_generate.assert_not_called()
+        self.assertEqual(first["pexels:1"].decision, "ACCEPT")
+        self.assertEqual(second["pexels:1"].decision, "ACCEPT")
+        self.assertEqual(second["pexels:1"].reason, first["pexels:1"].reason)
+        self.assertEqual(
+            second["pexels:1"].mandatory_fact_results[0].status, "OBSERVED"
+        )
+
+    def test_a_rejection_is_cached_too(self):
+        # This is where the money actually is: a failing beat exhausts its whole
+        # candidate budget, so its rejections are the bulk of the spend.
+        spec = self._spec()
+        candidate = self._candidate(
+            "pexels:1",
+            status="NOT_OBSERVED",
+            evidence="Only a parked car is visible.",
+        )
+        rejection = self._response(
+            self._decision(
+                "pexels:1",
+                decision="REJECT",
+                status="NOT_OBSERVED",
+                reason="The defining installation is never shown.",
+                missing=["f1"],
+            )
+        )
+
+        first, first_generate = self._adjudicate(spec, [candidate], rejection)
+        second, second_generate = self._adjudicate(spec, [candidate])
+
+        self.assertEqual(first_generate.call_count, 1)
+        second_generate.assert_not_called()
+        self.assertEqual(second["pexels:1"].decision, "REJECT")
+        self.assertEqual(second["pexels:1"].missing_or_contradictory_facts, ["f1"])
+
+    def test_only_the_uncached_candidates_are_sent_to_the_provider(self):
+        spec = self._spec()
+        cached = self._candidate("pexels:1")
+        fresh = self._candidate(
+            "pexels:2", evidence="A second clip also shows the tire being secured."
+        )
+
+        self._adjudicate(spec, [cached], self._response(self._decision("pexels:1")))
+        both, generate = self._adjudicate(
+            spec, [cached, fresh], self._response(self._decision("pexels:2"))
+        )
+
+        self.assertEqual(generate.call_count, 1)
+        prompt = generate.call_args.args[0]
+        self.assertIn("pexels:2", prompt)
+        self.assertNotIn("pexels:1", prompt)
+        self.assertEqual(set(both), {"pexels:1", "pexels:2"})
+
+    def test_a_verdict_is_not_reused_once_the_evidence_changes(self):
+        spec = self._spec()
+        original = self._candidate("pexels:1")
+        reobserved = self._candidate(
+            "pexels:1", evidence="On review only the wheel is held, never fitted."
+        )
+
+        self._adjudicate(spec, [original], self._response(self._decision("pexels:1")))
+        second, generate = self._adjudicate(
+            spec,
+            [reobserved],
+            self._response(
+                self._decision(
+                    "pexels:1",
+                    decision="UNCERTAIN",
+                    reason="Holding the wheel does not establish the fitting.",
+                )
+            ),
+        )
+
+        self.assertEqual(generate.call_count, 1)
+        self.assertEqual(second["pexels:1"].decision, "UNCERTAIN")
+
+    def test_a_verdict_is_not_reused_once_the_requirement_changes(self):
+        candidate = self._candidate("pexels:1")
+        first_spec = self._spec()
+        # Still grounded in "installs", so this stays a valid spec — only the
+        # requirement it was decomposed from differs.
+        other_spec = self._spec("Worker installs a new tire at the roadside")
+
+        self.assertNotEqual(
+            llm.visual_requirement_spec_digest(first_spec),
+            llm.visual_requirement_spec_digest(other_spec),
+        )
+
+        self._adjudicate(
+            first_spec, [candidate], self._response(self._decision("pexels:1"))
+        )
+        _, generate = self._adjudicate(
+            other_spec, [candidate], self._response(self._decision("pexels:1"))
+        )
+
+        self.assertEqual(generate.call_count, 1)
+
+    def test_a_stored_accept_cannot_outlive_the_evidence_that_earned_it(self):
+        # The file name is a hash of the evidence, so this can only happen through
+        # a hand-edited or corrupted cache. It must still never be honored.
+        spec = self._spec()
+        candidate = self._candidate("pexels:1", status="NOT_OBSERVED")
+        digest = self._digest(spec, candidate)
+        llm._semantic_adjudication_cache_path(digest).write_text(
+            json.dumps(
+                {
+                    "version": llm._SEMANTIC_ADJUDICATION_CACHE_FORMAT_VERSION,
+                    "schema_version": llm.SEMANTIC_ADJUDICATION_SCHEMA_VERSION,
+                    "decision": self._decision("pexels:1", status="OBSERVED"),
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        verdicts, generate = self._adjudicate(
+            spec,
+            [candidate],
+            self._response(
+                self._decision(
+                    "pexels:1",
+                    decision="REJECT",
+                    status="NOT_OBSERVED",
+                    reason="The mandatory fact is not observed.",
+                    missing=["f1"],
+                )
+            ),
+        )
+
+        self.assertEqual(generate.call_count, 1)
+        self.assertEqual(verdicts["pexels:1"].decision, "REJECT")
+
+    def test_a_superseded_schema_version_is_not_honored(self):
+        spec = self._spec()
+        candidate = self._candidate("pexels:1")
+        digest = self._digest(spec, candidate)
+        llm._semantic_adjudication_cache_path(digest).write_text(
+            json.dumps(
+                {
+                    "version": llm._SEMANTIC_ADJUDICATION_CACHE_FORMAT_VERSION,
+                    "schema_version": "semantic-adjudication-from-older-rules",
+                    "decision": self._decision("pexels:1"),
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        _, generate = self._adjudicate(
+            spec, [candidate], self._response(self._decision("pexels:1"))
+        )
+
+        self.assertEqual(generate.call_count, 1)
+
+    def test_the_key_covers_the_model_that_reached_the_verdict(self):
+        spec = self._spec()
+        candidate = self._candidate("pexels:1")
+        baseline = self._digest(spec, candidate)
+
+        self.assertNotEqual(
+            baseline, self._digest(spec, candidate, provider_id="other-provider")
+        )
+        self.assertNotEqual(
+            baseline, self._digest(spec, candidate, model_name="other-model")
+        )
+        self.assertNotEqual(
+            baseline,
+            self._digest(spec, self._candidate("pexels:2")),
+        )
+
+    def test_a_damaged_cache_file_costs_one_request_not_correctness(self):
+        spec = self._spec()
+        candidate = self._candidate("pexels:1")
+        llm._semantic_adjudication_cache_path(
+            self._digest(spec, candidate)
+        ).write_text("{ this is not json", encoding="utf-8")
+
+        verdicts, generate = self._adjudicate(
+            spec, [candidate], self._response(self._decision("pexels:1"))
+        )
+
+        self.assertEqual(generate.call_count, 1)
+        self.assertEqual(verdicts["pexels:1"].decision, "ACCEPT")
+
+    def test_an_unreachable_cache_costs_tokens_never_correctness(self):
+        spec = self._spec()
+        candidate = self._candidate("pexels:1")
+
+        with patch.object(
+            llm,
+            "_semantic_adjudication_cache_digest",
+            side_effect=OSError("storage is unavailable"),
+        ):
+            verdicts, generate = self._adjudicate(
+                spec, [candidate], self._response(self._decision("pexels:1"))
+            )
+
+        self.assertEqual(generate.call_count, 1)
+        self.assertEqual(verdicts["pexels:1"].decision, "ACCEPT")
+
+    def test_a_malformed_batch_leaves_no_verdict_behind(self):
+        spec = self._spec()
+        good = self._candidate("pexels:1")
+        bad = self._candidate(
+            "pexels:2", evidence="A second angle on the same fitting."
+        )
+        # One valid decision and one that tampers with the supplied status. The whole
+        # response is refused, so neither may be stored.
+        response = self._response(
+            self._decision("pexels:1"),
+            self._decision("pexels:2", status="NOT_OBSERVED"),
+        )
+
+        verdicts, _ = self._adjudicate(spec, [good, bad], response)
+
+        self.assertEqual(verdicts, {})
+        self.assertEqual(sorted(self.cache_dir.iterdir()), [])
+
+    def test_a_verdict_survives_a_cache_that_cannot_be_written(self):
+        spec = self._spec()
+        candidate = self._candidate("pexels:1")
+
+        with patch.object(
+            llm,
+            "_save_semantic_adjudication_cache",
+            side_effect=OSError("read-only storage"),
+        ):
+            verdicts, _ = self._adjudicate(
+                spec, [candidate], self._response(self._decision("pexels:1"))
+            )
+
+        self.assertEqual(verdicts["pexels:1"].decision, "ACCEPT")
+
+
+class TestAlternativeVisualRequirements(unittest.TestCase):
+    """A rewritten requirement is the last thing standing between one unfillable
+    beat and a failed video, so an ungrounded rewrite is worse than none at all:
+    it would quietly render a different scene than the narration asked for."""
+
+    NARRATION = "Workers once inspected every railway track by hand"
+    FAILED = "Workers inspecting railway tracks at sunrise with lanterns"
+    ALTERNATIVE = "Two workers walking along railway tracks"
+    BASIS = "inspected every railway track"
+
+    def _item(self, **overrides) -> dict:
+        item = {
+            "item_index": 4,
+            "narration_text": self.NARRATION,
+            "failed_requirement": self.FAILED,
+            "problem": "no candidate passed semantic verification",
+        }
+        item.update(overrides)
+        return item
+
+    def _alternative(self, **overrides) -> dict:
+        entry = {
+            "item_id": 0,
+            "visual_requirement": self.ALTERNATIVE,
+            "narration_basis": self.BASIS,
+        }
+        entry.update(overrides)
+        return entry
+
+    @staticmethod
+    def _response(alternatives: list) -> str:
+        return json.dumps({"alternatives": alternatives})
+
+    @staticmethod
+    def _requested_items(prompt: str) -> list[dict]:
+        return json.loads(prompt.rsplit("Inputs:", 1)[1].strip())
+
+    def _run(self, response: str, items: list | None = None):
+        """Run one rewrite request against a canned provider reply."""
+        with patch.object(llm, "_generate_response", return_value=response) as generate:
+            resolved = llm.generate_alternative_visual_requirements(
+                [self._item()] if items is None else items
+            )
+        return resolved, generate
+
+    def test_grounded_alternative_is_accepted_under_the_callers_index(self):
+        response = self._response(
+            [
+                self._alternative(
+                    visual_requirement="  Two workers   walking\nalong railway tracks "
+                )
+            ]
+        )
+
+        resolved, generate = self._run(response)
+
+        self.assertEqual(
+            resolved,
+            {
+                4: {
+                    "visual_requirement": self.ALTERNATIVE,
+                    "narration_basis": self.BASIS,
+                }
+            },
+        )
+        self.assertEqual(generate.call_count, 1)
+        self.assertEqual(
+            self._requested_items(generate.call_args[0][0]),
+            [
+                {
+                    "item_id": 0,
+                    "spoken_text": self.NARRATION,
+                    "rejected_visual_requirement": self.FAILED,
+                    "why_it_failed": "no candidate passed semantic verification",
+                }
+            ],
+        )
+
+    def test_an_ungrounded_proposal_is_dropped_without_re_asking(self):
+        """每个被丢弃的提案都不得再次请求 Provider，否则一个坏 Beat 会被反复计费。"""
+        cases = {
+            "narration_basis is not a quote of this line": self._alternative(
+                narration_basis="workers wearing bright hard hats"
+            ),
+            "narration_basis words are not contiguous": self._alternative(
+                narration_basis="workers inspected track"
+            ),
+            "narration_basis is a single word": self._alternative(
+                narration_basis="railway"
+            ),
+            "the rejected wording is returned again": self._alternative(
+                visual_requirement=(
+                    "  workers INSPECTING railway tracks at sunrise with lanterns "
+                )
+            ),
+            "the alternative carries no searchable letters": self._alternative(
+                visual_requirement="کارگران روی ریل راه‌آهن"
+            ),
+        }
+        for label, alternative in cases.items():
+            with self.subTest(label):
+                resolved, generate = self._run(self._response([alternative]))
+
+                self.assertEqual(resolved, {})
+                self.assertEqual(generate.call_count, 1)
+
+    def test_an_unusable_item_is_never_sent_to_the_provider(self):
+        long_text = "word " * 200
+        cases = {
+            "no items at all": [],
+            "item_index is not an integer": [self._item(item_index="4")],
+            "item_index is a bool": [self._item(item_index=True)],
+            "the beat has no spoken text": [self._item(narration_text="   ")],
+            "the spoken text is too long": [self._item(narration_text=long_text)],
+            "the rejected requirement is too long": [
+                self._item(failed_requirement=long_text)
+            ],
+        }
+        for label, items in cases.items():
+            with self.subTest(label):
+                resolved, generate = self._run("unused", items=items)
+
+                self.assertEqual(resolved, {})
+                generate.assert_not_called()
+
+    def test_a_malformed_batch_is_discarded_without_re_asking(self):
+        cases = {
+            "item_id is outside the batch": self._response(
+                [self._alternative(item_id=7)]
+            ),
+            "item_id is not an integer": self._response(
+                [self._alternative(item_id="0")]
+            ),
+            "item_id is a bool": self._response([self._alternative(item_id=True)]),
+            "more alternatives than inputs": self._response(
+                [self._alternative(), self._alternative(item_id=1)]
+            ),
+            "alternatives is not an array": json.dumps({"alternatives": {}}),
+            "an alternative is not an object": self._response(["Two workers walking"]),
+            "visual_requirement is missing": self._response(
+                [{"item_id": 0, "narration_basis": self.BASIS}]
+            ),
+            "narration_basis is missing": self._response(
+                [{"item_id": 0, "visual_requirement": self.ALTERNATIVE}]
+            ),
+        }
+        for label, response in cases.items():
+            with self.subTest(label):
+                resolved, generate = self._run(response)
+
+                self.assertEqual(resolved, {})
+                self.assertEqual(generate.call_count, 1)
+
+    def test_a_duplicated_item_id_discards_even_the_well_formed_sibling(self):
+        """item_id 重复意味着无法判断哪个 Beat 对应哪个提案，整批必须丢弃。"""
+        items = [self._item(item_index=4), self._item(item_index=9)]
+
+        resolved, generate = self._run(
+            self._response([self._alternative(), self._alternative()]),
+            items=items,
+        )
+
+        self.assertEqual(resolved, {})
+        self.assertEqual(generate.call_count, 1)
+
+    def test_an_omitted_item_stays_unfilled_while_its_sibling_is_answered(self):
+        items = [self._item(item_index=4), self._item(item_index=9)]
+
+        resolved, generate = self._run(
+            self._response([self._alternative(item_id=1)]), items=items
+        )
+
+        self.assertEqual(set(resolved), {9})
+        self.assertEqual(resolved[9]["visual_requirement"], self.ALTERNATIVE)
+        requested = self._requested_items(generate.call_args[0][0])
+        self.assertEqual([entry["item_id"] for entry in requested], [0, 1])
+
+    def test_requests_are_batched_and_one_bad_batch_keeps_the_good_one(self):
+        items = [
+            self._item(item_index=index, failed_requirement=f"{self.FAILED} {index}")
+            for index in range(llm._VISUAL_REQUIREMENT_BATCH_SIZE + 2)
+        ]
+        batch_sizes: list[int] = []
+
+        def fake_generate(prompt, app_config=None):
+            requested = self._requested_items(prompt)
+            batch_sizes.append(len(requested))
+            if len(requested) < llm._VISUAL_REQUIREMENT_BATCH_SIZE:
+                return "the provider explained itself instead of answering"
+            return self._response(
+                [self._alternative(item_id=entry["item_id"]) for entry in requested]
+            )
+
+        with patch.object(llm, "_generate_response", side_effect=fake_generate):
+            resolved = llm.generate_alternative_visual_requirements(items)
+
+        self.assertEqual(
+            batch_sizes,
+            [llm._VISUAL_REQUIREMENT_BATCH_SIZE]
+            + [2] * llm._MAX_STRUCTURED_RESPONSE_ATTEMPTS,
+        )
+        self.assertEqual(set(resolved), set(range(llm._VISUAL_REQUIREMENT_BATCH_SIZE)))
+
+    def test_a_long_failure_diagnosis_is_bounded_but_keeps_the_item(self):
+        resolved, generate = self._run(
+            self._response([self._alternative()]),
+            items=[self._item(problem="rejected " * 200)],
+        )
+
+        requested = self._requested_items(generate.call_args[0][0])
+        self.assertEqual(
+            len(requested[0]["why_it_failed"]), llm._MAX_STRUCTURED_TEXT_LENGTH
+        )
+        self.assertEqual(set(resolved), {4})
+
+    def test_provider_unavailability_is_not_retried_per_beat(self):
+        resolved, generate = self._run("Error: provider is unavailable")
+
+        self.assertEqual(resolved, {})
+        self.assertEqual(generate.call_count, 1)
+
+    def test_narration_grounding_requires_a_contiguous_quote(self):
+        cases = [
+            ("an exact quote", self.NARRATION, self.BASIS, True),
+            (
+                "punctuation and case differ",
+                self.NARRATION,
+                "Inspected, EVERY railway track!",
+                True,
+            ),
+            ("the whole spoken line", self.NARRATION, self.NARRATION, True),
+            ("scattered words", self.NARRATION, "workers inspected track", False),
+            ("a single word", self.NARRATION, "railway", False),
+            ("empty narration", "", self.BASIS, False),
+            ("empty quote", self.NARRATION, "   ", False),
+            (
+                "a quote in the narration's own language",
+                "کارگران ریل راه آهن را بازرسی می‌کردند",
+                "ریل راه آهن",
+                True,
+            ),
+            (
+                "a quote absent from the narration's own language",
+                "کارگران ریل راه آهن را بازرسی می‌کردند",
+                "برداشت گیلاس",
+                False,
+            ),
+        ]
+        for label, narration, quote, expected in cases:
+            with self.subTest(label):
+                self.assertIs(
+                    llm._narration_contains_quote(narration, quote), expected
+                )
+
+
+class TestNarrationVisualRequirementRepair(unittest.TestCase):
+    """The call that turns spoken narration lines into filmable requirements.
+
+    It runs only when semantic grouping already failed, so its own failures must
+    stay legible: a line the provider cannot describe visually has to come back
+    absent, never as an invented scene and never as the spoken line itself.
+    """
+
+    @staticmethod
+    def _lines(count):
+        return [
+            {"index": index, "spoken_text": f"Narration line {index}."}
+            for index in range(1, count + 1)
+        ]
+
+    def test_an_empty_answer_marks_a_line_as_having_no_visible_content(self):
+        payload = (
+            '[{"index":1,"visual_requirement":"A seed cracking open in dark soil"},'
+            '{"index":2,"visual_requirement":""},'
+            '{"index":3,"visual_requirement":"  "}]'
+        )
+        with patch.object(llm, "_generate_response", return_value=payload):
+            result = llm.generate_narration_visual_requirements(
+                narration_text="A seed cracks open. Patient. Not loud.",
+                narration_lines=self._lines(3),
+            )
+
+        # Absent, not empty-stringed: the caller attaches such a line to a
+        # neighbour, and an empty requirement would reach stock search instead.
+        self.assertEqual(result, {1: "A seed cracking open in dark soil"})
+
+    def test_an_unusable_object_never_discards_the_lines_that_came_back(self):
+        payload = (
+            '[{"index":1,"visual_requirement":"Roots pushing down through soil"},'
+            '{"index":"2","visual_requirement":"Leaves reaching up"},'
+            '{"index":3,"visual_requirement":42},'
+            '{"index":4,"visual_requirement":"Forest canopy at dawn",'
+            '"confidence":0.9},'
+            '{"index":9,"visual_requirement":"A line that was never requested"},'
+            '{"index":1,"visual_requirement":"A duplicate answer"}]'
+        )
+        with patch.object(llm, "_generate_response", return_value=payload):
+            result = llm.generate_narration_visual_requirements(
+                narration_text="Roots push down.",
+                narration_lines=self._lines(4),
+            )
+
+        self.assertEqual(result, {1: "Roots pushing down through soil"})
+
+    def test_the_prompt_carries_every_requested_line_and_forbids_invention(self):
+        captured = {}
+
+        def fake_generate_response(prompt, app_config=None):
+            captured["prompt"] = prompt
+            return '[{"index":1,"visual_requirement":"A single water drop"}]'
+
+        with patch.object(
+            llm, "_generate_response", side_effect=fake_generate_response
+        ) as generate:
+            result = llm.generate_narration_visual_requirements(
+                narration_text="It starts with a single drop of water. One drop.",
+                narration_lines=[
+                    {"index": 1, "spoken_text": "It starts with a single drop."},
+                    {"index": 2, "spoken_text": "One drop."},
+                ],
+            )
+
+        self.assertEqual(generate.call_count, 1)
+        self.assertEqual(result, {1: "A single water drop"})
+        self.assertIn('1|"It starts with a single drop."', captured["prompt"])
+        self.assertIn('2|"One drop."', captured["prompt"])
+        # The narration is context for resolving "One drop.", and inventing a
+        # subject is the failure mode that makes a requirement unfillable.
+        self.assertIn("It starts with a single drop of water.", captured["prompt"])
+        self.assertIn("Add no fact the narration does not support", captured["prompt"])
+        self.assertIn("must return an empty string", captured["prompt"])
+
+    def test_provider_failure_reads_as_unavailable_not_as_nothing_visible(self):
+        with patch.object(
+            llm, "_generate_response", return_value="Error: provider unavailable"
+        ):
+            unavailable = llm.generate_narration_visual_requirements(
+                narration_text="Roots push down.",
+                narration_lines=self._lines(2),
+            )
+
+        # None and {} mean different things to the caller: one keeps the spoken
+        # requirements for the pipeline to reject, the other would consolidate a
+        # timeline around the claim that no line is filmable.
+        self.assertIsNone(unavailable)
+
+        with patch.object(llm, "_generate_response", return_value="[]") as generate:
+            nothing_visible = llm.generate_narration_visual_requirements(
+                narration_text="Patient. Not loud.",
+                narration_lines=self._lines(2),
+            )
+
+        self.assertEqual(nothing_visible, {})
+        self.assertEqual(generate.call_count, 1)
+
+    def test_a_long_narration_is_asked_for_in_bounded_batches(self):
+        line_count = llm._NARRATION_REQUIREMENT_BATCH_SIZE + 3
+        requested_batches = []
+
+        def fake_generate_response(prompt, app_config=None):
+            indexes = [
+                int(line.split("|", 1)[0])
+                for line in prompt.splitlines()
+                if line and line[0].isdigit() and "|" in line
+            ]
+            requested_batches.append(indexes)
+            return json.dumps(
+                [
+                    {"index": index, "visual_requirement": f"Visible situation {index}"}
+                    for index in indexes
+                ]
+            )
+
+        with patch.object(
+            llm, "_generate_response", side_effect=fake_generate_response
+        ) as generate:
+            result = llm.generate_narration_visual_requirements(
+                narration_text="A long narration.",
+                narration_lines=self._lines(line_count),
+            )
+
+        self.assertEqual(generate.call_count, 2)
+        self.assertEqual(
+            len(requested_batches[0]),
+            llm._NARRATION_REQUIREMENT_BATCH_SIZE,
+        )
+        self.assertEqual(len(requested_batches[1]), 3)
+        self.assertEqual(len(result), line_count)
+        self.assertEqual(result[line_count], f"Visible situation {line_count}")
+
+    def test_a_failed_batch_keeps_the_batches_that_answered(self):
+        line_count = llm._NARRATION_REQUIREMENT_BATCH_SIZE + 2
+        responses = []
+
+        def fake_generate_response(prompt, app_config=None):
+            if not responses:
+                responses.append("first")
+                return json.dumps(
+                    [{"index": 1, "visual_requirement": "A visible first situation"}]
+                )
+            return "not json"
+
+        with patch.object(
+            llm, "_generate_response", side_effect=fake_generate_response
+        ):
+            result = llm.generate_narration_visual_requirements(
+                narration_text="A long narration.",
+                narration_lines=self._lines(line_count),
+            )
+
+        self.assertEqual(result, {1: "A visible first situation"})
+
+    def test_a_line_without_spoken_text_is_never_sent(self):
+        with patch.object(llm, "_generate_response") as generate:
+            result = llm.generate_narration_visual_requirements(
+                narration_text="   ",
+                narration_lines=[
+                    {"index": 1, "spoken_text": "   "},
+                    {"index": True, "spoken_text": "A boolean is not a line index."},
+                ],
+            )
+
+        generate.assert_not_called()
+        self.assertIsNone(result)
 
 
 FOUNDRY_KEY = os.environ.get("ANTHROPIC_FOUNDRY_API_KEY", "")

@@ -40,6 +40,7 @@ class TestMaterialTlsVerification(unittest.TestCase):
                     {
                         "id": 321,
                         "url": "https://www.pexels.com/video/example-321/?token=drop",
+                        "image": "https://images.pexels.com/videos/321/preview.jpg?size=large",
                         "duration": 8,
                         "user": {
                             "id": 654,
@@ -76,6 +77,21 @@ class TestMaterialTlsVerification(unittest.TestCase):
             "https://www.pexels.com/@creator/",
         )
         self.assertEqual(results[0].source_info["rendition"]["id"], "987")
+        self.assertEqual(results[0].provider_asset_id, "321")
+        self.assertEqual(
+            results[0].preview_url,
+            "https://images.pexels.com/videos/321/preview.jpg",
+        )
+        self.assertEqual(results[0].width, 1080)
+        self.assertEqual(results[0].height, 1920)
+        self.assertEqual(results[0].orientation, "portrait")
+        self.assertEqual(results[0].rendition_id, "987")
+        self.assertEqual(results[0].search_query, "cat")
+        self.assertEqual(results[0].query_attempt, 1)
+        self.assertEqual(
+            results[0].source_page_url,
+            "https://www.pexels.com/video/example-321/",
+        )
         self.assertIn("per_page=80", get.call_args.args[0])
 
     def test_search_pexels_accepts_best_hd_rendition_without_exact_full_hd(self):
@@ -735,6 +751,9 @@ class TestMaterialTlsVerification(unittest.TestCase):
             record["rendition"],
             {"id": "large", "width": 1920, "height": 1080},
         )
+        self.assertEqual(record["provider"], "pixabay")
+        self.assertEqual(record["provider_asset_id"], "123")
+        self.assertEqual(record["asset_id"], "123")
         self.assertNotIn("secret", serialized)
         self.assertNotIn("/Users/example", serialized)
         self.assertNotIn("private@example.com", serialized)

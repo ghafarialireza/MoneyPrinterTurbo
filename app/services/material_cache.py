@@ -22,6 +22,7 @@ from app.utils import utils
 MATERIAL_SEARCH_CACHE_TTL_SECONDS = 24 * 60 * 60
 _CACHE_FORMAT_VERSION = 2
 _CACHE_CLEANUP_INTERVAL_SECONDS = 60 * 60
+_CACHE_FUTURE_MTIME_TOLERANCE_SECONDS = 5.0
 _CACHE_FILE_PATTERN = re.compile(r"^[0-9a-f]{64}\.json$")
 
 # API 默认允许多个视频任务并发执行。固定数量的锁分片可以让相同搜索条件共用
@@ -58,19 +59,29 @@ def _cached_source_info(item: MaterialInfo) -> dict | None:
     恢复。下载 URL 由 ``MaterialInfo.url`` 单独保存，这里只允许公开素材页、
     作者公开页和稳定业务标识，避免任意扩展字段进入磁盘缓存。
     """
-    source = item.source_info
-    if not isinstance(source, dict) or not source:
-        return None
+    source = item.source_info if isinstance(item.source_info, dict) else {}
 
     cached: dict = {
         "provider": str(source.get("provider") or item.provider),
     }
-    asset_id = source.get("asset_id")
-    source_page = _safe_public_url(source.get("source_page"))
+    asset_id = (
+        item.provider_asset_id
+        or source.get("provider_asset_id")
+        or source.get("asset_id")
+    )
+    source_page = _safe_public_url(
+        item.source_page_url
+        or source.get("source_page_url")
+        or source.get("source_page")
+    )
+    preview_url = _safe_public_url(item.preview_url or source.get("preview_url"))
     if asset_id not in (None, ""):
         cached["asset_id"] = str(asset_id)
+        cached["provider_asset_id"] = str(asset_id)
     if source_page:
         cached["source_page"] = source_page
+    if preview_url:
+        cached["preview_url"] = preview_url
 
     raw_creator = source.get("creator")
     if isinstance(raw_creator, dict):
@@ -88,15 +99,18 @@ def _cached_source_info(item: MaterialInfo) -> dict | None:
             cached["creator"] = creator
 
     raw_rendition = source.get("rendition")
-    if isinstance(raw_rendition, dict):
-        rendition = {}
-        for field in ("id", "width", "height"):
-            value = raw_rendition.get(field)
-            if value not in (None, ""):
-                rendition[field] = str(value) if field == "id" else value
-        if rendition:
-            cached["rendition"] = rendition
-    return cached
+    raw_rendition = raw_rendition if isinstance(raw_rendition, dict) else {}
+    rendition = {}
+    for field, value in {
+        "id": item.rendition_id or raw_rendition.get("id"),
+        "width": item.width or raw_rendition.get("width"),
+        "height": item.height or raw_rendition.get("height"),
+    }.items():
+        if value not in (None, ""):
+            rendition[field] = str(value) if field == "id" else value
+    if rendition:
+        cached["rendition"] = rendition
+    return cached if len(cached) > 1 else None
 
 
 def _cache_dir() -> Path:
@@ -241,7 +255,10 @@ def load_material_search_cache(
     cache_age = current_time - stat_result.st_mtime
     # 系统时间回拨或文件从其它机器复制后，mtime 可能落在未来。此时不能把
     # 缓存长期视为新鲜数据，直接失效并重新请求远端更可靠。
-    if cache_age < 0 or cache_age >= MATERIAL_SEARCH_CACHE_TTL_SECONDS:
+    if (
+        cache_age < -_CACHE_FUTURE_MTIME_TOLERANCE_SECONDS
+        or cache_age >= MATERIAL_SEARCH_CACHE_TTL_SECONDS
+    ):
         _remove_invalid_cache(cache_path)
         return None
 
@@ -279,12 +296,46 @@ def load_material_search_cache(
                 raise ValueError("invalid material fields")
             source_info = dict(source_info)
             source_info["search_term"] = search_term
+            provider_asset_id = source_info.get(
+                "provider_asset_id"
+            ) or source_info.get("asset_id")
+            rendition = source_info.get("rendition")
+            rendition = rendition if isinstance(rendition, dict) else {}
+            try:
+                width = int(rendition.get("width"))
+                height = int(rendition.get("height"))
+            except (TypeError, ValueError):
+                width = None
+                height = None
+            orientation = None
+            if width and height:
+                if width == height:
+                    orientation = "square"
+                else:
+                    orientation = "landscape" if width > height else "portrait"
             items.append(
                 MaterialInfo(
                     provider=item_provider,
                     url=item_url,
                     duration=int(item_duration),
                     source_info=source_info,
+                    provider_asset_id=(
+                        str(provider_asset_id)
+                        if provider_asset_id not in (None, "")
+                        else None
+                    ),
+                    preview_url=_safe_public_url(source_info.get("preview_url")),
+                    width=width,
+                    height=height,
+                    orientation=orientation,
+                    rendition_id=(
+                        str(rendition.get("id"))
+                        if rendition.get("id") not in (None, "")
+                        else None
+                    ),
+                    search_query=search_term,
+                    query_attempt=1,
+                    source_page_url=_safe_public_url(source_info.get("source_page")),
                 )
             )
     except (OSError, ValueError, TypeError) as exc:
@@ -426,7 +477,11 @@ def cleanup_expired_material_search_cache(
                 if not entry.is_file(follow_symlinks=False):
                     continue
                 cache_age = current_time - entry.stat(follow_symlinks=False).st_mtime
-                if 0 <= cache_age < MATERIAL_SEARCH_CACHE_TTL_SECONDS:
+                if (
+                    -_CACHE_FUTURE_MTIME_TOLERANCE_SECONDS
+                    <= cache_age
+                    < MATERIAL_SEARCH_CACHE_TTL_SECONDS
+                ):
                     continue
                 os.unlink(entry.path)
                 deleted_count += 1

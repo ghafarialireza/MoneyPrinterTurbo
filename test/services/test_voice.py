@@ -43,6 +43,14 @@ RUN_INTEGRATION_TESTS = os.environ.get("MPT_RUN_INTEGRATION_TESTS", "").lower() 
     "true",
     "yes",
 }
+
+
+def _timed_cue(start_time, end_time, text):
+    return SimpleNamespace(
+        start=timedelta(seconds=start_time),
+        end=timedelta(seconds=end_time),
+        content=text,
+    )
                     
 class TestVoiceService(unittest.TestCase):
     def setUp(self):
@@ -289,6 +297,174 @@ class TestVoiceService(unittest.TestCase):
             self.assertEqual(len(sub_maker.events), 1)
             self.assertEqual(sub_maker.events[0]["type"], "WordBoundary")
 
+    def test_edge_word_boundaries_become_script_aligned_timed_units(self):
+        script = (
+            "Bright red coffee cherries grow on the plant.\n"
+            "Workers pick the ripe cherries by hand."
+        )
+        words = (
+            "Bright red coffee cherries grow on the plant "
+            "Workers pick the ripe cherries by hand"
+        ).split()
+        cues = [
+            _timed_cue(0.25 + index * 0.3, 0.47 + index * 0.3, word)
+            for index, word in enumerate(words)
+        ]
+        sub_maker = SimpleNamespace(cues=cues, type="WordBoundary")
+
+        units = vs.extract_timed_narration_units(
+            sub_maker=sub_maker,
+            narration_text=script,
+            timing_source="edge_tts_boundary",
+            audio_duration=5.0,
+        )
+
+        self.assertEqual([unit.text for unit in units], words)
+        self.assertEqual(
+            [unit.index for unit in units],
+            list(range(1, len(words) + 1)),
+        )
+        self.assertEqual(units[0].start_time, 0.25)
+        self.assertLess(units[-1].end_time, 5.0)
+        self.assertEqual(units[0].timing_quality, "boundary")
+        self.assertEqual(units[0].source_boundary_type, "WordBoundary")
+        self.assertEqual(script[units[0].script_start_char : units[0].script_end_char], "Bright")
+        repeated = [unit for unit in units if unit.text == "cherries"]
+        self.assertEqual(len(repeated), 2)
+        self.assertLess(repeated[0].script_start_char, repeated[1].script_start_char)
+
+    def test_coarse_multiword_cue_is_not_split_or_claimed_as_word_timing(self):
+        sub_maker = SimpleNamespace(
+            cues=[
+                _timed_cue(0.2, 1.1, "Workers pick"),
+                _timed_cue(1.2, 2.0, "ripe cherries"),
+            ],
+            type="SentenceBoundary",
+        )
+
+        units = vs.extract_timed_narration_units(
+            sub_maker=sub_maker,
+            narration_text="Workers pick ripe cherries.",
+            timing_source="edge_tts_boundary",
+            audio_duration=2.5,
+        )
+
+        self.assertEqual([unit.text for unit in units], ["Workers pick", "ripe cherries"])
+        self.assertEqual(units[0].source_boundary_type, "SentenceBoundary")
+        self.assertEqual(units[0].start_time, 0.2)
+        self.assertEqual(units[0].end_time, 1.1)
+
+    def test_azure_v2_legacy_word_offsets_become_timed_units(self):
+        sub_maker = SimpleNamespace(
+            cues=[],
+            subs=["Bright", "red"],
+            offset=[(2_500_000, 5_000_000), (6_000_000, 9_000_000)],
+        )
+
+        units = vs.extract_timed_narration_units(
+            sub_maker=sub_maker,
+            narration_text="Bright red.",
+            timing_source="azure_tts_boundary",
+            audio_duration=1.5,
+        )
+
+        self.assertEqual([unit.text for unit in units], ["Bright", "red"])
+        self.assertEqual(units[0].start_time, 0.25)
+        self.assertEqual(units[1].end_time, 0.9)
+        self.assertEqual(units[0].source_boundary_type, "WordBoundary")
+        self.assertEqual(units[0].timing_source, "azure_tts_boundary")
+        self.assertEqual(units[0].timing_quality, "boundary")
+
+    def test_estimated_multilingual_units_align_without_false_precision(self):
+        script = "العامل يُزيل الألواح، ثم يتوقف.\n工人挑选咖啡豆。\nDon't stop."
+        sub_maker = SimpleNamespace(
+            cues=[],
+            subs=[
+                "العامل يزيل الألواح",
+                "ثم يتوقف",
+                "工人挑选咖啡豆",
+                "Don’t stop",
+            ],
+            offset=[
+                (0, 10_000_000),
+                (10_000_000, 18_000_000),
+                (18_000_000, 28_000_000),
+                (28_000_000, 36_000_000),
+            ],
+        )
+
+        units = vs.extract_timed_narration_units(
+            sub_maker=sub_maker,
+            narration_text=script,
+            timing_source="estimated",
+            audio_duration=4.0,
+        )
+
+        self.assertEqual(len(units), 4)
+        self.assertTrue(all(unit.timing_quality == "estimated" for unit in units))
+        self.assertTrue(
+            all(unit.source_boundary_type == "EstimatedScriptSegment" for unit in units)
+        )
+        self.assertEqual(units[2].text, "工人挑选咖啡豆")
+        self.assertEqual(units[3].text, "Don’t stop")
+
+    def test_timed_unit_validation_rejects_malformed_timing(self):
+        cases = (
+            [
+                _timed_cue(0.2, 1.0, "one"),
+                _timed_cue(0.9, 1.2, "two"),
+            ],
+            [_timed_cue(0.2, 0.2, "one"), _timed_cue(0.3, 0.6, "two")],
+            [_timed_cue(0.2, 0.8, "one"), _timed_cue(0.9, 2.1, "two")],
+        )
+        for cues in cases:
+            with self.subTest(cues=cues), self.assertRaises(ValueError):
+                vs.extract_timed_narration_units(
+                    sub_maker=SimpleNamespace(cues=cues, type="WordBoundary"),
+                    narration_text="one two",
+                    timing_source="edge_tts_boundary",
+                    audio_duration=2.0,
+                )
+
+        valid = vs.extract_timed_narration_units(
+            sub_maker=SimpleNamespace(
+                cues=[
+                    _timed_cue(0.2, 0.8, "one"),
+                    _timed_cue(0.9, 1.2, "two"),
+                ],
+                type="WordBoundary",
+            ),
+            narration_text="one two",
+            timing_source="edge_tts_boundary",
+            audio_duration=2.0,
+        )
+        valid[1].index = 1
+        with self.assertRaisesRegex(ValueError, "duplicate"):
+            vs.validate_timed_narration_units(valid, 2.0)
+
+    def test_extracting_timed_units_does_not_change_subtitle_output(self):
+        script = "Bright red."
+        sub_maker = SimpleNamespace(
+            cues=[
+                _timed_cue(0.2, 0.6, "Bright"),
+                _timed_cue(0.7, 1.0, "red"),
+            ],
+            type="WordBoundary",
+        )
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            before = Path(tmp_dir) / "before.srt"
+            after = Path(tmp_dir) / "after.srt"
+            vs.create_subtitle(sub_maker, script, str(before))
+            vs.extract_timed_narration_units(
+                sub_maker=sub_maker,
+                narration_text=script,
+                timing_source="edge_tts_boundary",
+                audio_duration=1.5,
+            )
+            vs.create_subtitle(sub_maker, script, str(after))
+
+            self.assertEqual(before.read_text(encoding="utf-8"), after.read_text(encoding="utf-8"))
+
     def test_azure_tts_v1_times_out_hanging_stream_sync(self):
         """
         验证 Azure TTS V1 在 edge_tts 同步流卡住时能够快速失败。
@@ -296,7 +472,7 @@ class TestVoiceService(unittest.TestCase):
         真实现场里，网络异常、服务端限流、voice 语言与文本不匹配时，
         `stream_sync()` 可能长时间不返回，导致 WebUI 任务只停在
         `start, voice name...`。这里用阻塞的 fake stream 复现该场景，
-        确认超时保护会让函数结束并返回 None。
+        确认超时保护会让函数结束并抛出可分类的安全错误。
         """
 
         class _HangingCommunicate:
@@ -317,26 +493,167 @@ class TestVoiceService(unittest.TestCase):
             def get_srt(self):
                 return ""
 
-        with tempfile.TemporaryDirectory() as tmp_dir, patch.object(
-            vs.edge_tts, "Communicate", _HangingCommunicate
-        ), patch.object(vs.edge_tts, "SubMaker", _FakeSubMaker), patch.object(
-            vs.config,
-            "app",
-            dict(vs.config.app, edge_tts_timeout=0.05),
+        with (
+            tempfile.TemporaryDirectory() as tmp_dir,
+            patch.object(vs.edge_tts, "Communicate", _HangingCommunicate),
+            patch.object(vs.edge_tts, "SubMaker", _FakeSubMaker),
+            patch.object(
+                vs.config,
+                "app",
+                dict(vs.config.app, edge_tts_timeout=0.05),
+            ),
+            patch.object(vs, "_EDGE_TTS_RETRY_BACKOFF_SECONDS", 0),
         ):
             voice_file = Path(tmp_dir) / "hanging-edge-tts.mp3"
             started_at = time.monotonic()
+            with self.assertRaises(vs.TTSServiceError) as raised:
+                vs.azure_tts_v1(
+                    text="帮我生成一个花开花落的视频",
+                    voice_name="en-AU-NatashaNeural-Female",
+                    voice_file=str(voice_file),
+                    voice_rate=1.0,
+                )
+            elapsed = time.monotonic() - started_at
+            self.assertFalse(voice_file.exists())
+
+        self.assertEqual(raised.exception.category, "network")
+        self.assertLess(elapsed, 2)
+
+    def test_azure_tts_progressing_stream_can_exceed_inactivity_timeout(self):
+        class _ProgressingCommunicate:
+            def __init__(self, text, voice, rate="+0%", boundary=None):
+                pass
+
+            def stream_sync(self):
+                for _ in range(5):
+                    time.sleep(0.015)
+                    yield {"type": "audio", "data": b"audio"}
+                time.sleep(0.015)
+                yield {
+                    "type": "WordBoundary",
+                    "offset": 0,
+                    "duration": 10000000,
+                    "text": "active",
+                }
+
+        class _FakeSubMaker:
+            def __init__(self):
+                self.events = []
+
+            def feed(self, chunk):
+                self.events.append(chunk)
+
+            def get_srt(self):
+                return (
+                    "1\n00:00:00,000 --> 00:00:01,000\nactive\n" if self.events else ""
+                )
+
+        with (
+            tempfile.TemporaryDirectory() as tmp_dir,
+            patch.object(vs.edge_tts, "Communicate", _ProgressingCommunicate),
+            patch.object(vs.edge_tts, "SubMaker", _FakeSubMaker),
+            patch.object(
+                vs.config,
+                "app",
+                dict(
+                    vs.config.app,
+                    edge_tts_timeout=0.03,
+                    edge_tts_overall_timeout=1.0,
+                ),
+            ),
+        ):
+            voice_file = Path(tmp_dir) / "progressing-edge-tts.mp3"
+            started_at = time.monotonic()
             sub_maker = vs.azure_tts_v1(
-                text="帮我生成一个花开花落的视频",
-                voice_name="en-AU-NatashaNeural-Female",
+                text="active stream",
+                voice_name="en-US-AriaNeural-Female",
                 voice_file=str(voice_file),
                 voice_rate=1.0,
             )
             elapsed = time.monotonic() - started_at
-            self.assertFalse(voice_file.exists())
 
-        self.assertIsNone(sub_maker)
-        self.assertLess(elapsed, 2)
+            self.assertIsNotNone(sub_maker)
+            self.assertGreater(elapsed, 0.03)
+            self.assertEqual(voice_file.read_bytes(), b"audio" * 5)
+
+    def test_azure_tts_retries_transient_failures_and_cleans_partial_audio(self):
+        attempts = 0
+
+        class _RetryingCommunicate:
+            def __init__(self, text, voice, rate="+0%", boundary=None):
+                nonlocal attempts
+                attempts += 1
+                self.attempt = attempts
+
+            def stream_sync(self):
+                if self.attempt < 3:
+                    yield {"type": "audio", "data": b"partial"}
+                    raise ConnectionError("temporary network failure")
+                yield {"type": "audio", "data": b"complete"}
+                yield {
+                    "type": "WordBoundary",
+                    "offset": 0,
+                    "duration": 10000000,
+                    "text": "complete",
+                }
+
+        class _FakeSubMaker:
+            def __init__(self):
+                self.events = []
+
+            def feed(self, chunk):
+                self.events.append(chunk)
+
+            def get_srt(self):
+                return "valid" if self.events else ""
+
+        with (
+            tempfile.TemporaryDirectory() as tmp_dir,
+            patch.object(vs.edge_tts, "Communicate", _RetryingCommunicate),
+            patch.object(vs.edge_tts, "SubMaker", _FakeSubMaker),
+            patch.object(vs.time, "sleep") as sleep,
+        ):
+            voice_file = Path(tmp_dir) / "retrying-edge-tts.mp3"
+            result = vs.azure_tts_v1(
+                text="retry stream",
+                voice_name="en-US-AriaNeural-Female",
+                voice_file=str(voice_file),
+                voice_rate=1.0,
+            )
+            final_audio = voice_file.read_bytes()
+
+        self.assertIsNotNone(result)
+        self.assertEqual(attempts, 3)
+        self.assertEqual(final_audio, b"complete")
+        self.assertEqual([item.args[0] for item in sleep.call_args_list], [1.0, 2.0])
+
+    def test_azure_tts_invalid_voice_is_not_retried(self):
+        attempts = 0
+
+        class _InvalidVoiceCommunicate:
+            def __init__(self, text, voice, rate="+0%", boundary=None):
+                nonlocal attempts
+                attempts += 1
+                raise ValueError("invalid voice")
+
+        with (
+            tempfile.TemporaryDirectory() as tmp_dir,
+            patch.object(vs.edge_tts, "Communicate", _InvalidVoiceCommunicate),
+            patch.object(vs.time, "sleep") as sleep,
+        ):
+            voice_file = Path(tmp_dir) / "invalid-voice.mp3"
+            with self.assertRaises(vs.TTSServiceError) as raised:
+                vs.azure_tts_v1(
+                    text="voice test",
+                    voice_name="invalid-voice",
+                    voice_file=str(voice_file),
+                    voice_rate=1.0,
+                )
+
+        self.assertEqual(raised.exception.category, "voice")
+        self.assertEqual(attempts, 1)
+        sleep.assert_not_called()
+        self.assertFalse(voice_file.exists())
 
     @unittest.skipUnless(
         RUN_INTEGRATION_TESTS,
@@ -960,6 +1277,82 @@ class TestVoiceService(unittest.TestCase):
                     "the whole trip"
                 )
             ],
+        )
+
+    def test_script_split_keeps_ordinary_english_commas_inside_sentence(self):
+        text = (
+            "Workers inspect the wall, remove damaged boards, and clean the frame. "
+            "The structure is then ready."
+        )
+
+        self.assertEqual(
+            utils.split_string_by_punctuations(text),
+            [
+                "Workers inspect the wall, remove damaged boards, and clean the frame",
+                "The structure is then ready",
+            ],
+        )
+
+    def test_edge_cue_aggregation_splits_one_cue_across_punctuation(self):
+        script_lines = ["First sentence", "Second sentence"]
+        sub_maker = SimpleNamespace(
+            cues=[
+                SimpleNamespace(
+                    content="First sentence. Second sentence.",
+                    start=timedelta(seconds=0),
+                    end=timedelta(seconds=4),
+                )
+            ]
+        )
+
+        sub_items = vs._build_subtitle_items_from_edge_cues(
+            sub_maker,
+            script_lines,
+        )
+
+        self.assertEqual(len(sub_items), 2)
+        self.assertIn("First sentence", sub_items[0])
+        self.assertIn("Second sentence", sub_items[1])
+        self.assertNotIn("00:00:00,000 --> 00:00:00,000", "\n".join(sub_items))
+
+    def test_create_subtitle_handles_seven_sentences_in_separate_paragraphs(self):
+        sentences = [
+            "Sentence one introduces the subject",
+            "Sentence two contains a natural, ordinary comma",
+            "Sentence three explains the action",
+            "Sentence four adds visible detail",
+            "Sentence five continues the narration",
+            "Sentence six gives the result",
+            "Sentence seven closes the story",
+        ]
+        text = ".\n\n".join(sentences) + "."
+        sub_maker = SimpleNamespace(
+            cues=[
+                SimpleNamespace(
+                    content=". ".join(sentences[:3]) + ".",
+                    start=timedelta(seconds=0),
+                    end=timedelta(seconds=6),
+                ),
+                SimpleNamespace(
+                    content=". ".join(sentences[3:]) + ".",
+                    start=timedelta(seconds=6),
+                    end=timedelta(seconds=14),
+                ),
+            ]
+        )
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            subtitle_file = Path(tmp_dir) / "seven-sentences.srt"
+            vs.create_subtitle(sub_maker, text, str(subtitle_file))
+            subtitle_items = task_service.subtitle.file_to_subtitles(str(subtitle_file))
+
+        self.assertEqual(len(subtitle_items), 7)
+        self.assertEqual([item[2] for item in subtitle_items], sentences)
+        self.assertTrue(
+            all(
+                "00:00:00,000 --> 00:00:00,000" not in item[1]
+                for item in subtitle_items
+            )
         )
 
     def test_edge_cue_aggregation_handles_thousand_separator_comma(self):

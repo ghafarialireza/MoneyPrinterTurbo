@@ -14,12 +14,19 @@ from loguru import logger
 from app.config import config
 from app.models import const
 from app.models.schema import (
+    NarrationOverlap,
     NarrationSlot,
     NarrationTimingQuality,
     NarrationTimingSource,
+    RenderSegment,
+    SemanticVisualSpan,
+    TimedNarrationUnit,
     VideoConcatMode,
     VideoParams,
+    VisualBeat,
+    VisualRequirementSpec,
     VisualSlot,
+    VISUAL_BEAT_RAPID_CUT_SECONDS,
 )
 from app.services import bgm as bgm_service
 from app.services import (
@@ -59,6 +66,17 @@ _ACTIVE_CROSS_POST_STATES = {
     const.CROSS_POST_STATE_PROCESSING,
 }
 _CROSS_POST_STATE_WRITE_ATTEMPTS = 3
+_SEMANTIC_VISUAL_REQUIREMENT_MAX_CHARS = 240
+_SEMANTIC_SPAN_OUTPUT_FIELDS = {
+    "start_unit",
+    "end_unit_exclusive",
+    "visual_requirement",
+}
+_VISUAL_BEAT_PREFERRED_MIN_SECONDS = 2.0
+_VISUAL_BEAT_RAPID_CUT_SECONDS = VISUAL_BEAT_RAPID_CUT_SECONDS
+_VISUAL_BEAT_PREFERRED_MAX_SECONDS = 5.0
+_VISUAL_BEAT_LONG_SPLIT_TARGET_SECONDS = 4.0
+_VISUAL_BEAT_TIME_TOLERANCE_SECONDS = 1e-6
 _CROSS_POST_STATE_RETRY_DELAY_SECONDS = 0.1
 _LOOMLOOM_STATE_WRITE_ATTEMPTS = 3
 _LOOMLOOM_STATE_RETRY_DELAY_SECONDS = 0.1
@@ -377,6 +395,37 @@ def resolve_narration_timing_source(
     return "edge_tts_boundary"
 
 
+def resolve_timed_narration_timing_source(
+    params: VideoParams,
+    sub_maker,
+) -> NarrationTimingSource | None:
+    """Resolve the strongest timing carried by the TTS result itself.
+
+    This intentionally does not inspect ``subtitle_provider``. Display subtitles
+    may use Whisper while an Edge/Azure TTS result still carries more direct word
+    boundaries that should remain available as an independent timing artifact.
+    """
+    if sub_maker is None:
+        return None
+
+    voice_name = voice.parse_voice_name(params.voice_name or "")
+    if voice.is_azure_v2_voice(voice_name):
+        return "azure_tts_boundary"
+    if any(
+        (
+            voice.is_siliconflow_voice(voice_name),
+            voice.is_gemini_voice(voice_name),
+            voice.is_mimo_voice(voice_name),
+            voice.is_minimax_voice(voice_name),
+            voice.is_elevenlabs_voice(voice_name),
+            voice.is_chatterbox_voice(voice_name),
+            voice.is_no_voice(voice_name),
+        )
+    ):
+        return "estimated"
+    return "edge_tts_boundary"
+
+
 def _timing_quality(
     timing_source: NarrationTimingSource,
 ) -> NarrationTimingQuality:
@@ -482,6 +531,1030 @@ def build_narration_slots(
     return narration_slots
 
 
+def associate_timed_units_with_narration_slots(
+    timed_units: list[TimedNarrationUnit],
+    narration_slots: list[NarrationSlot],
+) -> list[TimedNarrationUnit]:
+    """Associate units by exact normalized text position, never fuzzy matching."""
+    if not timed_units:
+        return []
+    if not narration_slots:
+        raise ValueError("timed narration units require narration slots")
+
+    unit_ranges: list[tuple[int, int, TimedNarrationUnit]] = []
+    unit_cursor = 0
+    for unit in timed_units:
+        normalized = voice.normalize_timing_alignment_text(unit.text)
+        unit_end = unit_cursor + len(normalized)
+        unit_ranges.append((unit_cursor, unit_end, unit))
+        unit_cursor = unit_end
+
+    slot_ranges: list[tuple[int, int, NarrationSlot]] = []
+    slot_cursor = 0
+    for narration_slot in narration_slots:
+        normalized = voice.normalize_timing_alignment_text(narration_slot.text)
+        slot_end = slot_cursor + len(normalized)
+        slot_ranges.append((slot_cursor, slot_end, narration_slot))
+        slot_cursor = slot_end
+
+    unit_text = "".join(
+        voice.normalize_timing_alignment_text(unit.text) for unit in timed_units
+    )
+    slot_text = "".join(
+        voice.normalize_timing_alignment_text(slot.text) for slot in narration_slots
+    )
+    if unit_cursor != slot_cursor or unit_text != slot_text:
+        raise ValueError("timed narration units do not align with narration slots")
+
+    slot_position = 0
+    for unit_start, unit_end, unit in unit_ranges:
+        while (
+            slot_position < len(slot_ranges)
+            and unit_start >= slot_ranges[slot_position][1]
+        ):
+            slot_position += 1
+        if slot_position >= len(slot_ranges):
+            raise ValueError("timed narration unit is outside narration slots")
+        slot_start, slot_end, narration_slot = slot_ranges[slot_position]
+        if unit_start >= slot_start and unit_end <= slot_end:
+            unit.source_narration_slot_index = narration_slot.index
+        else:
+            # A coarse provider cue can genuinely cross a sentence/SRT boundary.
+            # Keep its timing and text intact, but do not claim one source slot.
+            unit.source_narration_slot_index = None
+    return timed_units
+
+
+def validate_semantic_visual_span_specs(
+    raw_specs,
+    unit_count: int,
+) -> list[dict]:
+    """Validate complete unit coverage without trusting any LLM-authored text."""
+    if unit_count <= 0:
+        raise ValueError("semantic span validation requires narration units")
+    if not isinstance(raw_specs, list) or not raw_specs:
+        raise ValueError("semantic span response must be a non-empty JSON array")
+
+    validated: list[dict] = []
+    expected_start = 0
+    for position, raw_spec in enumerate(raw_specs, start=1):
+        if not isinstance(raw_spec, dict):
+            raise ValueError(f"semantic span {position} must be an object")
+        if set(raw_spec) != _SEMANTIC_SPAN_OUTPUT_FIELDS:
+            raise ValueError(f"semantic span {position} contains unsupported fields")
+
+        start_unit = raw_spec["start_unit"]
+        end_unit_exclusive = raw_spec["end_unit_exclusive"]
+        if (
+            isinstance(start_unit, bool)
+            or not isinstance(start_unit, int)
+            or isinstance(end_unit_exclusive, bool)
+            or not isinstance(end_unit_exclusive, int)
+        ):
+            raise ValueError("semantic span unit indexes must be integers")
+        if start_unit != expected_start:
+            raise ValueError("semantic spans contain a gap, overlap, or reordering")
+        if start_unit < 0 or end_unit_exclusive > unit_count:
+            raise ValueError("semantic span unit index is outside narration units")
+        if start_unit >= end_unit_exclusive:
+            raise ValueError("semantic span must contain at least one narration unit")
+
+        visual_requirement = raw_spec["visual_requirement"]
+        if not isinstance(visual_requirement, str) or not visual_requirement.strip():
+            raise ValueError("semantic span visual_requirement must be non-empty")
+        visual_requirement = visual_requirement.strip()
+        if len(visual_requirement) > _SEMANTIC_VISUAL_REQUIREMENT_MAX_CHARS:
+            raise ValueError("semantic span visual_requirement is too long")
+
+        validated.append(
+            {
+                "start_unit": start_unit,
+                "end_unit_exclusive": end_unit_exclusive,
+                "visual_requirement": visual_requirement,
+            }
+        )
+        expected_start = end_unit_exclusive
+
+    if expected_start != unit_count:
+        raise ValueError("semantic spans do not cover every narration unit")
+    return validated
+
+
+def reconstruct_semantic_spoken_text(
+    narration_script: str,
+    timed_units: list[TimedNarrationUnit],
+    start_unit: int,
+    end_unit_exclusive: int,
+) -> str:
+    """Slice source narration by S1 offsets; never use LLM-authored source text."""
+    if not (0 <= start_unit < end_unit_exclusive <= len(timed_units)):
+        raise ValueError("semantic spoken-text range is outside narration units")
+
+    first = timed_units[start_unit]
+    if first.script_start_char is None:
+        raise ValueError("semantic spoken-text range has no source offset")
+    start_char = 0 if start_unit == 0 else first.script_start_char
+    if end_unit_exclusive == len(timed_units):
+        end_char = len(narration_script)
+    else:
+        end_char = timed_units[end_unit_exclusive].script_start_char
+        if end_char is None:
+            raise ValueError("semantic spoken-text range has no source offset")
+    if start_char < 0 or end_char <= start_char or end_char > len(narration_script):
+        raise ValueError("semantic spoken-text source offsets are invalid")
+
+    spoken_text = narration_script[start_char:end_char].strip()
+    expected = "".join(
+        voice.normalize_timing_alignment_text(unit.text)
+        for unit in timed_units[start_unit:end_unit_exclusive]
+    )
+    if not spoken_text or voice.normalize_timing_alignment_text(spoken_text) != expected:
+        raise ValueError("semantic spoken text does not match its source units")
+    return spoken_text
+
+
+def _semantic_span_slot_indexes(
+    timed_units: list[TimedNarrationUnit],
+    narration_slots: list[NarrationSlot],
+    start_unit: int,
+    end_unit_exclusive: int,
+) -> list[int]:
+    normalized_units = [
+        voice.normalize_timing_alignment_text(unit.text) for unit in timed_units
+    ]
+    normalized_slots = [
+        voice.normalize_timing_alignment_text(slot.text) for slot in narration_slots
+    ]
+    unit_lengths = [len(text) for text in normalized_units]
+    slot_lengths = [len(text) for text in normalized_slots]
+    if "".join(normalized_units) == "".join(normalized_slots):
+        span_start = sum(unit_lengths[:start_unit])
+        span_end = sum(unit_lengths[:end_unit_exclusive])
+        result: list[int] = []
+        slot_start = 0
+        for narration_slot, slot_length in zip(narration_slots, slot_lengths):
+            slot_end = slot_start + slot_length
+            if slot_start < span_end and slot_end > span_start:
+                result.append(narration_slot.index)
+            slot_start = slot_end
+        if result:
+            return result
+
+    return list(
+        dict.fromkeys(
+            unit.source_narration_slot_index
+            for unit in timed_units[start_unit:end_unit_exclusive]
+            if unit.source_narration_slot_index is not None
+        )
+    )
+
+
+def _semantic_span_timing(
+    units: list[TimedNarrationUnit] | list[SemanticVisualSpan],
+) -> tuple[NarrationTimingSource, NarrationTimingQuality]:
+    """Collapse the timing provenance of several ordered pieces into one pair.
+
+    Accepts timed units or already-built spans: merging spans has to answer the
+    same question about the pieces it absorbs, and the answer must degrade the
+    same way -- one shared source or "estimated", and the weakest quality wins.
+    """
+    timing_sources = {unit.timing_source for unit in units}
+    timing_source: NarrationTimingSource = (
+        next(iter(timing_sources)) if len(timing_sources) == 1 else "estimated"
+    )
+    qualities = {unit.timing_quality for unit in units}
+    if "estimated" in qualities:
+        timing_quality: NarrationTimingQuality = "estimated"
+    elif "speech_recognition" in qualities:
+        timing_quality = "speech_recognition"
+    else:
+        timing_quality = "boundary"
+    return timing_source, timing_quality
+
+
+def _bounded_fallback_visual_requirement(text: str) -> str:
+    compacted = " ".join(str(text or "").split())
+    if len(compacted) <= _SEMANTIC_VISUAL_REQUIREMENT_MAX_CHARS:
+        return compacted
+    prefix = compacted[: _SEMANTIC_VISUAL_REQUIREMENT_MAX_CHARS - 3]
+    word_boundary = prefix.rfind(" ")
+    if word_boundary > _SEMANTIC_VISUAL_REQUIREMENT_MAX_CHARS // 2:
+        prefix = prefix[:word_boundary]
+    return prefix.rstrip() + "..."
+
+
+def build_semantic_visual_spans_from_specs(
+    narration_script: str,
+    timed_units: list[TimedNarrationUnit],
+    narration_slots: list[NarrationSlot],
+    raw_specs,
+) -> list[SemanticVisualSpan]:
+    specs = validate_semantic_visual_span_specs(raw_specs, len(timed_units))
+    spans: list[SemanticVisualSpan] = []
+    for index, spec in enumerate(specs, start=1):
+        start_unit = spec["start_unit"]
+        end_unit_exclusive = spec["end_unit_exclusive"]
+        source_units = timed_units[start_unit:end_unit_exclusive]
+        timing_source, timing_quality = _semantic_span_timing(source_units)
+        spans.append(
+            SemanticVisualSpan(
+                index=index,
+                start_unit=start_unit,
+                end_unit_exclusive=end_unit_exclusive,
+                spoken_text=reconstruct_semantic_spoken_text(
+                    narration_script,
+                    timed_units,
+                    start_unit,
+                    end_unit_exclusive,
+                ),
+                visual_requirement=spec["visual_requirement"],
+                source_narration_slot_indexes=_semantic_span_slot_indexes(
+                    timed_units,
+                    narration_slots,
+                    start_unit,
+                    end_unit_exclusive,
+                ),
+                start_time=source_units[0].start_time,
+                end_time=source_units[-1].end_time,
+                timing_source=timing_source,
+                timing_quality=timing_quality,
+                grouping_source="llm",
+            )
+        )
+    return spans
+
+
+def build_narration_slot_semantic_fallback(
+    narration_script: str,
+    timed_units: list[TimedNarrationUnit],
+    narration_slots: list[NarrationSlot],
+) -> list[SemanticVisualSpan]:
+    """Build deterministic slot-led spans, preserving indivisible coarse units."""
+    if not narration_slots:
+        return []
+    if not timed_units:
+        return [
+            SemanticVisualSpan(
+                index=index,
+                start_unit=None,
+                end_unit_exclusive=None,
+                spoken_text=slot.text,
+                visual_requirement=_bounded_fallback_visual_requirement(slot.text),
+                source_narration_slot_indexes=[slot.index],
+                start_time=slot.start_time,
+                end_time=slot.end_time,
+                timing_source=slot.timing_source,
+                timing_quality=_timing_quality(slot.timing_source),
+                grouping_source="narration_slot_fallback",
+            )
+            for index, slot in enumerate(narration_slots, start=1)
+        ]
+
+    normalized_units = [
+        voice.normalize_timing_alignment_text(unit.text) for unit in timed_units
+    ]
+    normalized_slots = [
+        voice.normalize_timing_alignment_text(slot.text) for slot in narration_slots
+    ]
+    unit_lengths = [len(text) for text in normalized_units]
+    slot_lengths = [len(text) for text in normalized_slots]
+    if "".join(normalized_units) != "".join(normalized_slots):
+        raise ValueError("narration-slot fallback text does not align with timing units")
+
+    slot_boundaries: set[int] = set()
+    slot_cursor = 0
+    for slot_length in slot_lengths[:-1]:
+        slot_cursor += slot_length
+        slot_boundaries.add(slot_cursor)
+
+    cuts = [0]
+    unit_cursor = 0
+    for unit_index, unit_length in enumerate(unit_lengths, start=1):
+        unit_cursor += unit_length
+        if unit_cursor in slot_boundaries:
+            cuts.append(unit_index)
+    cuts.append(len(timed_units))
+
+    spans: list[SemanticVisualSpan] = []
+    for start_unit, end_unit_exclusive in zip(cuts, cuts[1:]):
+        source_units = timed_units[start_unit:end_unit_exclusive]
+        timing_source, timing_quality = _semantic_span_timing(source_units)
+        spoken_text = reconstruct_semantic_spoken_text(
+            narration_script,
+            timed_units,
+            start_unit,
+            end_unit_exclusive,
+        )
+        spans.append(
+            SemanticVisualSpan(
+                index=len(spans) + 1,
+                start_unit=start_unit,
+                end_unit_exclusive=end_unit_exclusive,
+                spoken_text=spoken_text,
+                visual_requirement=_bounded_fallback_visual_requirement(spoken_text),
+                source_narration_slot_indexes=_semantic_span_slot_indexes(
+                    timed_units,
+                    narration_slots,
+                    start_unit,
+                    end_unit_exclusive,
+                ),
+                start_time=source_units[0].start_time,
+                end_time=source_units[-1].end_time,
+                timing_source=timing_source,
+                timing_quality=timing_quality,
+                grouping_source="narration_slot_fallback",
+            )
+        )
+    return spans
+
+
+def _consolidate_repaired_spans(
+    narration_script: str,
+    timed_units: list[TimedNarrationUnit],
+    spans: list[SemanticVisualSpan],
+    requirements: dict[int, str],
+) -> list[SemanticVisualSpan]:
+    """Rebuild the timeline around the lines that have visible content.
+
+    Every span whose line has no filmable requirement is absorbed by the nearest
+    span that has one -- the previous one, or the first one for a run of leading
+    lines. This is the free version of the material stage's unfillable-beat
+    merge: it happens before a single stock request, so nothing is spent proving
+    that "Patient." has no footage, and the narration timing never moves because
+    the absorbing span simply covers the absorbed window too.
+
+    Returns an empty list when no line has visible content, which cannot be
+    consolidated into anything and must be handled by the caller.
+    """
+    groups: list[tuple[str, list[SemanticVisualSpan]]] = []
+    leading: list[SemanticVisualSpan] = []
+    for span in spans:
+        requirement = requirements.get(span.index)
+        if requirement:
+            groups.append((requirement, [span]))
+        elif groups:
+            groups[-1][1].append(span)
+        else:
+            leading.append(span)
+    if not groups:
+        return []
+    if leading:
+        groups[0] = (groups[0][0], leading + groups[0][1])
+
+    merged: list[SemanticVisualSpan] = []
+    for position, (requirement, members) in enumerate(groups, start=1):
+        first = members[0]
+        last = members[-1]
+        start_unit = first.start_unit
+        end_unit_exclusive = last.end_unit_exclusive
+        if timed_units and start_unit is not None and end_unit_exclusive is not None:
+            spoken_text = reconstruct_semantic_spoken_text(
+                narration_script,
+                timed_units,
+                start_unit,
+                end_unit_exclusive,
+            )
+            timing_source, timing_quality = _semantic_span_timing(
+                timed_units[start_unit:end_unit_exclusive]
+            )
+        else:
+            spoken_text = " ".join(
+                member.spoken_text.strip()
+                for member in members
+                if member.spoken_text.strip()
+            )
+            timing_source, timing_quality = _semantic_span_timing(members)
+        merged.append(
+            SemanticVisualSpan(
+                index=position,
+                start_unit=start_unit,
+                end_unit_exclusive=end_unit_exclusive,
+                spoken_text=spoken_text,
+                visual_requirement=requirement,
+                source_narration_slot_indexes=list(
+                    dict.fromkeys(
+                        slot_index
+                        for member in members
+                        for slot_index in member.source_narration_slot_indexes
+                    )
+                ),
+                start_time=first.start_time,
+                end_time=last.end_time,
+                timing_source=timing_source,
+                timing_quality=timing_quality,
+                grouping_source="narration_slot_repaired",
+            )
+        )
+    return merged
+
+
+def repair_fallback_visual_requirements(
+    narration_script: str,
+    timed_units: list[TimedNarrationUnit],
+    spans: list[SemanticVisualSpan],
+) -> list[SemanticVisualSpan]:
+    """Replace spoken narration lines with requirements a clip can satisfy.
+
+    The slot-led fallback has one span per narration line, so its
+    ``visual_requirement`` is the spoken line itself. Handing that to stock
+    search and to candidate verification asks the pipeline to find footage of a
+    sentence: a line like "Patient." can never be filled, yet it still buys a
+    full search and a full round of candidate analysis on every phrasing of
+    every provider before the failure ladder gives up on it. One extra
+    provider-neutral call is much cheaper than that, and the lines it reports as
+    having no visible content of their own cost nothing at all -- a neighbour
+    absorbs their window.
+
+    Returns the original spans unchanged when the repair produced nothing
+    usable, so the failure stays visible in ``grouping_source`` instead of
+    looking like a planned timeline.
+    """
+    if not spans:
+        return spans
+
+    try:
+        repaired_requirements = llm.generate_narration_visual_requirements(
+            narration_text=narration_script,
+            narration_lines=[
+                {"index": span.index, "spoken_text": span.spoken_text}
+                for span in spans
+            ],
+        )
+    except Exception as exc:
+        logger.warning(
+            "narration visual requirement repair failed: "
+            f"error={type(exc).__name__}"
+        )
+        return spans
+    if not repaired_requirements:
+        logger.warning(
+            "narration visual requirement repair returned nothing usable; "
+            f"visual requirements are still spoken narration: lines={len(spans)}"
+        )
+        return spans
+
+    requirements: dict[int, str] = {}
+    over_long = 0
+    for span in spans:
+        answer = repaired_requirements.get(span.index)
+        requirement = " ".join(str(answer or "").split())
+        if not requirement:
+            continue
+        # The same ceiling the LLM grouping path validates against. An answer
+        # over it is not adopted, because a bloated requirement is carried into
+        # the checklist and into every adjudication prompt of that beat.
+        if len(requirement) > _SEMANTIC_VISUAL_REQUIREMENT_MAX_CHARS:
+            over_long += 1
+            continue
+        requirements[span.index] = requirement
+    if over_long:
+        logger.warning(
+            "repaired visual requirements exceeded the span limit and were "
+            f"treated as unfilmable lines: count={over_long}"
+        )
+
+    repaired_spans = _consolidate_repaired_spans(
+        narration_script,
+        timed_units,
+        spans,
+        requirements,
+    )
+    if not repaired_spans:
+        logger.warning(
+            "no narration line has camera-visible content of its own; keeping "
+            f"the spoken slot-led requirements: lines={len(spans)}"
+        )
+        return spans
+
+    logger.info(
+        "narration visual requirements repaired: "
+        f"lines={len(spans)}, filmable_lines={len(requirements)}, "
+        f"spans={len(repaired_spans)}"
+    )
+    return repaired_spans
+
+
+def generate_semantic_visual_spans(
+    narration_script: str,
+    timed_units: list[TimedNarrationUnit],
+    narration_slots: list[NarrationSlot],
+) -> list[SemanticVisualSpan]:
+    """Use one provider-neutral LLM call, then fail wholly to slot-led spans."""
+    if timed_units:
+        try:
+            raw_specs = llm.generate_semantic_visual_span_specs(
+                narration_text=narration_script,
+                timed_units=[
+                    {
+                        "text": unit.text,
+                        "source_narration_slot_index": (
+                            unit.source_narration_slot_index
+                        ),
+                    }
+                    for unit in timed_units
+                ],
+            )
+            if raw_specs is not None:
+                return build_semantic_visual_spans_from_specs(
+                    narration_script,
+                    timed_units,
+                    narration_slots,
+                    raw_specs,
+                )
+        except Exception as exc:
+            logger.warning(
+                "semantic visual grouping rejected; using narration-slot fallback: "
+                f"error={type(exc).__name__}"
+            )
+
+    try:
+        fallback_spans = build_narration_slot_semantic_fallback(
+            narration_script,
+            timed_units,
+            narration_slots,
+        )
+        fallback_units = timed_units
+    except ValueError as exc:
+        logger.warning(
+            "timed narration fallback unavailable; using coarse narration slots: "
+            f"reason={exc}"
+        )
+        fallback_spans = build_narration_slot_semantic_fallback(
+            narration_script,
+            [],
+            narration_slots,
+        )
+        fallback_units = []
+
+    # The fallback owns the timeline shape; it must not also decide what a shot
+    # has to show. Its requirement is the spoken line, so it is repaired before
+    # anything downstream can mistake narration for a description of footage.
+    return repair_fallback_visual_requirements(
+        narration_script,
+        fallback_units,
+        fallback_spans,
+    )
+
+
+def semantic_visual_requirements_are_spoken_narration(
+    semantic_visual_spans: list[SemanticVisualSpan],
+) -> bool:
+    """True when no span in the timeline describes footage.
+
+    ``narration_slot_fallback`` survives only when semantic grouping failed and
+    the repair could not turn a single spoken line into a visible situation.
+    Every requirement in the timeline is then the narration itself, so the beat
+    path would search stock catalogs for sentences and pay the verifier to
+    reject real footage for lines like "Patient." -- a whole video of guaranteed
+    rejections. The proven fixed-slot timeline is worth more than that.
+    """
+    return bool(semantic_visual_spans) and all(
+        span.grouping_source == "narration_slot_fallback"
+        for span in semantic_visual_spans
+    )
+
+
+def _validate_semantic_spans_for_visual_beats(
+    semantic_visual_spans: list[SemanticVisualSpan],
+    timed_units: list[TimedNarrationUnit],
+    audio_duration: float,
+) -> None:
+    if not semantic_visual_spans:
+        raise ValueError("visual beats require semantic visual spans")
+
+    uses_unit_ranges = semantic_visual_spans[0].start_unit is not None
+    expected_unit = 0
+    previous_end = 0.0
+    for position, span in enumerate(semantic_visual_spans, start=1):
+        if span.index != position:
+            raise ValueError("semantic visual span indexes must be sequential")
+        if not span.spoken_text.strip() or not span.visual_requirement.strip():
+            raise ValueError("semantic visual spans require visible text metadata")
+        if not math.isfinite(span.start_time) or not math.isfinite(span.end_time):
+            raise ValueError("semantic visual span timing must be finite")
+        if span.start_time < 0 or span.end_time <= span.start_time:
+            raise ValueError("semantic visual span timing is invalid")
+        if span.end_time > audio_duration + _VISUAL_BEAT_TIME_TOLERANCE_SECONDS:
+            raise ValueError("semantic visual span exceeds the audio duration")
+        if (
+            position > 1
+            and span.start_time
+            < previous_end - _VISUAL_BEAT_TIME_TOLERANCE_SECONDS
+        ):
+            raise ValueError("semantic visual spans overlap or are reordered")
+
+        has_start_unit = span.start_unit is not None
+        has_end_unit = span.end_unit_exclusive is not None
+        if has_start_unit != has_end_unit or has_start_unit != uses_unit_ranges:
+            raise ValueError("semantic visual span unit ranges are inconsistent")
+        if uses_unit_ranges:
+            start_unit = span.start_unit
+            end_unit_exclusive = span.end_unit_exclusive
+            if start_unit is None or end_unit_exclusive is None:
+                raise ValueError("semantic visual span unit range is missing")
+            if (
+                start_unit != expected_unit
+                or start_unit < 0
+                or end_unit_exclusive <= start_unit
+                or end_unit_exclusive > len(timed_units)
+            ):
+                raise ValueError("semantic visual span unit coverage is invalid")
+            source_units = timed_units[start_unit:end_unit_exclusive]
+            if not math.isclose(
+                span.start_time,
+                source_units[0].start_time,
+                rel_tol=0.0,
+                abs_tol=_VISUAL_BEAT_TIME_TOLERANCE_SECONDS,
+            ) or not math.isclose(
+                span.end_time,
+                source_units[-1].end_time,
+                rel_tol=0.0,
+                abs_tol=_VISUAL_BEAT_TIME_TOLERANCE_SECONDS,
+            ):
+                raise ValueError("semantic visual span timing does not match its units")
+            expected_unit = end_unit_exclusive
+        previous_end = span.end_time
+
+    if uses_unit_ranges and expected_unit != len(timed_units):
+        raise ValueError("semantic visual spans do not cover every timing unit")
+
+
+def _desired_visual_beat_shot_count(duration: float) -> int:
+    if duration <= (
+        _VISUAL_BEAT_PREFERRED_MAX_SECONDS
+        + _VISUAL_BEAT_TIME_TOLERANCE_SECONDS
+    ):
+        return 1
+    minimum_count = math.ceil(duration / _VISUAL_BEAT_PREFERRED_MAX_SECONDS)
+    target_count = math.floor(
+        duration / _VISUAL_BEAT_LONG_SPLIT_TARGET_SECONDS + 0.5
+    )
+    return max(2, minimum_count, target_count)
+
+
+def _visual_beat_unit_cut_candidates(
+    span: SemanticVisualSpan,
+    timed_units: list[TimedNarrationUnit],
+    group_start: float,
+    group_end: float,
+) -> list[tuple[int, float]]:
+    if span.start_unit is None or span.end_unit_exclusive is None:
+        return []
+
+    candidates: list[tuple[int, float]] = []
+    previous_time = group_start
+    for unit_index in range(span.start_unit + 1, span.end_unit_exclusive):
+        cut_time = timed_units[unit_index].start_time
+        if (
+            not math.isfinite(cut_time)
+            or cut_time <= group_start + _VISUAL_BEAT_TIME_TOLERANCE_SECONDS
+            or cut_time >= group_end - _VISUAL_BEAT_TIME_TOLERANCE_SECONDS
+            or cut_time <= previous_time + _VISUAL_BEAT_TIME_TOLERANCE_SECONDS
+        ):
+            continue
+        candidates.append((unit_index, cut_time))
+        previous_time = cut_time
+    return candidates
+
+
+def _choose_balanced_visual_beat_cuts(
+    candidates: list[tuple[int, float]],
+    group_start: float,
+    group_end: float,
+    desired_shot_count: int,
+) -> list[tuple[int, float]]:
+    """Choose deterministic, balanced cuts only at real timing-unit starts."""
+    desired_shot_count = min(desired_shot_count, len(candidates) + 1)
+    for shot_count in range(desired_shot_count, 1, -1):
+        # state: last candidate position -> (squared timing error, chosen positions)
+        states: dict[int, tuple[float, tuple[int, ...]]] = {-1: (0.0, ())}
+        for cut_number in range(1, shot_count):
+            ideal_time = group_start + (
+                (group_end - group_start) * cut_number / shot_count
+            )
+            remaining_segments = shot_count - cut_number
+            next_states: dict[int, tuple[float, tuple[int, ...]]] = {}
+            for previous_position, (cost, chosen_positions) in states.items():
+                previous_time = (
+                    group_start
+                    if previous_position < 0
+                    else candidates[previous_position][1]
+                )
+                for candidate_position in range(
+                    previous_position + 1,
+                    len(candidates),
+                ):
+                    cut_time = candidates[candidate_position][1]
+                    if (
+                        cut_time - previous_time
+                        < _VISUAL_BEAT_RAPID_CUT_SECONDS
+                        - _VISUAL_BEAT_TIME_TOLERANCE_SECONDS
+                    ):
+                        continue
+                    if (
+                        group_end - cut_time
+                        < remaining_segments * _VISUAL_BEAT_RAPID_CUT_SECONDS
+                        - _VISUAL_BEAT_TIME_TOLERANCE_SECONDS
+                    ):
+                        continue
+                    candidate_state = (
+                        cost + (cut_time - ideal_time) ** 2,
+                        chosen_positions + (candidate_position,),
+                    )
+                    current_state = next_states.get(candidate_position)
+                    if current_state is None or candidate_state < current_state:
+                        next_states[candidate_position] = candidate_state
+            states = next_states
+            if not states:
+                break
+
+        valid_states = [
+            state
+            for candidate_position, state in states.items()
+            if candidate_position >= 0
+            and group_end - candidates[candidate_position][1]
+            >= _VISUAL_BEAT_RAPID_CUT_SECONDS
+            - _VISUAL_BEAT_TIME_TOLERANCE_SECONDS
+        ]
+        if valid_states:
+            _, chosen_positions = min(valid_states)
+            return [candidates[position] for position in chosen_positions]
+    return []
+
+
+def _visual_beat_timing(
+    span: SemanticVisualSpan,
+    source_units: list[TimedNarrationUnit],
+) -> tuple[NarrationTimingSource, NarrationTimingQuality]:
+    if not source_units:
+        return span.timing_source, span.timing_quality
+
+    unit_source, unit_quality = _semantic_span_timing(source_units)
+    timing_source: NarrationTimingSource = (
+        unit_source if unit_source == span.timing_source else "estimated"
+    )
+    qualities = {unit_quality, span.timing_quality}
+    if "estimated" in qualities:
+        timing_quality: NarrationTimingQuality = "estimated"
+    elif "speech_recognition" in qualities:
+        timing_quality = "speech_recognition"
+    else:
+        timing_quality = "boundary"
+    return timing_source, timing_quality
+
+
+def _build_visual_beats_from_valid_spans(
+    narration_script: str,
+    semantic_visual_spans: list[SemanticVisualSpan],
+    timed_units: list[TimedNarrationUnit],
+    audio_duration: float,
+    source_semantic_spans_available: bool,
+) -> list[VisualBeat]:
+    visual_beats: list[VisualBeat] = []
+    for group_position, span in enumerate(semantic_visual_spans):
+        group_start = 0.0 if group_position == 0 else span.start_time
+        group_end = (
+            semantic_visual_spans[group_position + 1].start_time
+            if group_position + 1 < len(semantic_visual_spans)
+            else audio_duration
+        )
+        if (
+            group_end - group_start
+            <= _VISUAL_BEAT_TIME_TOLERANCE_SECONDS
+        ):
+            raise ValueError("semantic visual group has no usable timeline duration")
+
+        candidates = _visual_beat_unit_cut_candidates(
+            span,
+            timed_units,
+            group_start,
+            group_end,
+        )
+        cuts = _choose_balanced_visual_beat_cuts(
+            candidates,
+            group_start,
+            group_end,
+            _desired_visual_beat_shot_count(group_end - group_start),
+        )
+        unit_boundaries = (
+            [span.start_unit]
+            + [unit_index for unit_index, _ in cuts]
+            + [span.end_unit_exclusive]
+            if span.start_unit is not None
+            and span.end_unit_exclusive is not None
+            else [None, None]
+        )
+        time_boundaries = [group_start] + [cut_time for _, cut_time in cuts] + [group_end]
+        split_succeeded = bool(cuts)
+
+        if split_succeeded:
+            try:
+                spoken_parts = [
+                    reconstruct_semantic_spoken_text(
+                        narration_script,
+                        timed_units,
+                        start_unit,
+                        end_unit_exclusive,
+                    )
+                    for start_unit, end_unit_exclusive in zip(
+                        unit_boundaries,
+                        unit_boundaries[1:],
+                    )
+                    if start_unit is not None and end_unit_exclusive is not None
+                ]
+                if len(spoken_parts) != len(time_boundaries) - 1:
+                    raise ValueError("visual beat text partition is incomplete")
+            except ValueError:
+                # Never invent text or a sub-unit boundary merely to satisfy an
+                # editing preference. A coarse/unalignable long concept remains
+                # one semantically correct shot.
+                cuts = []
+                unit_boundaries = [span.start_unit, span.end_unit_exclusive]
+                time_boundaries = [group_start, group_end]
+                spoken_parts = [span.spoken_text]
+                split_succeeded = False
+        else:
+            spoken_parts = [span.spoken_text]
+
+        source_span_duration = span.end_time - span.start_time
+        if split_succeeded:
+            duration_policy = "long_span_split"
+        elif (
+            source_span_duration
+            < _VISUAL_BEAT_PREFERRED_MIN_SECONDS
+            - _VISUAL_BEAT_TIME_TOLERANCE_SECONDS
+        ):
+            duration_policy = "short_semantic_preserved"
+        else:
+            duration_policy = "semantic_original"
+
+        for shot_index, (start_time, end_time) in enumerate(
+            zip(time_boundaries, time_boundaries[1:]),
+            start=1,
+        ):
+            start_unit = unit_boundaries[shot_index - 1]
+            end_unit_exclusive = unit_boundaries[shot_index]
+            source_units = (
+                timed_units[start_unit:end_unit_exclusive]
+                if start_unit is not None and end_unit_exclusive is not None
+                else []
+            )
+            timing_source, timing_quality = _visual_beat_timing(
+                span,
+                source_units,
+            )
+            source_narration_slot_indexes = (
+                _semantic_span_slot_indexes(
+                    timed_units,
+                    [],
+                    start_unit,
+                    end_unit_exclusive,
+                )
+                if split_succeeded
+                and start_unit is not None
+                and end_unit_exclusive is not None
+                else span.source_narration_slot_indexes
+            )
+            duration = end_time - start_time
+            visual_beats.append(
+                VisualBeat(
+                    index=len(visual_beats) + 1,
+                    semantic_group_id=group_position + 1,
+                    shot_index=shot_index,
+                    start_time=start_time,
+                    end_time=end_time,
+                    duration=duration,
+                    spoken_text=spoken_parts[shot_index - 1],
+                    visual_requirement=span.visual_requirement,
+                    source_semantic_span_index=(
+                        span.index if source_semantic_spans_available else None
+                    ),
+                    source_narration_slot_indexes=list(
+                        source_narration_slot_indexes
+                    ),
+                    start_unit=start_unit,
+                    end_unit_exclusive=end_unit_exclusive,
+                    timing_source=timing_source,
+                    timing_quality=timing_quality,
+                    duration_policy=duration_policy,
+                    rapid_cut=(
+                        duration
+                        < _VISUAL_BEAT_RAPID_CUT_SECONDS
+                        - _VISUAL_BEAT_TIME_TOLERANCE_SECONDS
+                    ),
+                )
+            )
+    return visual_beats
+
+
+def _validate_complete_visual_beat_timeline(
+    visual_beats: list[VisualBeat],
+    audio_duration: float,
+) -> None:
+    if not visual_beats:
+        raise ValueError("visual beat timeline is empty")
+    if visual_beats[0].start_time != 0.0:
+        raise ValueError("visual beat timeline must start at zero")
+    if visual_beats[-1].end_time != audio_duration:
+        raise ValueError("visual beat timeline must end at the audio duration")
+
+    for position, beat in enumerate(visual_beats, start=1):
+        if beat.index != position:
+            raise ValueError("visual beat indexes must be sequential")
+        if not math.isfinite(beat.start_time) or not math.isfinite(beat.end_time):
+            raise ValueError("visual beat timing must be finite")
+        if beat.duration <= _VISUAL_BEAT_TIME_TOLERANCE_SECONDS:
+            raise ValueError("visual beat duration must be positive")
+        if not math.isclose(
+            beat.duration,
+            beat.end_time - beat.start_time,
+            rel_tol=0.0,
+            abs_tol=_VISUAL_BEAT_TIME_TOLERANCE_SECONDS,
+        ):
+            raise ValueError("visual beat duration is inconsistent")
+        if position < len(visual_beats) and not math.isclose(
+            beat.end_time,
+            visual_beats[position].start_time,
+            rel_tol=0.0,
+            abs_tol=_VISUAL_BEAT_TIME_TOLERANCE_SECONDS,
+        ):
+            raise ValueError("visual beat timeline contains a gap or overlap")
+
+    if not math.isclose(
+        math.fsum(beat.duration for beat in visual_beats),
+        audio_duration,
+        rel_tol=0.0,
+        abs_tol=_VISUAL_BEAT_TIME_TOLERANCE_SECONDS,
+    ):
+        raise ValueError("visual beat durations do not cover the audio duration")
+
+
+def build_visual_beats(
+    narration_script: str,
+    semantic_visual_spans: list[SemanticVisualSpan] | None,
+    timed_units: list[TimedNarrationUnit],
+    narration_slots: list[NarrationSlot],
+    audio_duration: float,
+) -> list[VisualBeat]:
+    """Build a gapless variable shot timeline without changing semantics."""
+    if not math.isfinite(audio_duration) or audio_duration <= 0:
+        raise ValueError("visual beat timeline requires a positive audio duration")
+
+    if semantic_visual_spans:
+        try:
+            _validate_semantic_spans_for_visual_beats(
+                semantic_visual_spans,
+                timed_units,
+                audio_duration,
+            )
+            visual_beats = _build_visual_beats_from_valid_spans(
+                narration_script,
+                semantic_visual_spans,
+                timed_units,
+                audio_duration,
+                source_semantic_spans_available=True,
+            )
+            _validate_complete_visual_beat_timeline(visual_beats, audio_duration)
+            return visual_beats
+        except ValueError as exc:
+            logger.warning(
+                "semantic visual beats unavailable; using narration-slot fallback: "
+                f"error={type(exc).__name__}"
+            )
+
+    if not narration_slots:
+        return []
+
+    fallback_attempts = (timed_units, []) if timed_units else ([],)
+    for fallback_units in fallback_attempts:
+        try:
+            fallback_spans = build_narration_slot_semantic_fallback(
+                narration_script,
+                fallback_units,
+                narration_slots,
+            )
+            _validate_semantic_spans_for_visual_beats(
+                fallback_spans,
+                fallback_units,
+                audio_duration,
+            )
+            visual_beats = _build_visual_beats_from_valid_spans(
+                narration_script,
+                fallback_spans,
+                fallback_units,
+                audio_duration,
+                source_semantic_spans_available=False,
+            )
+            _validate_complete_visual_beat_timeline(visual_beats, audio_duration)
+            return visual_beats
+        except ValueError as exc:
+            logger.warning(
+                "narration-slot visual beats unavailable: "
+                f"error={type(exc).__name__}"
+            )
+    return []
+
+
 def build_visual_slots(
     narration_slots: list[NarrationSlot],
     audio_duration: float,
@@ -510,6 +1583,50 @@ def build_visual_slots(
                 f"visual slot {zero_based_index + 1} has no overlapping narration"
             )
 
+        narration_overlaps = [
+            NarrationOverlap(
+                narration_slot_index=narration.index,
+                overlap_start_time=max(start_time, narration.start_time),
+                overlap_end_time=min(end_time, narration.end_time),
+                overlap_duration=(
+                    min(end_time, narration.end_time)
+                    - max(start_time, narration.start_time)
+                ),
+            )
+            for narration in overlapping
+        ]
+        maximum_overlap = max(
+            overlap.overlap_duration for overlap in narration_overlaps
+        )
+        primary_candidates = [
+            narration
+            for narration, overlap in zip(overlapping, narration_overlaps)
+            if math.isclose(
+                overlap.overlap_duration,
+                maximum_overlap,
+                rel_tol=0.0,
+                abs_tol=1e-9,
+            )
+        ]
+        visual_midpoint = (start_time + end_time) / 2
+        midpoint_candidates = [
+            narration
+            for narration in primary_candidates
+            if narration.start_time <= visual_midpoint < narration.end_time
+        ]
+        if midpoint_candidates:
+            primary_candidates = midpoint_candidates
+        primary_narration = min(
+            primary_candidates,
+            key=lambda narration: (
+                abs(
+                    ((narration.start_time + narration.end_time) / 2)
+                    - visual_midpoint
+                ),
+                narration.index,
+            ),
+        )
+
         timing_sources = {slot.timing_source for slot in overlapping}
         timing_source = (
             next(iter(timing_sources)) if len(timing_sources) == 1 else "estimated"
@@ -522,6 +1639,10 @@ def build_visual_slots(
                 duration=end_time - start_time,
                 narration_slot_indexes=[slot.index for slot in overlapping],
                 narration_text=" ".join(slot.text for slot in overlapping),
+                primary_narration_slot_index=primary_narration.index,
+                primary_narration_text=primary_narration.text,
+                visual_requirement=primary_narration.text,
+                narration_overlaps=narration_overlaps,
                 search_queries=[],
                 timing_source=timing_source,
                 timing_quality=_timing_quality(timing_source),
@@ -540,7 +1661,7 @@ def generate_visual_slot_search_queries(
             "slot_index": slot.index,
             "start_time": slot.start_time,
             "end_time": slot.end_time,
-            "narration_text": slot.narration_text,
+            "visual_requirement": slot.visual_requirement,
         }
         for slot in visual_slots
     ]
@@ -558,11 +1679,140 @@ def generate_visual_slot_search_queries(
     return [slot.search_queries[0] for slot in visual_slots]
 
 
+def generate_visual_beat_search_queries(
+    visual_beats: list[VisualBeat],
+    queries_per_beat: int = 1,
+) -> list[str]:
+    """Generate once per semantic group/requirement and copy to sibling shots."""
+    if not visual_beats:
+        return []
+
+    representatives: dict[tuple[int, str], VisualBeat] = {}
+    beat_group_keys: dict[int, tuple[int, str]] = {}
+    for beat in visual_beats:
+        requirement = " ".join(beat.visual_requirement.split()).strip()
+        if not requirement:
+            raise ValueError(f"visual beat {beat.index} has no visual requirement")
+        group_key = (beat.semantic_group_id, requirement.casefold())
+        representatives.setdefault(group_key, beat)
+        beat_group_keys[beat.index] = group_key
+
+    representative_payload = [
+        {
+            "slot_index": beat.index,
+            "start_time": beat.start_time,
+            "end_time": beat.end_time,
+            "visual_requirement": beat.visual_requirement,
+        }
+        for beat in representatives.values()
+    ]
+    # VisualBeat queries must not inherit whole-video or neighboring narration
+    # context. The existing provider-neutral query abstraction therefore gets
+    # only representative visual requirements and an intentionally empty subject.
+    queries_by_representative = llm.generate_visual_slot_queries(
+        video_subject="",
+        visual_slots=representative_payload,
+        queries_per_slot=queries_per_beat,
+    )
+
+    queries_by_group: dict[tuple[int, str], list[str]] = {}
+    for group_key, representative in representatives.items():
+        queries = queries_by_representative.get(representative.index, [])
+        if not queries:
+            raise ValueError(
+                f"visual beat group {representative.semantic_group_id} "
+                "has no search query"
+            )
+        queries_by_group[group_key] = list(queries)
+
+    for beat in visual_beats:
+        beat.search_queries = list(queries_by_group[beat_group_keys[beat.index]])
+    return [beat.search_queries[0] for beat in visual_beats]
+
+
+def generate_visual_requirement_checklist(
+    visual_beats: list[VisualBeat],
+) -> dict[str, VisualRequirementSpec]:
+    """Decompose every beat requirement while still in the script stage.
+
+    The checklist is the contract candidate verification gates on, so it belongs
+    to the script timeline rather than to the material stage: it is written to
+    the task manifest before a single stock request is made, so the plan can be
+    inspected before anything is downloaded or analyzed, and material selection
+    then verifies against exactly the checklist this run was planned with.
+
+    Keys are normalized requirements. A requirement the provider could not
+    decompose is simply absent; no synthetic checklist is invented here, and the
+    material stage keeps deciding what a missing checklist means for that beat.
+    """
+    if not visual_beats:
+        return {}
+
+    requirements = [beat.visual_requirement for beat in visual_beats]
+    specs = llm.generate_visual_requirement_specs(requirements)
+    missing_beats = [
+        beat.index
+        for beat in visual_beats
+        if llm.normalize_visual_requirement(beat.visual_requirement) not in specs
+    ]
+    if missing_beats:
+        logger.warning(
+            "visual requirement checklist is incomplete: "
+            f"beats={len(visual_beats)}, decomposed={len(specs)}, "
+            f"missing_beat_indexes={missing_beats}"
+        )
+    else:
+        logger.info(
+            "visual requirement checklist ready: "
+            f"beats={len(visual_beats)}, unique_requirements={len(specs)}"
+        )
+    return specs
+
+
+def _visual_beat_records(
+    visual_beats: list[VisualBeat] | None,
+) -> list[dict[str, object]]:
+    """The persisted shape of one beat timeline.
+
+    Written twice: once by the script stage for the timeline it planned, and again
+    after material selection if a merge rewrote it. One definition keeps those two
+    writes from drifting into two different schemas for the same field.
+    """
+    return [
+        {
+            "index": beat.index,
+            "semantic_group_id": beat.semantic_group_id,
+            "shot_index": beat.shot_index,
+            "start_time": beat.start_time,
+            "end_time": beat.end_time,
+            "duration": beat.duration,
+            "spoken_text": beat.spoken_text,
+            "visual_requirement": beat.visual_requirement,
+            "source_semantic_span_index": beat.source_semantic_span_index,
+            "source_narration_slot_indexes": (
+                beat.source_narration_slot_indexes
+            ),
+            "start_unit": beat.start_unit,
+            "end_unit_exclusive": beat.end_unit_exclusive,
+            "timing_source": beat.timing_source,
+            "timing_quality": beat.timing_quality,
+            "duration_policy": beat.duration_policy,
+            "rapid_cut": beat.rapid_cut,
+            "search_queries": beat.search_queries,
+        }
+        for beat in (visual_beats or [])
+    ]
+
+
 def persist_narration_timeline(
     task_id: str,
     narration_slots: list[NarrationSlot],
     visual_slots: list[VisualSlot],
     video_terms: list[str],
+    timed_narration_units: list[TimedNarrationUnit] | None = None,
+    semantic_visual_spans: list[SemanticVisualSpan] | None = None,
+    visual_beats: list[VisualBeat] | None = None,
+    visual_requirement_specs: dict[str, VisualRequirementSpec] | None = None,
 ) -> None:
     narration_records = [
         {
@@ -583,17 +1833,86 @@ def persist_narration_timeline(
             "duration": slot.duration,
             "narration_slot_indexes": slot.narration_slot_indexes,
             "narration_text": slot.narration_text,
+            "primary_narration_slot_index": slot.primary_narration_slot_index,
+            "primary_narration_text": slot.primary_narration_text,
+            "visual_requirement": slot.visual_requirement,
+            "narration_overlaps": [
+                {
+                    "narration_slot_index": overlap.narration_slot_index,
+                    "overlap_start_time": overlap.overlap_start_time,
+                    "overlap_end_time": overlap.overlap_end_time,
+                    "overlap_duration": overlap.overlap_duration,
+                }
+                for overlap in slot.narration_overlaps
+            ],
             "search_queries": slot.search_queries,
             "timing_source": slot.timing_source,
             "timing_quality": slot.timing_quality,
         }
         for slot in visual_slots
     ]
+    timed_unit_records = [
+        {
+            "index": unit.index,
+            "text": unit.text,
+            "start_time": unit.start_time,
+            "end_time": unit.end_time,
+            "duration": unit.duration,
+            "source_narration_slot_index": unit.source_narration_slot_index,
+            "timing_source": unit.timing_source,
+            "timing_quality": unit.timing_quality,
+            "source_boundary_type": unit.source_boundary_type,
+            "script_start_char": unit.script_start_char,
+            "script_end_char": unit.script_end_char,
+        }
+        for unit in (timed_narration_units or [])
+    ]
+    semantic_span_records = [
+        {
+            "index": span.index,
+            "start_unit": span.start_unit,
+            "end_unit_exclusive": span.end_unit_exclusive,
+            "spoken_text": span.spoken_text,
+            "visual_requirement": span.visual_requirement,
+            "source_narration_slot_indexes": span.source_narration_slot_indexes,
+            "start_time": span.start_time,
+            "end_time": span.end_time,
+            "timing_source": span.timing_source,
+            "timing_quality": span.timing_quality,
+            "grouping_source": span.grouping_source,
+        }
+        for span in (semantic_visual_spans or [])
+    ]
+    visual_beat_records = _visual_beat_records(visual_beats)
+    # The checklist is written per unique normalized requirement because sibling
+    # shots of one semantic group share it. ``missing`` is listed explicitly: it
+    # is the difference between "this beat will be verified" and "this beat has
+    # no gate", and it must be visible before any download starts.
+    requirement_spec_records = [
+        {
+            "normalized_requirement": normalized,
+            "spec": llm.visual_requirement_spec_to_dict(spec),
+        }
+        for normalized, spec in sorted((visual_requirement_specs or {}).items())
+    ]
+    missing_requirement_beats = [
+        beat.index
+        for beat in (visual_beats or [])
+        if visual_requirement_specs is not None
+        and llm.normalize_visual_requirement(beat.visual_requirement)
+        not in visual_requirement_specs
+    ]
     task_artifacts.patch_script_data(
         task_id,
+        timeline_schema_version=2,
         search_terms=video_terms,
         narration_slots=narration_records,
         visual_slots=visual_records,
+        timed_narration_units=timed_unit_records,
+        semantic_visual_spans=semantic_span_records,
+        visual_beats=visual_beat_records,
+        visual_requirement_specs=requirement_spec_records,
+        visual_requirement_specs_missing_beat_indexes=missing_requirement_beats,
     )
 
 
@@ -744,12 +2063,16 @@ def generate_audio(task_id, params, video_script, voice_preview=None):
 
         logger.info("no custom audio file provided, using TTS to generate audio.")
         audio_file = path.join(utils.task_dir(task_id), "audio.mp3")
-        sub_maker = voice.tts(
-            text=video_script,
-            voice_name=voice.parse_voice_name(params.voice_name),
-            voice_rate=params.voice_rate,
-            voice_file=audio_file,
-        )
+        try:
+            sub_maker = voice.tts(
+                text=video_script,
+                voice_name=voice.parse_voice_name(params.voice_name),
+                voice_rate=params.voice_rate,
+                voice_file=audio_file,
+            )
+        except voice.TTSServiceError as exc:
+            _mark_task_failed(task_id, "audio", str(exc))
+            return None, None, None
         if sub_maker is None:
             _mark_task_failed(
                 task_id,
@@ -853,6 +2176,9 @@ def get_video_materials(
     audio_duration,
     loomloom_video_request: loomloom.LoomLoomConfirmedVideoRequest | None = None,
     visual_slots: list[VisualSlot] | None = None,
+    visual_beats: list[VisualBeat] | None = None,
+    visual_requirement_specs: dict[str, VisualRequirementSpec] | None = None,
+    merged_beats_out: list[VisualBeat] | None = None,
 ):
     if params.video_source == "local":
         logger.info("\n\n## preprocess local materials")
@@ -930,11 +2256,17 @@ def get_video_materials(
             return None
     else:
         logger.info(f"\n\n## downloading videos from {params.video_source}")
+        # A beat timeline carries its own per-beat queries, and smart selection
+        # requires exactly one query per visual item. Using the slot queries here
+        # would pair every beat with the wrong search term.
+        beat_terms = (
+            [beat.search_queries[0] for beat in visual_beats] if visual_beats else []
+        )
         # 顺序匹配模式只在用户显式开启时生效。这里强制素材下载按关键词顺序
         # 轮询，避免某个早期关键词下载太多素材，把后续脚本主题挤出最终时间线。
         downloaded_videos = material.download_videos(
             task_id=task_id,
-            search_terms=video_terms,
+            search_terms=beat_terms or video_terms,
             source=params.video_source,
             video_aspect=params.video_aspect,
             video_concat_mode=(
@@ -952,8 +2284,15 @@ def get_video_materials(
             ),
             max_clip_duration=params.video_clip_duration,
             match_script_order=params.match_materials_to_script,
-            visual_slots=visual_slots,
+            visual_slots=None if visual_beats else visual_slots,
+            visual_beats=visual_beats or None,
             clip_speed=params.video_clip_speed,
+            # Computed in the script stage so verification uses the checklist
+            # this run was planned and persisted with.
+            requirement_specs=visual_requirement_specs or None,
+            # Filled only if an unfillable beat had to be absorbed by a sibling
+            # shot, in which case the renderer must use the rewritten timeline.
+            merged_beats_out=merged_beats_out,
         )
         if not downloaded_videos:
             _mark_task_failed(
@@ -1016,6 +2355,7 @@ def generate_final_videos(
     subtitle_path,
     audio_duration,
     source_ranges: list[tuple[float, float]] | None = None,
+    render_segments: list[RenderSegment] | None = None,
 ):
     final_video_paths = []
     combined_video_paths = []
@@ -1053,6 +2393,7 @@ def generate_final_videos(
             threads=params.n_threads,
             clip_speed=params.video_clip_speed,
             source_ranges=source_ranges,
+            render_segments=render_segments,
         )
 
         _progress += 50 / params.video_count / 2
@@ -1460,7 +2801,7 @@ def _run_pipeline(
 
     if (
         stop_at in {"materials", "video"}
-        and params.video_source == "pexels"
+        and material.supports_smart_visual_matching(params.video_source)
         and params.match_materials_to_script
         and twelvelabs.visual_matching_requested()
     ):
@@ -1533,6 +2874,18 @@ def _run_pipeline(
         params.match_materials_to_script and params.video_source != "local"
     )
     visual_slots: list[VisualSlot] | None = None
+    visual_beats: list[VisualBeat] = []
+    # ``None`` means "no checklist was requested for this run"; an empty mapping
+    # means "requested and nothing could be decomposed". The manifest keeps those
+    # two apart, so stay with ``None`` until the gate below actually fires.
+    visual_requirement_specs: dict[str, VisualRequirementSpec] | None = None
+    # Smart matching drives the renderer from the variable beat timeline; every
+    # other configuration keeps the fixed-slot path untouched.
+    smart_matching_requested = (
+        material.supports_smart_visual_matching(params.video_source)
+        and params.match_materials_to_script
+        and twelvelabs.visual_matching_requested()
+    )
 
     # 2. Generate terms. Ordered matching must wait for the narration timeline;
     # the normal mode intentionally keeps its existing whole-script behavior.
@@ -1605,6 +2958,25 @@ def _run_pipeline(
             exact_audio_duration = float(audio_duration)
         material_audio_duration = exact_audio_duration
         timing_source = resolve_narration_timing_source(params, sub_maker)
+        timed_narration_units: list[TimedNarrationUnit] = []
+        timed_unit_source = resolve_timed_narration_timing_source(params, sub_maker)
+        if timed_unit_source is not None:
+            try:
+                timed_narration_units = voice.extract_timed_narration_units(
+                    sub_maker=sub_maker,
+                    narration_text=video_script,
+                    timing_source=timed_unit_source,
+                    audio_duration=exact_audio_duration,
+                )
+            except ValueError as exc:
+                # S1 is an additive timing artifact. A provider text transform that
+                # cannot be aligned exactly must not alter the existing subtitle or
+                # fixed-slot behavior; later semantic stages can use their explicit
+                # coarse fallback instead of consuming untrusted word timing.
+                logger.warning(
+                    "timed narration units unavailable: "
+                    f"source={timed_unit_source}, reason={exc}"
+                )
         try:
             narration_slots = build_narration_slots(
                 subtitle_path=subtitle_path,
@@ -1620,14 +2992,72 @@ def _run_pipeline(
         except ValueError as exc:
             return _mark_task_failed(task_id, "narration_timeline", str(exc))
 
+        if timed_narration_units:
+            try:
+                timed_narration_units = associate_timed_units_with_narration_slots(
+                    timed_narration_units,
+                    narration_slots,
+                )
+            except ValueError as exc:
+                # This is optional S1 metadata. Exact association failure must not
+                # make the established NarrationSlot/VisualSlot path fail.
+                logger.warning(f"timed narration slot association unavailable: {exc}")
+                timed_narration_units = []
+
+        semantic_visual_spans = generate_semantic_visual_spans(
+            narration_script=video_script,
+            timed_units=timed_narration_units,
+            narration_slots=narration_slots,
+        )
+        visual_beats = build_visual_beats(
+            narration_script=video_script,
+            semantic_visual_spans=semantic_visual_spans,
+            timed_units=timed_narration_units,
+            narration_slots=narration_slots,
+            audio_duration=exact_audio_duration,
+        )
+        # Checked before beat queries and before the checklist, because both are
+        # paid calls and neither can produce anything usable from a requirement
+        # that is really a spoken sentence.
+        if visual_beats and semantic_visual_requirements_are_spoken_narration(
+            semantic_visual_spans
+        ):
+            logger.warning(
+                "visual beat requirements are spoken narration because semantic "
+                "grouping and its repair both failed; falling back to the fixed "
+                "visual slot timeline instead of searching for sentences"
+            )
+            visual_beats = []
+
         if stop_at == "subtitle":
             persist_narration_timeline(
                 task_id=task_id,
                 narration_slots=narration_slots,
                 visual_slots=visual_slots,
                 video_terms=[],
+                timed_narration_units=timed_narration_units,
+                semantic_visual_spans=semantic_visual_spans,
+                visual_beats=visual_beats,
             )
         else:
+            try:
+                # Ask for as many phrasings as material selection is allowed to
+                # try on one provider. Fewer may come back; that only costs a
+                # fallback, while asking for one guarantees the beat has nothing
+                # to retry with before the cascade jumps to a thinner catalog.
+                generate_visual_beat_search_queries(
+                    visual_beats,
+                    queries_per_beat=material.max_query_variants_per_provider(),
+                )
+            except ValueError as exc:
+                # Without one query per beat there is nothing to search per beat,
+                # so drop back to the fixed-slot timeline instead of failing the
+                # task. The run still gets ordered, script-matched materials.
+                logger.warning(
+                    f"visual beat search queries unavailable: {exc}; "
+                    "falling back to the fixed visual slot timeline"
+                )
+                visual_beats = []
             try:
                 video_terms = generate_visual_slot_search_queries(
                     params=params,
@@ -1635,11 +3065,28 @@ def _run_pipeline(
                 )
             except ValueError as exc:
                 return _mark_task_failed(task_id, "terms", str(exc))
+            # The checklist gate is deliberately the credential-aware one that
+            # material selection itself uses. The looser beat-timeline gate would
+            # decompose requirements for runs that can never verify a candidate,
+            # and `smart_matching_requested` keeps sources that never reach smart
+            # selection from paying for the decomposition at all.
+            if (
+                visual_beats
+                and smart_matching_requested
+                and twelvelabs.is_smart_visual_matching_enabled()
+            ):
+                visual_requirement_specs = generate_visual_requirement_checklist(
+                    visual_beats
+                )
             persist_narration_timeline(
                 task_id=task_id,
                 narration_slots=narration_slots,
                 visual_slots=visual_slots,
                 video_terms=video_terms,
+                timed_narration_units=timed_narration_units,
+                semantic_visual_spans=semantic_visual_spans,
+                visual_beats=visual_beats,
+                visual_requirement_specs=visual_requirement_specs,
             )
 
         if stop_at == "terms":
@@ -1662,7 +3109,21 @@ def _run_pipeline(
 
     sm.state.update_task(task_id, state=const.TASK_STATE_PROCESSING, progress=40)
 
+    # Beats replace slots only when S4 actually produced a complete timeline with
+    # queries. Anything less keeps the proven fixed-slot renderer path.
+    use_visual_beats = smart_matching_requested and bool(visual_beats)
+    if smart_matching_requested and not use_visual_beats:
+        logger.warning(
+            "smart visual matching is running on the fixed slot timeline because "
+            "no usable visual beat timeline was produced"
+        )
+
     # 5. Get video materials
+    # Selection is allowed to rewrite the beat timeline: when no provider,
+    # phrasing, or rewritten requirement can fill a beat, a sibling shot of the
+    # same semantic group absorbs its window. The narration timing never moves,
+    # so this list is either empty or a shorter timeline covering the same span.
+    merged_visual_beats: list[VisualBeat] = []
     try:
         downloaded_videos = get_video_materials(
             task_id,
@@ -1671,6 +3132,11 @@ def _run_pipeline(
             material_audio_duration,
             loomloom_video_request=loomloom_video_request,
             visual_slots=visual_slots,
+            visual_beats=visual_beats if use_visual_beats else None,
+            visual_requirement_specs=(
+                visual_requirement_specs if use_visual_beats else None
+            ),
+            merged_beats_out=merged_visual_beats if use_visual_beats else None,
         )
     except material.SmartMaterialSelectionError as exc:
         return _mark_task_failed(task_id, "materials", str(exc))
@@ -1679,6 +3145,24 @@ def _run_pipeline(
             task_id,
             "materials",
             "failed to prepare video materials",
+        )
+
+    # From here on the merged timeline is the only true one: the downloaded
+    # material records were written against it, so the renderer must bind to it
+    # rather than to the timeline the script stage planned.
+    if use_visual_beats and merged_visual_beats:
+        logger.warning(
+            "visual beat timeline was rewritten by merges: "
+            f"planned={len(visual_beats)}, rendering={len(merged_visual_beats)}"
+        )
+        visual_beats = merged_visual_beats
+        # Rewritten in the task file too. The planned timeline is still recoverable
+        # from the merge records in ``semantic_verifier_runs``, and leaving a beat
+        # list behind that names shots the video does not contain would make the
+        # artifact disagree with both the render and its own material records.
+        task_artifacts.patch_script_data(
+            task_id,
+            visual_beats=_visual_beat_records(visual_beats),
         )
 
     if stop_at == "materials":
@@ -1693,16 +3177,24 @@ def _run_pipeline(
     sm.state.update_task(task_id, state=const.TASK_STATE_PROCESSING, progress=50)
 
     source_ranges: list[tuple[float, float]] | None = None
-    if (
-        params.video_source == "pexels"
-        and params.match_materials_to_script
-        and twelvelabs.visual_matching_requested()
-    ):
+    render_segments: list[RenderSegment] | None = None
+    if smart_matching_requested:
         try:
-            source_ranges = material.load_selected_source_ranges(
-                task_id,
-                downloaded_videos,
-            )
+            if use_visual_beats:
+                # The beat path owns the whole timeline: every beat renders once,
+                # in order, for exactly its own duration.
+                render_segments = material.load_render_segments(
+                    task_id,
+                    downloaded_videos,
+                    visual_beats,
+                    clip_speed=params.video_clip_speed,
+                    audio_duration=material_audio_duration,
+                )
+            else:
+                source_ranges = material.load_selected_source_ranges(
+                    task_id,
+                    downloaded_videos,
+                )
         except (OSError, ValueError) as exc:
             return _mark_task_failed(task_id, "video", str(exc))
 
@@ -1721,6 +3213,7 @@ def _run_pipeline(
             subtitle_path,
             audio_duration,
             source_ranges=source_ranges,
+            render_segments=render_segments,
         )
     )
 

@@ -1,15 +1,28 @@
+import hashlib
 import json
 import logging
 import re
+import tempfile
+import threading
+from dataclasses import asdict
+from pathlib import Path
 from time import perf_counter
-from typing import List
+from typing import Any, List
 
 from loguru import logger
 from openai import AzureOpenAI, OpenAI
 from openai.types.chat import ChatCompletion
 
 from app.config import config
+from app.models.schema import (
+    CriticalVisualFact,
+    MandatoryFactResult,
+    ObservedVisualFacts,
+    SemanticAdjudication,
+    VisualRequirementSpec,
+)
 from app.models.llm_provider import DEFAULT_LLM_PROVIDER_ID, get_llm_provider
+from app.utils import utils
 
 _max_retries = 5
 MIN_SCRIPT_PARAGRAPH_NUMBER = 1
@@ -25,6 +38,50 @@ _SENSITIVE_QUERY_RE = re.compile(
     r"([?&](?:api[_-]?key|access[_-]?token|token|key|secret|password)=)([^&#\s]+)",
     re.IGNORECASE,
 )
+VISUAL_REQUIREMENT_SPEC_SCHEMA_VERSION = "visual-requirement-spec-v2"
+# Part of the adjudication cache key. A stored decision is only reusable while the
+# rules that produced it still hold, so bump this whenever the decision rules in
+# adjudicate_visual_candidates change — otherwise a run would keep honoring
+# verdicts reached under rules it no longer applies.
+SEMANTIC_ADJUDICATION_SCHEMA_VERSION = "semantic-adjudication-v1"
+_VISUAL_REQUIREMENT_CACHE_FORMAT_VERSION = 2
+_VISUAL_REQUIREMENT_CACHE_LOCKS = tuple(threading.Lock() for _ in range(64))
+_SEMANTIC_ADJUDICATION_CACHE_FORMAT_VERSION = 1
+_SEMANTIC_ADJUDICATION_CACHE_LOCKS = tuple(threading.Lock() for _ in range(64))
+_MAX_REQUIREMENT_TEXT_LENGTH = 500
+_MAX_REQUIREMENT_LIST_ITEMS = 12
+_MAX_CRITICAL_VISUAL_FACTS = 8
+_MAX_STRUCTURED_TEXT_LENGTH = 500
+# One decomposition spec is a large object (up to _MAX_CRITICAL_VISUAL_FACTS
+# nested fact objects). Asking for every requirement of a timeline in a single
+# response produced ~10k tokens of JSON, which providers truncate mid-object and
+# we then discard whole. Small batches keep each response parsable, and the
+# per-requirement cache makes the extra requests free on the next run.
+_VISUAL_REQUIREMENT_BATCH_SIZE = 4
+# One repaired narration line is a single short string, so batches can be much
+# larger than a decomposition batch. The bound exists because the model has to
+# keep every requested line index straight in one answer, not because of size.
+_NARRATION_REQUIREMENT_BATCH_SIZE = 25
+# Providers that require an explicit output ceiling used to get 2048 tokens,
+# which silently truncated every multi-object structured response.
+_DEFAULT_MAX_OUTPUT_TOKENS = 8192
+_MAX_STRUCTURED_RESPONSE_ATTEMPTS = 2
+_LOGGED_RESPONSE_PREVIEW_LENGTH = 200
+_TIMESTAMP_EVIDENCE_RE = re.compile(
+    r"(?:\b\d{1,2}:\d{2}(?::\d{2})?\b|\b\d+(?:\.\d+)?\s*(?:s|sec|secs|second|seconds)\b)",
+    re.IGNORECASE,
+)
+_CRITICAL_FACT_BOILERPLATE_WORDS = {
+    "a",
+    "an",
+    "are",
+    "be",
+    "directly",
+    "is",
+    "shown",
+    "the",
+    "visible",
+}
 
 DEFAULT_SCRIPT_SYSTEM_PROMPT = """
 # Role: Video Script Generator
@@ -64,7 +121,10 @@ def _normalize_text_response(content, llm_provider: str) -> str:
     if not content:
         raise ValueError(f"[{llm_provider}] returned empty text content")
 
-    return content.replace("\n", "")
+    # Leading/trailing whitespace was already stripped above. Preserve internal
+    # single and double newlines because generated scripts use them for semantic
+    # line breaks and paragraph boundaries consumed by the subtitle timeline.
+    return content
 
 
 def _sanitize_error_message(error: object) -> str:
@@ -135,6 +195,23 @@ def _extract_qwen_generation_text(response) -> str:
 
     text = _get_response_field(output, "text") if output else None
     return _normalize_text_response(text, "qwen")
+
+
+def _resolved_max_output_tokens(runtime_app_config) -> int:
+    """Output-token ceiling for providers whose SDK needs an explicit limit.
+
+    Only a few adapters (currently Gemini) require the caller to state a maximum;
+    the OpenAI-compatible ones default to the model maximum. The previous
+    hardcoded 2048 was below the size of a single structured response, so the
+    semantic grouping and requirement decomposition calls came back truncated and
+    were discarded as unparsable. Operators can still lower or raise the ceiling
+    through ``llm_max_output_tokens``.
+    """
+    try:
+        configured = int(runtime_app_config.get("llm_max_output_tokens", 0) or 0)
+    except (TypeError, ValueError):
+        configured = 0
+    return configured if configured > 0 else _DEFAULT_MAX_OUTPUT_TOKENS
 
 
 def _generate_response(prompt: str, app_config=None) -> str:
@@ -246,7 +323,7 @@ def _generate_response(prompt: str, app_config=None) -> str:
                 temperature=0.5,
                 top_p=1,
                 top_k=1,
-                max_output_tokens=2048,
+                max_output_tokens=_resolved_max_output_tokens(runtime_app_config),
                 safety_settings=[
                     types.SafetySetting(
                         category="HARM_CATEGORY_HARASSMENT",
@@ -592,6 +669,88 @@ def _strip_code_fence(text: str) -> str:
     return t.strip()
 
 
+def _extract_json_payload(text: str) -> str:
+    """Best-effort recovery of the JSON document inside a chatty response.
+
+    Providers sometimes prepend a sentence, append a note, or wrap the payload in
+    a fence. ``generate_visual_slot_queries`` already recovered from that with a
+    local regex, which is exactly why it kept working while the structured calls
+    that lacked recovery failed on the same provider. This centralizes the
+    behavior so every structured call benefits.
+    """
+    stripped = _strip_code_fence(text)
+    try:
+        json.loads(stripped)
+        return stripped
+    except (json.JSONDecodeError, ValueError):
+        pass
+    # The document starts at the first structural character; anything before it is
+    # prose. ``raw_decode`` accepts one complete value there and ignores trailing
+    # prose, so a truncated response stays unparsable instead of being "recovered"
+    # as one of its inner objects, which would parse cleanly and be silently wrong.
+    starts = [
+        position
+        for position in (stripped.find("{"), stripped.find("["))
+        if position >= 0
+    ]
+    if not starts:
+        return stripped
+    start = min(starts)
+    try:
+        _, end = json.JSONDecoder().raw_decode(stripped, start)
+    except (json.JSONDecodeError, ValueError):
+        return stripped
+    return stripped[start:end]
+
+
+def _response_diagnostic(response: str) -> str:
+    """Log-safe description of a response we could not parse.
+
+    Logging only the exception class name made these failures undiagnosable: a
+    truncated payload, an empty payload and a refusal all reported
+    ``JSONDecodeError``. The preview is provider output, never a request, so it
+    cannot contain configured credentials.
+    """
+    text = (response or "").strip()
+    preview = re.sub(r"\s+", " ", text[:_LOGGED_RESPONSE_PREVIEW_LENGTH])
+    return f"response_length={len(text)}, response_preview={preview!r}"
+
+
+def _generate_structured_response(
+    prompt: str,
+    *,
+    purpose: str,
+    app_config=None,
+    attempts: int = _MAX_STRUCTURED_RESPONSE_ATTEMPTS,
+) -> Any:
+    """Ask the selected provider for JSON, with recovery and a bounded retry.
+
+    Returns the parsed payload, or ``None`` when every attempt failed. Provider
+    unavailability is not retried: ``_generate_response`` already exhausts its own
+    transport retries and returns a sanitized ``Error: `` string.
+    """
+    for attempt in range(1, max(1, attempts) + 1):
+        if app_config is None:
+            response = _generate_response(prompt)
+        else:
+            response = _generate_response(prompt, app_config=app_config)
+        if response.startswith("Error: "):
+            logger.warning(
+                f"{purpose} provider is unavailable: "
+                f"{response[:_LOGGED_RESPONSE_PREVIEW_LENGTH]}"
+            )
+            return None
+        try:
+            return json.loads(_extract_json_payload(response))
+        except Exception as exc:
+            logger.warning(
+                f"{purpose} returned unusable structured data "
+                f"(attempt {attempt}/{max(1, attempts)}): "
+                f"error={type(exc).__name__}: {exc}, {_response_diagnostic(response)}"
+            )
+    return None
+
+
 def generate_terms(
     video_subject: str,
     video_script: str,
@@ -747,7 +906,7 @@ def generate_visual_slot_queries(
     queries_per_slot: int = 1,
     app_config=None,
 ) -> dict[int, list[str]]:
-    """Generate indexed stock-video queries from each slot's narration only."""
+    """Generate indexed stock-video queries from each slot's visual requirement."""
     if not visual_slots:
         return {}
 
@@ -757,7 +916,7 @@ def generate_visual_slot_queries(
             "slot_index": int(slot["slot_index"]),
             "start_time": float(slot["start_time"]),
             "end_time": float(slot["end_time"]),
-            "narration_text": str(slot["narration_text"]).strip(),
+            "visual_requirement": str(slot["visual_requirement"]).strip(),
         }
         for slot in visual_slots
     ]
@@ -772,6 +931,20 @@ def generate_visual_slot_queries(
         }
         for slot in slot_payload
     ]
+    # With more than one query per slot the extra phrasings are ordered fallbacks
+    # for the same shot, tried on the same provider before another catalog is
+    # asked. Near-duplicates would waste a search and an analysis round, so the
+    # ordering and the "same scene" constraint are stated explicitly.
+    fallback_rule = (
+        ""
+        if queries_per_slot == 1
+        else (
+            "\n8. Order each slot's queries as fallbacks for the same shot: the most "
+            "literal phrasing first, then progressively simpler or more generic "
+            "phrasings of the same visible subject and action. Fallbacks must differ "
+            "in wording, and none of them may describe a different scene."
+        )
+    )
     prompt = f"""
 # Role: Visual Slot Stock-Video Search Query Generator
 
@@ -781,13 +954,13 @@ Generate Pexels stock-video search queries for the indexed visual slots below.
 ## Rules
 1. Return a JSON array only, with exactly one object for every supplied slot_index.
 2. Each object must contain slot_index and exactly {queries_per_slot} queries.
-3. Derive each query only from that slot's narration_text. Never move an action,
+3. Derive each query only from that slot's visual_requirement. Never move an action,
    subject, or scene from one slot to another.
 4. Preserve the narration's main visible subject and action.
 5. Every query must describe a concrete, camera-visible shot suitable for stock footage.
 6. Avoid abstract concepts, emotions, metaphors, narration summaries, camera
    transitions, and editorial instructions.
-7. Use concise English queries of 2-6 words.
+7. Use concise English queries of 2-6 words.{fallback_rule}
 
 ## Video Subject
 {video_subject}
@@ -824,11 +997,22 @@ Generate Pexels stock-video search queries for the indexed visual slots below.
             ):
                 raise ValueError(f"slot {slot_index} queries must be strings")
             queries = [query.strip() for query in queries if query.strip()]
-            if len(queries) != queries_per_slot:
-                raise ValueError(
-                    f"slot {slot_index} must contain exactly "
-                    f"{queries_per_slot} queries"
-                )
+            # Alternate phrasings are a bonus, not a contract: material selection
+            # tries them in order and stops at the first winner. Rejecting a slot
+            # because the provider returned two phrasings instead of three would
+            # throw away the one phrasing that works, so accept what arrived,
+            # collapse repeats, and keep at most what was asked for.
+            deduplicated: list[str] = []
+            seen_queries: set[str] = set()
+            for query in queries:
+                normalized_query = query.casefold()
+                if normalized_query in seen_queries:
+                    continue
+                seen_queries.add(normalized_query)
+                deduplicated.append(query)
+            queries = deduplicated[:queries_per_slot]
+            if not queries:
+                raise ValueError(f"slot {slot_index} must contain at least one query")
             if not all(re.search(r"[A-Za-z]", query) for query in queries):
                 raise ValueError(f"slot {slot_index} queries must be English")
             queries_by_slot[slot_index] = queries
@@ -836,6 +1020,17 @@ Generate Pexels stock-video search queries for the indexed visual slots below.
         if set(queries_by_slot) != expected_indexes:
             missing = sorted(expected_indexes - set(queries_by_slot))
             raise ValueError(f"visual slot query response is missing slots: {missing}")
+        if queries_per_slot > 1:
+            short_slots = sorted(
+                slot_index
+                for slot_index, slot_queries in queries_by_slot.items()
+                if len(slot_queries) < queries_per_slot
+            )
+            if short_slots:
+                logger.warning(
+                    "visual slot queries returned fewer phrasings than requested: "
+                    f"requested={queries_per_slot}, slots={short_slots}"
+                )
         return queries_by_slot
 
     response = ""
@@ -877,6 +1072,1403 @@ Generate Pexels stock-video search queries for the indexed visual slots below.
                 )
 
     return {}
+
+
+def generate_semantic_visual_span_specs(
+    narration_text: str,
+    timed_units: list[dict],
+    app_config=None,
+) -> object | None:
+    """Request one compact semantic grouping from the selected LLM provider.
+
+    The response remains untrusted here. The timeline service performs the
+    authoritative range/schema/coverage validation before constructing spans.
+    """
+    if not timed_units:
+        return None
+
+    unit_lines = []
+    for zero_based_id, unit in enumerate(timed_units):
+        unit_lines.append(
+            "|".join(
+                (
+                    str(zero_based_id),
+                    str(unit.get("source_narration_slot_index") or "-"),
+                    json.dumps(str(unit.get("text") or ""), ensure_ascii=False),
+                )
+            )
+        )
+
+    prompt = f"""
+# Role: Semantic Visual Span Grouper
+
+## Goal
+Identify only the points where the camera-visible meaning of this narration
+genuinely changes. Prefer the SMALLEST number of spans needed for distinct
+visible concepts.
+
+## Authoritative Units
+Each line is: zero_based_unit_id|narration_slot_hint|spoken_unit_text
+Unit IDs and their order are authoritative. A range uses start_unit inclusive
+and end_unit_exclusive. Never rewrite, omit, duplicate, or reorder source units.
+
+{chr(10).join(unit_lines)}
+
+## Read-only Narration Context
+This preserves punctuation and paragraph hints. It is context only and must not
+be copied into the response.
+<narration>
+{narration_text}
+</narration>
+
+## Semantic Rules
+1. Start a new span only for a meaningful visible change in subject, physical
+   action, object, location, environment, state, process, or event.
+2. Do not split merely for punctuation, sentence/paragraph boundaries,
+   adjectives, clauses, or conjunctions.
+3. Keep a continuous visible process together even when described in multiple
+   sentences.
+4. Attach abstract or non-visible wording to the nearest valid visible concept;
+   never create a nonsense standalone visual for an abstract phrase.
+5. A multi-word unit is indivisible. Boundaries may occur only between unit IDs.
+6. visual_requirement must be concise, concrete, camera-visible, and must
+   preserve the real subject/action without adding facts.
+
+## Strict Output
+Return one JSON array only. Every object must contain exactly:
+- start_unit: integer
+- end_unit_exclusive: integer
+- visual_requirement: non-empty string
+
+Do not return timestamps, durations, spoken_text, search queries, explanations,
+provider data, or any other fields.
+
+Example shape only:
+[
+  {{"start_unit": 0, "end_unit_exclusive": 8,
+    "visual_requirement": "Ripe coffee cherries growing on coffee plants"}}
+]
+""".strip()
+
+    try:
+        parsed = _generate_structured_response(
+            prompt,
+            purpose="semantic visual grouping",
+            app_config=app_config,
+        )
+        if parsed is None:
+            return None
+        return parsed
+    except Exception as exc:
+        logger.warning(
+            "semantic visual grouping returned unusable structured data: "
+            f"error={type(exc).__name__}: {exc}"
+        )
+        return None
+
+
+def _validated_narration_visual_requirements(
+    parsed: object,
+    requested_indexes: set[int],
+) -> dict[int, str]:
+    """Keep the well-formed answers and drop the rest.
+
+    A requested line is absent from the result when the provider left it out,
+    answered it with an empty string, or answered it with something malformed.
+    The caller treats all three the same way -- that line has no visual
+    requirement of its own -- so one bad object never discards the lines that
+    came back correctly.
+    """
+    if not isinstance(parsed, list):
+        raise ValueError("narration visual requirements must be a JSON array")
+    if len(parsed) > 2 * max(1, len(requested_indexes)):
+        raise ValueError("narration visual requirements returned too many objects")
+
+    requirements: dict[int, str] = {}
+    rejected = 0
+    for item in parsed:
+        if not isinstance(item, dict) or set(item) - {"index", "visual_requirement"}:
+            rejected += 1
+            continue
+        index = item.get("index")
+        if isinstance(index, bool) or not isinstance(index, int):
+            rejected += 1
+            continue
+        if index not in requested_indexes or index in requirements:
+            rejected += 1
+            continue
+        raw_requirement = item.get("visual_requirement")
+        if isinstance(raw_requirement, str) and not raw_requirement.strip():
+            # The documented way to say "this line has no visible content of its
+            # own". It is an answer, not a provider failure.
+            continue
+        try:
+            requirements[index] = _bounded_structured_text(
+                raw_requirement,
+                "visual_requirement",
+            )
+        except ValueError:
+            rejected += 1
+    if rejected:
+        logger.warning(
+            "narration visual requirement objects were unusable: "
+            f"rejected={rejected}, accepted={len(requirements)}"
+        )
+    return requirements
+
+
+def generate_narration_visual_requirements(
+    narration_text: str,
+    narration_lines: list[dict],
+    app_config=None,
+) -> dict[int, str] | None:
+    """Rewrite spoken narration lines as requirements a camera could record.
+
+    Used when semantic grouping failed and the timeline fell back to one span
+    per narration line: the spoken line is then standing in for a visual
+    requirement, and a line such as "Patient." cannot be filled by any stock
+    clip. Returns the accepted requirements keyed by the caller's line index.
+    A line that has no visible content of its own is deliberately absent rather
+    than given an invented scene, so the caller can attach it to a neighbour.
+
+    Returns ``None`` only when no batch produced a parseable payload at all,
+    which the caller must treat as "the repair is unavailable" and not as "the
+    narration has nothing visible in it".
+    """
+    requested = [
+        {"index": line.get("index"), "spoken_text": str(line.get("spoken_text") or "")}
+        for line in narration_lines
+        if isinstance(line.get("index"), int)
+        and not isinstance(line.get("index"), bool)
+        and str(line.get("spoken_text") or "").strip()
+    ]
+    if not requested:
+        return None
+
+    requirements: dict[int, str] = {}
+    parsed_any_batch = False
+    for batch_start in range(0, len(requested), _NARRATION_REQUIREMENT_BATCH_SIZE):
+        batch = requested[
+            batch_start : batch_start + _NARRATION_REQUIREMENT_BATCH_SIZE
+        ]
+        line_block = chr(10).join(
+            "|".join(
+                (
+                    str(line["index"]),
+                    json.dumps(line["spoken_text"], ensure_ascii=False),
+                )
+            )
+            for line in batch
+        )
+        prompt = f"""
+# Role: Narration Line to Filmable Visual Requirement
+
+## Goal
+For each narration line below, describe what a real stock video clip would have
+to show while that line is spoken. The result is used to search stock catalogs
+and to verify a candidate clip against it, so it must describe visible things
+and never the meaning of the words.
+
+## Authoritative Lines
+Each line is: line_index|spoken_text
+Line indexes are authoritative. Answer every line exactly once and never
+rewrite, merge, split, reorder, or invent lines.
+
+{line_block}
+
+## Read-only Narration Context
+Use this only to resolve what a short or dependent line refers to. It must not
+be copied into the response.
+<narration>
+{narration_text}
+</narration>
+
+## Rules
+1. visual_requirement must be concrete and camera-visible: a subject, action,
+   object, location, environment, or state that a camera can record.
+2. Add no fact the narration does not support. Resolve pronouns and elliptical
+   lines from the context above instead of inventing a new subject.
+3. Never request on-screen text, captions, logos, brands, or named real people.
+4. A line with no visible content of its own -- a judgement, a feeling, an
+   abstract statement, a connective phrase -- must return an empty string.
+   Never invent a nonsense visual for such a line.
+5. Describe one visible situation in under 20 words.
+
+## Strict Output
+Return one JSON array only. Every object must contain exactly:
+- index: integer, one of the line indexes above
+- visual_requirement: string, empty only for a line with no visible content
+
+Do not return timestamps, durations, spoken text, search queries, explanations,
+provider data, or any other fields.
+
+Example shape only:
+[
+  {{"index": 1,
+    "visual_requirement": "A single water drop falling into still water"}},
+  {{"index": 2, "visual_requirement": ""}}
+]
+""".strip()
+
+        parsed = _generate_structured_response(
+            prompt,
+            purpose="narration visual requirement repair",
+            app_config=app_config,
+        )
+        if parsed is None:
+            continue
+        parsed_any_batch = True
+        try:
+            requirements.update(
+                _validated_narration_visual_requirements(
+                    parsed,
+                    {line["index"] for line in batch},
+                )
+            )
+        except ValueError as exc:
+            logger.warning(
+                "narration visual requirement repair returned an unusable batch: "
+                f"reason={exc}"
+            )
+    if not parsed_any_batch:
+        return None
+    return requirements
+
+
+def normalize_visual_requirement(value: str) -> str:
+    """Canonical text identity shared by requirement batching and cache lookups."""
+    return " ".join(str(value or "").split()).strip().casefold()
+
+
+def _semantic_words(value: str) -> str:
+    return " ".join(
+        re.sub(r"[^\w]+", " ", str(value or "").casefold(), flags=re.UNICODE).split()
+    )
+
+
+def _selected_llm_identity(app_config=None) -> tuple[str, str]:
+    runtime_app_config = app_config if app_config is not None else config.app
+    provider_id = str(
+        runtime_app_config.get("llm_provider", DEFAULT_LLM_PROVIDER_ID)
+    ).lower()
+    provider = get_llm_provider(provider_id)
+    if provider is None:
+        return provider_id, ""
+    configured_model = runtime_app_config.get(provider.config_key("model_name"), "")
+    return provider_id, provider.resolve_model_name(configured_model)
+
+
+def _bounded_structured_text(value: object, field_name: str) -> str:
+    if not isinstance(value, str):
+        raise ValueError(f"{field_name} must be a string")
+    text = " ".join(value.split()).strip()
+    if not text or len(text) > _MAX_STRUCTURED_TEXT_LENGTH:
+        raise ValueError(f"{field_name} is empty or too long")
+    return text
+
+
+def _bounded_structured_string_list(value: object, field_name: str) -> list[str]:
+    if not isinstance(value, list) or len(value) > _MAX_REQUIREMENT_LIST_ITEMS:
+        raise ValueError(f"{field_name} must be a bounded string array")
+    return [
+        _bounded_structured_text(item, f"{field_name} item")
+        for item in value
+    ]
+
+
+def visual_requirement_spec_to_dict(spec: VisualRequirementSpec) -> dict[str, Any]:
+    """Return the validated, credential-free representation used by other services."""
+    return asdict(spec)
+
+
+def visual_requirement_spec_digest(spec: VisualRequirementSpec) -> str:
+    payload = json.dumps(
+        visual_requirement_spec_to_dict(spec),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _visual_requirement_spec_cache_dir() -> Path:
+    return Path(utils.storage_dir("cache_visual_requirement_specs", create=True))
+
+
+def _visual_requirement_spec_cache_digest(
+    normalized_requirement: str,
+    provider_id: str,
+    model_name: str,
+) -> str:
+    payload = json.dumps(
+        {
+            "normalized_requirement_hash": hashlib.sha256(
+                normalized_requirement.encode("utf-8")
+            ).hexdigest(),
+            "provider": provider_id,
+            "model": model_name,
+            "schema_version": VISUAL_REQUIREMENT_SPEC_SCHEMA_VERSION,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _visual_requirement_spec_cache_path(
+    normalized_requirement: str,
+    provider_id: str,
+    model_name: str,
+) -> Path:
+    digest = _visual_requirement_spec_cache_digest(
+        normalized_requirement,
+        provider_id,
+        model_name,
+    )
+    return _visual_requirement_spec_cache_dir() / f"{digest}.json"
+
+
+def _visual_requirement_spec_cache_lock(
+    normalized_requirement: str,
+    provider_id: str,
+    model_name: str,
+) -> threading.Lock:
+    digest = _visual_requirement_spec_cache_digest(
+        normalized_requirement,
+        provider_id,
+        model_name,
+    )
+    return _VISUAL_REQUIREMENT_CACHE_LOCKS[
+        int(digest[:8], 16) % len(_VISUAL_REQUIREMENT_CACHE_LOCKS)
+    ]
+
+
+_VISUAL_REQUIREMENT_SPEC_ITEM_FIELDS = {
+    "requirement_id",
+    "original_requirement",
+    "subjects",
+    "primary_action",
+    "objects",
+    "required_relations",
+    "required_context",
+    "required_visible_state",
+    "optional_attributes",
+    "critical_visual_facts",
+    "ambiguity_notes",
+}
+_CRITICAL_VISUAL_FACT_FIELDS = {
+    "id",
+    "fact",
+    "mandatory",
+    "direct_evidence_needed",
+    "evidence_description",
+    "basis_type",
+    "basis_quote",
+}
+
+
+def _validate_visual_requirement_spec_item(
+    item: object,
+    *,
+    requirement_id: int,
+    original_requirement: str,
+    provider_id: str,
+    model_name: str,
+) -> VisualRequirementSpec:
+    if not isinstance(item, dict) or set(item) != _VISUAL_REQUIREMENT_SPEC_ITEM_FIELDS:
+        raise ValueError("visual requirement spec fields are invalid")
+    if isinstance(item.get("requirement_id"), bool) or item.get(
+        "requirement_id"
+    ) != requirement_id:
+        raise ValueError("visual requirement spec id is invalid")
+
+    original = _bounded_structured_text(
+        item.get("original_requirement"), "original_requirement"
+    )
+    if normalize_visual_requirement(original) != normalize_visual_requirement(
+        original_requirement
+    ):
+        raise ValueError("visual requirement spec rewrote the source requirement")
+
+    primary_action_value = item.get("primary_action")
+    if primary_action_value is None:
+        primary_action = None
+    else:
+        primary_action = _bounded_structured_text(
+            primary_action_value, "primary_action"
+        )
+        action_words = _semantic_words(primary_action)
+        if not action_words or action_words not in _semantic_words(original):
+            raise ValueError("primary_action is not grounded in the source requirement")
+
+    raw_facts = item.get("critical_visual_facts")
+    if (
+        not isinstance(raw_facts, list)
+        or not raw_facts
+        or len(raw_facts) > _MAX_CRITICAL_VISUAL_FACTS
+    ):
+        raise ValueError("critical_visual_facts must be a bounded non-empty array")
+
+    critical_facts: list[CriticalVisualFact] = []
+    fact_ids: set[str] = set()
+    source_words = _semantic_words(original)
+    source_word_set = set(source_words.split())
+    for fact_index, raw_fact in enumerate(raw_facts, start=1):
+        if not isinstance(raw_fact, dict) or set(raw_fact) != _CRITICAL_VISUAL_FACT_FIELDS:
+            raise ValueError("critical visual fact fields are invalid")
+        fact_id = _bounded_structured_text(raw_fact.get("id"), "critical fact id")
+        if fact_id != f"f{fact_index}" or fact_id in fact_ids:
+            raise ValueError("critical visual fact ids must be unique and sequential")
+        fact_ids.add(fact_id)
+        mandatory = raw_fact.get("mandatory")
+        direct_evidence_needed = raw_fact.get("direct_evidence_needed")
+        if not isinstance(mandatory, bool) or not isinstance(
+            direct_evidence_needed, bool
+        ):
+            raise ValueError("critical fact flags must be booleans")
+        basis_type = raw_fact.get("basis_type")
+        if basis_type not in {"explicit", "logically_necessary"}:
+            raise ValueError("critical fact basis_type is invalid")
+        basis_quote = _bounded_structured_text(
+            raw_fact.get("basis_quote"), "critical fact basis_quote"
+        )
+        quote_words = _semantic_words(basis_quote)
+        if not quote_words or quote_words not in source_words:
+            raise ValueError("critical fact basis_quote is not from the requirement")
+        if basis_type == "logically_necessary":
+            if primary_action is None or _semantic_words(primary_action) not in quote_words:
+                raise ValueError(
+                    "logically necessary facts must cite the requested action phrase"
+                )
+        fact_text = _bounded_structured_text(raw_fact.get("fact"), "critical fact")
+        unsupported_fact_words = set(_semantic_words(fact_text).split()) - (
+            source_word_set | _CRITICAL_FACT_BOILERPLATE_WORDS
+        )
+        if mandatory and basis_type == "explicit" and unsupported_fact_words:
+            raise ValueError(
+                "mandatory critical facts must use only source-grounded wording"
+            )
+        if basis_type == "logically_necessary" and not direct_evidence_needed:
+            raise ValueError(
+                "logically necessary action facts require direct visual evidence"
+            )
+        critical_facts.append(
+            CriticalVisualFact(
+                id=fact_id,
+                fact=fact_text,
+                mandatory=mandatory,
+                direct_evidence_needed=direct_evidence_needed,
+                evidence_description=_bounded_structured_text(
+                    raw_fact.get("evidence_description"),
+                    "critical fact evidence_description",
+                ),
+                basis_type=basis_type,
+                basis_quote=basis_quote,
+            )
+        )
+
+    if not any(fact.mandatory for fact in critical_facts):
+        raise ValueError("at least one critical visual fact must be mandatory")
+    if primary_action is not None and not any(
+        fact.mandatory
+        and fact.direct_evidence_needed
+        and fact.basis_type == "logically_necessary"
+        for fact in critical_facts
+    ):
+        raise ValueError(
+            "an action requirement needs a defining logically necessary evidence fact"
+        )
+
+    subjects = _bounded_structured_string_list(item.get("subjects"), "subjects")
+    objects = _bounded_structured_string_list(item.get("objects"), "objects")
+    required_relations = _bounded_structured_string_list(
+        item.get("required_relations"), "required_relations"
+    )
+    required_context = _bounded_structured_string_list(
+        item.get("required_context"), "required_context"
+    )
+    required_visible_state = _bounded_structured_string_list(
+        item.get("required_visible_state"), "required_visible_state"
+    )
+    for field_name, values in (
+        ("subjects", subjects),
+        ("objects", objects),
+        ("required_relations", required_relations),
+        ("required_context", required_context),
+        ("required_visible_state", required_visible_state),
+    ):
+        for value in values:
+            if not set(_semantic_words(value).split()).issubset(source_word_set):
+                raise ValueError(f"{field_name} contains unsupported source details")
+
+    return VisualRequirementSpec(
+        schema_version=VISUAL_REQUIREMENT_SPEC_SCHEMA_VERSION,
+        generator_provider=provider_id,
+        generator_model=model_name,
+        original_requirement=original,
+        subjects=subjects,
+        primary_action=primary_action,
+        objects=objects,
+        required_relations=required_relations,
+        required_context=required_context,
+        required_visible_state=required_visible_state,
+        optional_attributes=_bounded_structured_string_list(
+            item.get("optional_attributes"), "optional_attributes"
+        ),
+        critical_visual_facts=critical_facts,
+        ambiguity_notes=_bounded_structured_string_list(
+            item.get("ambiguity_notes"), "ambiguity_notes"
+        ),
+    )
+
+
+def _load_visual_requirement_spec_cache(
+    original_requirement: str,
+    provider_id: str,
+    model_name: str,
+) -> VisualRequirementSpec | None:
+    normalized = normalize_visual_requirement(original_requirement)
+    try:
+        payload = json.loads(
+            _visual_requirement_spec_cache_path(
+                normalized, provider_id, model_name
+            ).read_text(encoding="utf-8")
+        )
+        if (
+            not isinstance(payload, dict)
+            or payload.get("version") != _VISUAL_REQUIREMENT_CACHE_FORMAT_VERSION
+            or payload.get("schema_version")
+            != VISUAL_REQUIREMENT_SPEC_SCHEMA_VERSION
+            or payload.get("provider") != provider_id
+            or payload.get("model") != model_name
+            or not isinstance(payload.get("spec"), dict)
+        ):
+            return None
+        raw_spec = dict(payload["spec"])
+        raw_spec["requirement_id"] = 0
+        for field in ("schema_version", "generator_provider", "generator_model"):
+            raw_spec.pop(field, None)
+        return _validate_visual_requirement_spec_item(
+            raw_spec,
+            requirement_id=0,
+            original_requirement=original_requirement,
+            provider_id=provider_id,
+            model_name=model_name,
+        )
+    except FileNotFoundError:
+        return None
+    except Exception as exc:
+        logger.warning(
+            "failed to read visual requirement spec cache: "
+            f"error={type(exc).__name__}"
+        )
+        return None
+
+
+def _save_visual_requirement_spec_cache(spec: VisualRequirementSpec) -> None:
+    normalized = normalize_visual_requirement(spec.original_requirement)
+    cache_path = _visual_requirement_spec_cache_path(
+        normalized,
+        spec.generator_provider,
+        spec.generator_model,
+    )
+    temp_path: Path | None = None
+    try:
+        payload = {
+            "version": _VISUAL_REQUIREMENT_CACHE_FORMAT_VERSION,
+            "schema_version": VISUAL_REQUIREMENT_SPEC_SCHEMA_VERSION,
+            "provider": spec.generator_provider,
+            "model": spec.generator_model,
+            "spec": visual_requirement_spec_to_dict(spec),
+        }
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=cache_path.parent,
+            prefix=f".{cache_path.stem}-",
+            suffix=".tmp",
+            delete=False,
+        ) as temp_file:
+            temp_path = Path(temp_file.name)
+            json.dump(payload, temp_file, ensure_ascii=False, separators=(",", ":"))
+            temp_file.flush()
+        temp_path.replace(cache_path)
+        temp_path = None
+    except Exception as exc:
+        logger.warning(
+            "failed to write visual requirement spec cache: "
+            f"error={type(exc).__name__}"
+        )
+    finally:
+        if temp_path is not None:
+            try:
+                temp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+
+def _validated_requirement_specs(
+    parsed: Any,
+    *,
+    chunk: list[str],
+    provider_id: str,
+    model_name: str,
+) -> list[VisualRequirementSpec]:
+    """Validate one decomposition batch and return specs ordered like ``chunk``.
+
+    Raises on any structural problem so the caller can drop this batch alone.
+    Requirement ids are batch-local, which is what keeps a malformed batch from
+    invalidating the batches that parsed cleanly.
+    """
+    if not isinstance(parsed, dict) or set(parsed) != {"specs"}:
+        raise ValueError("visual requirement decomposition root is invalid")
+    raw_specs = parsed.get("specs")
+    if not isinstance(raw_specs, list) or len(raw_specs) != len(chunk):
+        raise ValueError("visual requirement decomposition count is invalid")
+    by_id: dict[int, dict[str, Any]] = {}
+    for raw_spec in raw_specs:
+        if not isinstance(raw_spec, dict):
+            raise ValueError("visual requirement spec must be an object")
+        raw_id = raw_spec.get("requirement_id")
+        if isinstance(raw_id, bool) or not isinstance(raw_id, int):
+            raise ValueError("visual requirement spec id must be an integer")
+        if raw_id in by_id or not 0 <= raw_id < len(chunk):
+            raise ValueError("visual requirement spec id is duplicate or unknown")
+        by_id[raw_id] = raw_spec
+    if set(by_id) != set(range(len(chunk))):
+        raise ValueError("visual requirement decomposition is incomplete")
+    return [
+        _validate_visual_requirement_spec_item(
+            by_id[requirement_id],
+            requirement_id=requirement_id,
+            original_requirement=requirement,
+            provider_id=provider_id,
+            model_name=model_name,
+        )
+        for requirement_id, requirement in enumerate(chunk)
+    ]
+
+
+def generate_visual_requirement_specs(
+    visual_requirements: list[str],
+    app_config=None,
+) -> dict[str, VisualRequirementSpec]:
+    """Decompose all unique requirements with the selected provider, in batches.
+
+    Requirements are requested in small batches because one spec is a large
+    object; a single request for a whole timeline produced a response the provider
+    truncated, and the entire timeline then had no specs. A batch that fails is
+    dropped on its own, so the batches that parsed cleanly still return specs.
+
+    Returned keys are normalized requirements. Missing keys mean the provider
+    response was unavailable or failed strict source-grounding validation; no
+    synthetic fallback spec is invented.
+    """
+    unique_requirements: list[str] = []
+    seen: set[str] = set()
+    for value in visual_requirements:
+        requirement = " ".join(str(value or "").split()).strip()
+        normalized = normalize_visual_requirement(requirement)
+        if (
+            not normalized
+            or len(requirement) > _MAX_REQUIREMENT_TEXT_LENGTH
+            or normalized in seen
+        ):
+            continue
+        seen.add(normalized)
+        unique_requirements.append(requirement)
+    if not unique_requirements:
+        return {}
+
+    provider_id, model_name = _selected_llm_identity(app_config)
+    resolved: dict[str, VisualRequirementSpec] = {}
+    uncached: list[str] = []
+    try:
+        for requirement in unique_requirements:
+            normalized = normalize_visual_requirement(requirement)
+            lock = _visual_requirement_spec_cache_lock(
+                normalized, provider_id, model_name
+            )
+            with lock:
+                cached = _load_visual_requirement_spec_cache(
+                    requirement, provider_id, model_name
+                )
+            if cached is None:
+                uncached.append(requirement)
+            else:
+                resolved[normalized] = cached
+
+        if not uncached:
+            return resolved
+
+        failed_batches = 0
+        for chunk_start in range(0, len(uncached), _VISUAL_REQUIREMENT_BATCH_SIZE):
+            chunk = uncached[chunk_start : chunk_start + _VISUAL_REQUIREMENT_BATCH_SIZE]
+            request_items = [
+                {"requirement_id": index, "visual_requirement": requirement}
+                for index, requirement in enumerate(chunk)
+            ]
+            prompt = f"""
+# Role: General Visual Requirement Decomposer
+
+## Goal
+Convert each immutable visual requirement into only the camera-observable facts
+needed to distinguish the requested scene/action from merely related footage.
+
+## Critical safety rules
+1. Never add a mandatory fact merely because it is common, plausible, attractive,
+   or useful in a typical scene.
+2. A mandatory fact is allowed only when it is explicitly stated by the source
+   requirement, or logically necessary for the requested action/relation to be true.
+3. Clothing, weather, location, camera angle, colors, and background details are
+   optional unless explicitly required by the source wording.
+4. basis_quote must be an exact quote from visual_requirement. For a
+   logically_necessary fact it must include the exact requested action phrase.
+   Mandatory fact wording and every required field must use only words grounded in
+   visual_requirement. Put any merely plausible additions in optional_attributes.
+5. Keep optional details in optional_attributes; they can never become hard gates.
+6. Set direct_evidence_needed=true only when the defining action/relation/event
+   itself must be visible. Related subjects or objects alone are not evidence.
+7. When primary_action is not null, include at least one mandatory,
+   direct_evidence_needed, logically_necessary fact that operationalizes the exact
+   visible event/change/relation which makes that action true. Merely restating the
+   action label is insufficient: distinguish it from preparation, handling,
+   possession, inspection, aftermath, or a nearby related action. New wording is
+   allowed in this one kind of fact only when it describes that logically necessary
+   defining evidence; never use it to add typical environmental details.
+8. A continuous visible state with no requested action must not receive an invented
+   action gate.
+9. Preserve requirement_id and original wording. Do not output timestamps.
+
+## Strict JSON output
+Return one object with exactly one key, specs. specs must contain exactly one object
+per input. Every spec object must contain exactly:
+requirement_id, original_requirement, subjects, primary_action, objects,
+required_relations, required_context, required_visible_state, optional_attributes,
+critical_visual_facts, ambiguity_notes.
+
+primary_action is a source-grounded string or null. All plural fields are arrays of
+strings. critical_visual_facts is a non-empty array of at most
+{_MAX_CRITICAL_VISUAL_FACTS} objects, with sequential IDs f1, f2, ... and exactly:
+id, fact, mandatory, direct_evidence_needed, evidence_description, basis_type,
+basis_quote. basis_type is explicit or logically_necessary.
+
+Inputs:
+{json.dumps(request_items, ensure_ascii=False)}
+""".strip()
+            parsed = _generate_structured_response(
+                prompt,
+                purpose="visual requirement decomposition",
+                app_config=app_config,
+            )
+            if parsed is None:
+                failed_batches += 1
+                continue
+            try:
+                specs = _validated_requirement_specs(
+                    parsed,
+                    chunk=chunk,
+                    provider_id=provider_id,
+                    model_name=model_name,
+                )
+            except Exception as exc:
+                failed_batches += 1
+                logger.warning(
+                    "visual requirement decomposition batch is unusable: "
+                    f"batch_start={chunk_start}, size={len(chunk)}, "
+                    f"error={type(exc).__name__}: {exc}"
+                )
+                continue
+            for requirement, spec in zip(chunk, specs):
+                normalized = normalize_visual_requirement(requirement)
+                resolved[normalized] = spec
+                with _visual_requirement_spec_cache_lock(
+                    normalized, provider_id, model_name
+                ):
+                    _save_visual_requirement_spec_cache(spec)
+
+        cached_count = len(unique_requirements) - len(uncached)
+        logger.info(
+            "visual requirement decomposition completed: "
+            f"unique={len(unique_requirements)}, requested={len(uncached)}, "
+            f"generated={len(resolved) - cached_count}, cached={cached_count}, "
+            f"failed_batches={failed_batches}"
+        )
+        return resolved
+    except Exception as exc:
+        logger.warning(
+            "visual requirement decomposition returned unusable structured data: "
+            f"error={type(exc).__name__}: {exc}"
+        )
+        return resolved
+
+
+def _narration_contains_quote(narration_text: str, quote: str) -> bool:
+    """True when the quote is a contiguous word sequence of the narration."""
+    narration_words = _semantic_words(narration_text)
+    quote_words = _semantic_words(quote)
+    if not narration_words or not quote_words:
+        return False
+    if len(quote_words.split()) < 2 and len(narration_words.split()) >= 2:
+        return False
+    return f" {quote_words} " in f" {narration_words} "
+
+
+def _validated_alternative_requirements(
+    parsed: object,
+    chunk: list[dict],
+) -> dict[int, dict[str, str]]:
+    """Keep only proposals that are grounded in the beat's own spoken text."""
+    payload = parsed.get("alternatives") if isinstance(parsed, dict) else parsed
+    if not isinstance(payload, list):
+        raise ValueError("alternatives must be an array")
+    if len(payload) > len(chunk):
+        raise ValueError("alternatives contain more items than requested")
+
+    accepted: dict[int, dict[str, str]] = {}
+    for entry in payload:
+        if not isinstance(entry, dict):
+            raise ValueError("each alternative must be an object")
+        item_id = entry.get("item_id")
+        if not isinstance(item_id, int) or isinstance(item_id, bool):
+            raise ValueError("item_id must be an integer")
+        if not 0 <= item_id < len(chunk) or item_id in accepted:
+            raise ValueError(f"item_id {item_id} is unknown or duplicated")
+        item = chunk[item_id]
+        requirement = _bounded_structured_text(
+            entry.get("visual_requirement"), "visual_requirement"
+        )
+        narration_basis = _bounded_structured_text(
+            entry.get("narration_basis"), "narration_basis"
+        )
+        if not re.search(r"[A-Za-z]", requirement):
+            logger.warning(
+                "alternative visual requirement is not searchable: "
+                f"item_index={item['item_index']}"
+            )
+            continue
+        if normalize_visual_requirement(requirement) == normalize_visual_requirement(
+            item["failed_requirement"]
+        ):
+            logger.warning(
+                "alternative visual requirement repeats the rejected one: "
+                f"item_index={item['item_index']}"
+            )
+            continue
+        if not _narration_contains_quote(item["narration_text"], narration_basis):
+            logger.warning(
+                "alternative visual requirement is not grounded in the narration: "
+                f"item_index={item['item_index']}"
+            )
+            continue
+        accepted[item_id] = {
+            "visual_requirement": requirement,
+            "narration_basis": narration_basis,
+        }
+    return accepted
+
+
+def generate_alternative_visual_requirements(
+    items: list[dict],
+    app_config=None,
+) -> dict[int, dict[str, str]]:
+    """Describe the same narration a second way when the first way found nothing.
+
+    A beat becomes unfillable either because its requirement never decomposed or
+    because no candidate satisfied it. Both are failures of the *wording*, not of
+    the narration, so the fix is to re-describe the same spoken line in plainer,
+    more common visual terms instead of abandoning the video.
+
+    Each item needs `item_index`, `narration_text`, and `failed_requirement`.
+    Returned keys are the caller's `item_index`; a missing key means the caller
+    must keep treating that beat as unfilled. Every proposal must carry a
+    `narration_basis` quote which is verified here to be a real fragment of that
+    beat's spoken text, because an ungrounded rewrite would quietly replace the
+    requested scene with a different one.
+    """
+    requests: list[dict] = []
+    for item in items or []:
+        item_index = item.get("item_index") if isinstance(item, dict) else None
+        if not isinstance(item_index, int) or isinstance(item_index, bool):
+            continue
+        narration_text = " ".join(str(item.get("narration_text") or "").split())
+        failed_requirement = " ".join(str(item.get("failed_requirement") or "").split())
+        if not narration_text or len(narration_text) > _MAX_REQUIREMENT_TEXT_LENGTH:
+            continue
+        if len(failed_requirement) > _MAX_REQUIREMENT_TEXT_LENGTH:
+            continue
+        requests.append(
+            {
+                "item_index": item_index,
+                "narration_text": narration_text,
+                "failed_requirement": failed_requirement,
+                "problem": " ".join(str(item.get("problem") or "").split())[
+                    :_MAX_STRUCTURED_TEXT_LENGTH
+                ],
+            }
+        )
+    if not requests:
+        return {}
+
+    resolved: dict[int, dict[str, str]] = {}
+    for chunk_start in range(0, len(requests), _VISUAL_REQUIREMENT_BATCH_SIZE):
+        chunk = requests[chunk_start : chunk_start + _VISUAL_REQUIREMENT_BATCH_SIZE]
+        request_items = [
+            {
+                "item_id": batch_local_id,
+                "spoken_text": item["narration_text"],
+                "rejected_visual_requirement": item["failed_requirement"],
+                "why_it_failed": item["problem"],
+            }
+            for batch_local_id, item in enumerate(chunk)
+        ]
+        prompt = f"""
+# Role: Alternative Visual Requirement Author
+
+## Goal
+For each item, write ONE different way to show the SAME spoken line. The rejected
+requirement could not be satisfied by real stock footage, so the alternative must
+be easier to film and easier to find, without changing what the line says.
+
+## Rules
+1. Depict the same spoken line. Never introduce a subject, action, object, event,
+   place, or claim that the spoken text does not support.
+2. Choose the most ordinary camera-visible moment that still fits the line: one
+   concrete subject performing one concrete visible action or in one visible state.
+3. Simpler and more common wins. Drop counts, named places, brands, on-screen text,
+   specific weather, rare compound scenes, and any detail the spoken text does not
+   state.
+4. Do not reuse the rejected requirement, and do not merely reorder its words or
+   swap synonyms; change which visible moment is shown.
+5. Never describe abstract meaning, emotions, metaphors, camera moves, transitions,
+   edits, or narration summaries.
+6. narration_basis must be an exact contiguous quote copied from that item's
+   spoken_text, in its original language, at least two words long. It is the proof
+   that the alternative still describes this line.
+7. visual_requirement must be one short concrete English phrase, because it is used
+   for stock search and footage comparison. No timestamps and no lists.
+
+## Strict JSON output
+Return one object with exactly one key, alternatives. alternatives must contain at
+most one object per input, and each object must contain exactly:
+item_id, visual_requirement, narration_basis.
+Omit an item entirely rather than inventing an ungrounded alternative for it.
+
+Inputs:
+{json.dumps(request_items, ensure_ascii=False)}
+""".strip()
+        parsed = _generate_structured_response(
+            prompt,
+            purpose="alternative visual requirement",
+            app_config=app_config,
+        )
+        if parsed is None:
+            continue
+        try:
+            accepted = _validated_alternative_requirements(parsed, chunk)
+        except Exception as exc:
+            logger.warning(
+                "alternative visual requirement batch is unusable: "
+                f"batch_start={chunk_start}, size={len(chunk)}, "
+                f"error={type(exc).__name__}: {exc}"
+            )
+            continue
+        for batch_local_id, alternative in accepted.items():
+            resolved[chunk[batch_local_id]["item_index"]] = alternative
+
+    logger.info(
+        "alternative visual requirements completed: "
+        f"requested={len(requests)}, generated={len(resolved)}"
+    )
+    return resolved
+
+
+def _observed_facts_to_dict(value: ObservedVisualFacts | dict[str, Any]) -> dict:
+    if isinstance(value, ObservedVisualFacts):
+        return asdict(value)
+    if isinstance(value, dict):
+        return value
+    raise ValueError("observed facts are invalid")
+
+
+_ADJUDICATION_ITEM_FIELDS = {
+    "candidate_id",
+    "decision",
+    "mandatory_fact_results",
+    "missing_or_contradictory_facts",
+    "reason",
+}
+
+
+def _validated_adjudication(
+    item: object,
+    *,
+    mandatory_ids: set[str],
+    source_statuses: dict[str, dict[str, str]],
+) -> SemanticAdjudication:
+    """Check one adjudication record against the evidence that was actually supplied.
+
+    This runs over cached decisions as well as fresh ones, which is what makes the
+    cache safe to trust: a stored verdict is re-checked against the statuses of the
+    run reusing it, so an entry written under different evidence — or edited by
+    hand — cannot smuggle an ACCEPT into a beat.
+    """
+    if not isinstance(item, dict) or set(item) != _ADJUDICATION_ITEM_FIELDS:
+        raise ValueError("semantic adjudication fields are invalid")
+    candidate_id = str(item.get("candidate_id") or "").strip()
+    if candidate_id not in source_statuses:
+        raise ValueError("semantic adjudication candidate id is invalid")
+    decision = item.get("decision")
+    if decision not in {"ACCEPT", "REJECT", "UNCERTAIN"}:
+        raise ValueError("semantic adjudication decision is invalid")
+    raw_fact_results = item.get("mandatory_fact_results")
+    if not isinstance(raw_fact_results, list):
+        raise ValueError("mandatory_fact_results must be an array")
+    fact_results: list[MandatoryFactResult] = []
+    seen_fact_ids: set[str] = set()
+    for raw_result in raw_fact_results:
+        if not isinstance(raw_result, dict) or set(raw_result) != {
+            "fact_id",
+            "status",
+        }:
+            raise ValueError("mandatory fact result fields are invalid")
+        fact_id = raw_result.get("fact_id")
+        status = raw_result.get("status")
+        if (
+            fact_id not in mandatory_ids
+            or fact_id in seen_fact_ids
+            or status != source_statuses[candidate_id].get(fact_id)
+        ):
+            raise ValueError("adjudicator modified supplied fact evidence")
+        seen_fact_ids.add(fact_id)
+        fact_results.append(MandatoryFactResult(fact_id=fact_id, status=status))
+    if seen_fact_ids != mandatory_ids:
+        raise ValueError("adjudication omitted mandatory facts")
+    if decision == "ACCEPT" and any(
+        result.status != "OBSERVED" for result in fact_results
+    ):
+        raise ValueError("adjudicator accepted a failed mandatory fact")
+    missing = item.get("missing_or_contradictory_facts")
+    if not isinstance(missing, list) or any(
+        not isinstance(fact_id, str) or fact_id not in mandatory_ids
+        for fact_id in missing
+    ):
+        raise ValueError("adjudication missing fact IDs are invalid")
+    reason = _bounded_structured_text(item.get("reason"), "adjudication reason")
+    if _TIMESTAMP_EVIDENCE_RE.search(reason):
+        raise ValueError("adjudication reason invented or repeated a timestamp")
+    return SemanticAdjudication(
+        candidate_id=candidate_id,
+        decision=decision,
+        mandatory_fact_results=fact_results,
+        missing_or_contradictory_facts=list(dict.fromkeys(missing)),
+        reason=reason,
+    )
+
+
+def _semantic_adjudication_cache_dir() -> Path:
+    return Path(utils.storage_dir("cache_semantic_adjudication", create=True))
+
+
+def _semantic_adjudication_cache_digest(
+    candidate_id: str,
+    observed_facts: dict[str, Any],
+    requirement_spec_digest: str,
+    provider_id: str,
+    model_name: str,
+) -> str:
+    payload = json.dumps(
+        {
+            "candidate_id": candidate_id,
+            "observed_facts_hash": hashlib.sha256(
+                json.dumps(
+                    observed_facts,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            ).hexdigest(),
+            "requirement_spec_digest": str(requirement_spec_digest or ""),
+            "provider": provider_id,
+            "model": model_name,
+            "schema_version": SEMANTIC_ADJUDICATION_SCHEMA_VERSION,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _semantic_adjudication_cache_path(digest: str) -> Path:
+    return _semantic_adjudication_cache_dir() / f"{digest}.json"
+
+
+def _semantic_adjudication_cache_lock(digest: str) -> threading.Lock:
+    return _SEMANTIC_ADJUDICATION_CACHE_LOCKS[
+        int(digest[:8], 16) % len(_SEMANTIC_ADJUDICATION_CACHE_LOCKS)
+    ]
+
+
+def _load_semantic_adjudication_cache(
+    digest: str,
+    *,
+    mandatory_ids: set[str],
+    source_statuses: dict[str, dict[str, str]],
+) -> SemanticAdjudication | None:
+    """Return a stored verdict for this exact evidence, or None to pay for a fresh one.
+
+    Every failure mode — absent file, unreadable file, superseded format, a record
+    that no longer squares with the supplied evidence — returns None, so the worst a
+    damaged cache can do is cost one normal request.
+    """
+    try:
+        payload = json.loads(
+            _semantic_adjudication_cache_path(digest).read_text(encoding="utf-8")
+        )
+        if (
+            not isinstance(payload, dict)
+            or payload.get("version") != _SEMANTIC_ADJUDICATION_CACHE_FORMAT_VERSION
+            or payload.get("schema_version") != SEMANTIC_ADJUDICATION_SCHEMA_VERSION
+            or not isinstance(payload.get("decision"), dict)
+        ):
+            return None
+        return _validated_adjudication(
+            payload["decision"],
+            mandatory_ids=mandatory_ids,
+            source_statuses=source_statuses,
+        )
+    except FileNotFoundError:
+        return None
+    except Exception as exc:
+        logger.warning(
+            "failed to reuse a cached semantic adjudication: "
+            f"error={type(exc).__name__}"
+        )
+        return None
+
+
+def _save_semantic_adjudication_cache(
+    digest: str,
+    adjudication: SemanticAdjudication,
+) -> None:
+    cache_path = _semantic_adjudication_cache_path(digest)
+    temp_path: Path | None = None
+    try:
+        payload = {
+            "version": _SEMANTIC_ADJUDICATION_CACHE_FORMAT_VERSION,
+            "schema_version": SEMANTIC_ADJUDICATION_SCHEMA_VERSION,
+            "decision": asdict(adjudication),
+        }
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=cache_path.parent,
+            prefix=f".{cache_path.stem}-",
+            suffix=".tmp",
+            delete=False,
+        ) as temp_file:
+            temp_path = Path(temp_file.name)
+            json.dump(payload, temp_file, ensure_ascii=False, separators=(",", ":"))
+            temp_file.flush()
+        temp_path.replace(cache_path)
+        temp_path = None
+    except Exception as exc:
+        logger.warning(
+            f"failed to write semantic adjudication cache: error={type(exc).__name__}"
+        )
+    finally:
+        if temp_path is not None:
+            try:
+                temp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+
+def adjudicate_visual_candidates(
+    requirement_spec: VisualRequirementSpec,
+    candidates: list[dict[str, Any]],
+    app_config=None,
+) -> dict[str, SemanticAdjudication]:
+    """Batch text-only adjudication over immutable, already-observed candidate facts."""
+    if not candidates:
+        return {}
+    mandatory_ids = {
+        fact.id for fact in requirement_spec.critical_visual_facts if fact.mandatory
+    }
+    safe_candidates: list[dict[str, Any]] = []
+    source_statuses: dict[str, dict[str, str]] = {}
+    for candidate in candidates:
+        candidate_id = str(candidate.get("candidate_id") or "").strip()
+        if not candidate_id or candidate_id in source_statuses:
+            return {}
+        facts = _observed_facts_to_dict(candidate.get("observed_facts"))
+        evidence_items = facts.get("critical_fact_evidence")
+        if not isinstance(evidence_items, list):
+            return {}
+        status_map: dict[str, str] = {}
+        for item in evidence_items:
+            if not isinstance(item, dict):
+                return {}
+            fact_id = item.get("fact_id")
+            status = item.get("status")
+            if fact_id in status_map or status not in {
+                "OBSERVED",
+                "NOT_OBSERVED",
+                "CONTRADICTED",
+                "UNCERTAIN",
+            }:
+                return {}
+            status_map[fact_id] = status
+        if not mandatory_ids.issubset(status_map):
+            return {}
+        source_statuses[candidate_id] = status_map
+        safe_candidates.append(
+            {"candidate_id": candidate_id, "observed_facts": facts}
+        )
+
+    # The paid video observation is already cached, but the verdict drawn from it was
+    # not, so re-running the same script used to cost nothing at the video model and
+    # full price again here. Identical evidence judged by the same model under the
+    # same rules yields the same verdict, so it is looked up rather than re-bought.
+    cache_digests: dict[str, str] = {}
+    results: dict[str, SemanticAdjudication] = {}
+    pending: list[dict[str, Any]] = list(safe_candidates)
+    try:
+        provider_id, model_name = _selected_llm_identity(app_config)
+        spec_digest = visual_requirement_spec_digest(requirement_spec)
+        pending = []
+        for candidate in safe_candidates:
+            digest = _semantic_adjudication_cache_digest(
+                candidate["candidate_id"],
+                candidate["observed_facts"],
+                spec_digest,
+                provider_id,
+                model_name,
+            )
+            cache_digests[candidate["candidate_id"]] = digest
+            with _semantic_adjudication_cache_lock(digest):
+                cached = _load_semantic_adjudication_cache(
+                    digest,
+                    mandatory_ids=mandatory_ids,
+                    source_statuses=source_statuses,
+                )
+            if cached is None:
+                pending.append(candidate)
+            else:
+                results[candidate["candidate_id"]] = cached
+    except Exception as exc:
+        # A cache that cannot be consulted costs tokens, never correctness.
+        logger.warning(
+            "semantic adjudication cache unavailable: "
+            f"error={type(exc).__name__}: {exc}"
+        )
+        cache_digests = {}
+        results = {}
+        pending = list(safe_candidates)
+    if not pending:
+        logger.info(
+            "semantic adjudication reused every verdict from cache: "
+            f"candidates={len(results)}"
+        )
+        return results
+    if results:
+        logger.info(
+            "semantic adjudication partially cached: "
+            f"reused={len(results)}, requested={len(pending)}"
+        )
+
+    prompt = f"""
+# Role: Strict Text-Only Visual Evidence Adjudicator
+
+You receive one immutable VisualRequirementSpec and structured ObservedVisualFacts.
+Reason only over supplied facts. Never alter the requirement or observations, invent
+visual evidence, add facts, or invent timestamps.
+
+Decision rules:
+- ACCEPT only if every mandatory critical fact has direct OBSERVED evidence and no
+  supplied contradiction or unresolved uncertainty undermines the core meaning.
+- REJECT if any mandatory fact is NOT_OBSERVED or CONTRADICTED, or supplied facts
+  directly show a different defining action/relation.
+- UNCERTAIN if no mandatory fact is disproved but any mandatory fact or defining
+  relation remains ambiguous, occluded, partial, inferred, or insufficient.
+- Related subject matter never substitutes for the requested action/relation.
+- Treat supplied status labels as immutable records, not proof by themselves. Check
+  whether the accompanying evidence text actually entails the exact critical fact.
+  For a defining action, generic handling/movement, preparation, possession, or an
+  aftermath does not establish the required change or source/target relation.
+- If an OBSERVED label is supported only by evidence for a related but different
+  action, REJECT without changing that supplied label and list the affected fact ID.
+- Use that REJECT rule only when the supplied observations directly establish the
+  different/conflicting action or a sufficiently complete visible sequence. When
+  intent, attention, a defining transition, or an occluded event simply cannot be
+  determined from the supplied evidence, return UNCERTAIN rather than REJECT.
+
+Return raw JSON with exactly one key, decisions. Return one decision per candidate.
+Each decision must contain exactly: candidate_id, decision,
+mandatory_fact_results, missing_or_contradictory_facts, reason.
+decision is ACCEPT, REJECT, or UNCERTAIN. mandatory_fact_results must repeat every
+mandatory fact ID exactly once with the unchanged supplied status. Do not include
+timestamps in reason.
+
+VisualRequirementSpec:
+{json.dumps(visual_requirement_spec_to_dict(requirement_spec), ensure_ascii=False)}
+
+Candidates:
+{json.dumps(pending, ensure_ascii=False)}
+""".strip()
+    try:
+        parsed = _generate_structured_response(
+            prompt,
+            purpose="semantic adjudication",
+            app_config=app_config,
+        )
+        if parsed is None:
+            return {}
+        if not isinstance(parsed, dict) or set(parsed) != {"decisions"}:
+            raise ValueError("semantic adjudication root is invalid")
+        raw_decisions = parsed.get("decisions")
+        if not isinstance(raw_decisions, list) or len(raw_decisions) != len(pending):
+            raise ValueError("semantic adjudication count is invalid")
+        pending_ids = {candidate["candidate_id"] for candidate in pending}
+        fresh: dict[str, SemanticAdjudication] = {}
+        for item in raw_decisions:
+            adjudication = _validated_adjudication(
+                item,
+                mandatory_ids=mandatory_ids,
+                source_statuses=source_statuses,
+            )
+            if (
+                adjudication.candidate_id not in pending_ids
+                or adjudication.candidate_id in fresh
+            ):
+                raise ValueError("semantic adjudication candidate id is invalid")
+            fresh[adjudication.candidate_id] = adjudication
+        results.update(fresh)
+        if set(results) != set(source_statuses):
+            raise ValueError("semantic adjudication is incomplete")
+        # Written only after the whole response validated, so a partly malformed
+        # batch never leaves a verdict behind for the next run to trust. Persisting
+        # is a saving, not a result, so a failure here must never discard verdicts
+        # the caller already paid for.
+        try:
+            for candidate_id, adjudication in fresh.items():
+                digest = cache_digests.get(candidate_id)
+                if not digest:
+                    continue
+                with _semantic_adjudication_cache_lock(digest):
+                    _save_semantic_adjudication_cache(digest, adjudication)
+        except Exception as exc:
+            logger.warning(
+                "failed to store semantic adjudication verdicts: "
+                f"error={type(exc).__name__}: {exc}"
+            )
+        return results
+    except Exception as exc:
+        logger.warning(
+            "semantic adjudication returned unusable structured data: "
+            f"error={type(exc).__name__}: {exc}"
+        )
+        return {}
 
 
 # =============================================================================

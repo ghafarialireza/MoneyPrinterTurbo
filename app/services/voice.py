@@ -26,9 +26,18 @@ from moviepy.audio.io.AudioFileClip import AudioFileClip
 from openai import OpenAI
 
 from app.config import config
+from app.models.schema import (
+    NarrationTimingQuality,
+    NarrationTimingSource,
+    TimedNarrationUnit,
+)
 from app.utils import utils
 
 _DEFAULT_EDGE_TTS_TIMEOUT_SECONDS = 30.0
+_DEFAULT_EDGE_TTS_OVERALL_TIMEOUT_SECONDS = 300.0
+_EDGE_TTS_MAX_ATTEMPTS = 3
+_EDGE_TTS_RETRY_BACKOFF_SECONDS = 1.0
+_TIMED_NARRATION_AUDIO_TOLERANCE_SECONDS = 0.05
 _MIMO_DEFAULT_BASE_URL = "https://api.xiaomimimo.com/v1"
 _MIMO_DEFAULT_TTS_MODEL = "mimo-v2.5-tts"
 MINIMAX_TTS_GLOBAL_URL = "https://api.minimax.io/v1/t2a_v2"
@@ -45,6 +54,14 @@ NO_VOICE_NAME = "no-voice"
 # 已经手动调用过该分支的 API 用户升级后立即失效；WebUI 和新代码统一使用
 # 更明确的 `no-voice`。
 _NO_VOICE_ALIASES = {NO_VOICE_NAME, "none"}
+
+
+class TTSServiceError(RuntimeError):
+    """A safe, user-facing TTS failure with a stable category."""
+
+    def __init__(self, category: str, message: str):
+        super().__init__(message)
+        self.category = category
 
 
 def _configure_pydub_ffmpeg(audio_segment_cls):
@@ -537,6 +554,188 @@ def ensure_legacy_submaker_fields(sub_maker: SubMaker) -> SubMaker:
     return sub_maker
 
 
+def _normalize_timing_alignment_text(text: str) -> tuple[str, list[int]]:
+    """Normalize for exact sequential alignment while retaining script offsets."""
+    normalized_chars: list[str] = []
+    source_indexes: list[int] = []
+    for source_index, char in enumerate(str(text or "")):
+        # Reuse the same Arabic normalization used by subtitle cue matching.
+        # ``casefold`` can expand one code point (for example, ß -> ss), so every
+        # normalized code point keeps the original script index that produced it.
+        normalized = _normalize_arabic(char).casefold()
+        for normalized_char in normalized:
+            if normalized_char == "_" or not re.match(r"\w", normalized_char, re.UNICODE):
+                continue
+            normalized_chars.append(normalized_char)
+            source_indexes.append(source_index)
+    return "".join(normalized_chars), source_indexes
+
+
+def normalize_timing_alignment_text(text: str) -> str:
+    """Return the canonical text used by exact timing alignment."""
+    return _normalize_timing_alignment_text(text)[0]
+
+
+def validate_timed_narration_units(
+    units: list[TimedNarrationUnit],
+    audio_duration: float,
+    *,
+    audio_tolerance: float = _TIMED_NARRATION_AUDIO_TOLERANCE_SECONDS,
+) -> None:
+    """Validate an ordered timing artifact without stretching it to the audio."""
+    if not math.isfinite(audio_duration) or audio_duration <= 0:
+        raise ValueError("timed narration units require a positive audio duration")
+
+    previous_end = -1.0
+    seen_indexes: set[int] = set()
+    for expected_index, unit in enumerate(units, start=1):
+        if unit.index in seen_indexes:
+            raise ValueError(f"duplicate timed narration unit index: {unit.index}")
+        seen_indexes.add(unit.index)
+        if unit.index != expected_index:
+            raise ValueError("timed narration unit indexes are not deterministic")
+        if not str(unit.text or "").strip():
+            raise ValueError(f"timed narration unit {unit.index} has empty text")
+        if not all(
+            math.isfinite(value)
+            for value in (unit.start_time, unit.end_time, unit.duration)
+        ):
+            raise ValueError(f"timed narration unit {unit.index} has invalid timing")
+        if unit.start_time < 0 or unit.end_time <= unit.start_time:
+            raise ValueError(
+                f"timed narration unit {unit.index} must have positive timing"
+            )
+        if not math.isclose(
+            unit.duration,
+            unit.end_time - unit.start_time,
+            rel_tol=0.0,
+            abs_tol=1e-6,
+        ):
+            raise ValueError(f"timed narration unit {unit.index} duration is inconsistent")
+        if unit.start_time < previous_end:
+            raise ValueError("timed narration unit timings overlap or are not monotonic")
+        if unit.end_time > audio_duration + max(0.0, float(audio_tolerance)):
+            raise ValueError(
+                f"timed narration unit {unit.index} ends after the audio duration"
+            )
+        if (
+            unit.script_start_char is None
+            or unit.script_end_char is None
+            or unit.script_start_char < 0
+            or unit.script_end_char <= unit.script_start_char
+        ):
+            raise ValueError(
+                f"timed narration unit {unit.index} is not aligned to the script"
+            )
+        previous_end = unit.end_time
+
+
+def extract_timed_narration_units(
+    sub_maker: SubMaker | None,
+    narration_text: str,
+    timing_source: NarrationTimingSource,
+    audio_duration: float,
+) -> list[TimedNarrationUnit]:
+    """Extract provider cues as an additive, script-aligned timing artifact.
+
+    No cue is split into synthetic words. Modern Edge and Azure V2 word events
+    therefore remain word-accurate; an older multi-word cue remains one coarse
+    unit and declares that fact through ``source_boundary_type``.
+    """
+    if sub_maker is None:
+        return []
+
+    timing_quality: NarrationTimingQuality
+    if timing_source == "estimated":
+        timing_quality = "estimated"
+    elif timing_source == "whisper":
+        timing_quality = "speech_recognition"
+    else:
+        timing_quality = "boundary"
+
+    raw_units: list[tuple[float, float, str, str]] = []
+    cues = list(getattr(sub_maker, "cues", []) or [])
+    if cues:
+        boundary_type = str(getattr(sub_maker, "type", "") or "CueBoundary")
+        for cue in cues:
+            raw_units.append(
+                (
+                    float(cue.start.total_seconds()),
+                    float(cue.end.total_seconds()),
+                    unescape(str(cue.content or "")),
+                    boundary_type,
+                )
+            )
+    else:
+        legacy_offsets = list(getattr(sub_maker, "offset", []) or [])
+        legacy_subs = list(getattr(sub_maker, "subs", []) or [])
+        if not legacy_offsets and not legacy_subs:
+            return []
+        if len(legacy_offsets) != len(legacy_subs):
+            raise ValueError("timed narration cue text/timing counts do not match")
+
+        if timing_source == "azure_tts_boundary":
+            boundary_type = "WordBoundary"
+        elif timing_source == "edge_tts_boundary":
+            boundary_type = "LegacyCue"
+        else:
+            boundary_type = "EstimatedScriptSegment"
+        for offset, text in zip(legacy_offsets, legacy_subs):
+            if not isinstance(offset, (tuple, list)) or len(offset) != 2:
+                raise ValueError("timed narration legacy cue has invalid timing")
+            raw_units.append(
+                (
+                    float(offset[0]) / 10_000_000,
+                    float(offset[1]) / 10_000_000,
+                    unescape(str(text or "")),
+                    boundary_type,
+                )
+            )
+
+    script_normalized, script_source_indexes = _normalize_timing_alignment_text(
+        narration_text
+    )
+    if not script_normalized:
+        raise ValueError("timed narration alignment requires narration text")
+
+    units: list[TimedNarrationUnit] = []
+    normalized_cursor = 0
+    for start_time, end_time, raw_text, boundary_type in raw_units:
+        text = " ".join(raw_text.split())
+        unit_normalized, _ = _normalize_timing_alignment_text(text)
+        if not unit_normalized:
+            # Boundary streams can contain standalone punctuation/whitespace.
+            # It carries no spoken word and is safely omitted without inventing text.
+            continue
+        normalized_end = normalized_cursor + len(unit_normalized)
+        if script_normalized[normalized_cursor:normalized_end] != unit_normalized:
+            raise ValueError(
+                "timed narration cue text does not align with the narration script"
+            )
+        script_start_char = script_source_indexes[normalized_cursor]
+        script_end_char = script_source_indexes[normalized_end - 1] + 1
+        units.append(
+            TimedNarrationUnit(
+                index=len(units) + 1,
+                text=text,
+                start_time=start_time,
+                end_time=end_time,
+                duration=end_time - start_time,
+                timing_source=timing_source,
+                timing_quality=timing_quality,
+                source_boundary_type=boundary_type,
+                script_start_char=script_start_char,
+                script_end_char=script_end_char,
+            )
+        )
+        normalized_cursor = normalized_end
+
+    if normalized_cursor != len(script_normalized):
+        raise ValueError("timed narration cues do not cover the complete narration script")
+    validate_timed_narration_units(units, audio_duration)
+    return units
+
+
 def populate_legacy_submaker_with_full_text(
     sub_maker: SubMaker, text: str, audio_duration_seconds: float
 ) -> SubMaker:
@@ -635,7 +834,7 @@ def create_edge_tts_communicate(
 
 def get_edge_tts_timeout_seconds() -> Union[float, None]:
     """
-    获取 Azure TTS V1 单次流式请求的超时时间。
+    获取 Azure TTS V1 的无活动/停滞超时时间。
 
     背景：
     Edge consumer TTS 在网络不通、服务端限流、voice 与文本语言不匹配等场景下，
@@ -643,7 +842,7 @@ def get_edge_tts_timeout_seconds() -> Union[float, None]:
     默认超时，避免 WebUI 任务长期无反馈。
 
     使用方式：
-    - 默认 30 秒，覆盖常见短视频脚本的首包等待时间；
+    - 默认 30 秒；每次收到有效 audio/boundary chunk 后重新计时；
     - 如用户处于慢网络或代理环境，可在 `config.toml` 里设置
       `edge_tts_timeout = 60`；
     - 设置为 0 或负数表示显式禁用超时，保留完全向后兼容。
@@ -666,11 +865,49 @@ def get_edge_tts_timeout_seconds() -> Union[float, None]:
     return timeout_seconds
 
 
+def get_edge_tts_overall_timeout_seconds() -> Union[float, None]:
+    """Return the independent safety ceiling for one complete Edge stream."""
+    raw_timeout = config.app.get(
+        "edge_tts_overall_timeout",
+        _DEFAULT_EDGE_TTS_OVERALL_TIMEOUT_SECONDS,
+    )
+    try:
+        timeout_seconds = float(raw_timeout)
+    except (TypeError, ValueError):
+        logger.warning(
+            "invalid edge_tts_overall_timeout: "
+            f"{raw_timeout}, fallback to "
+            f"{_DEFAULT_EDGE_TTS_OVERALL_TIMEOUT_SECONDS}s"
+        )
+        timeout_seconds = _DEFAULT_EDGE_TTS_OVERALL_TIMEOUT_SECONDS
+    if timeout_seconds <= 0:
+        return None
+    return timeout_seconds
+
+
+def _is_valid_edge_tts_chunk(chunk) -> bool:
+    if not isinstance(chunk, dict):
+        return False
+    chunk_type = chunk.get("type")
+    if chunk_type == "audio":
+        return bool(chunk.get("data"))
+    return chunk_type in {"WordBoundary", "SentenceBoundary"}
+
+
+def _edge_tts_timeout_message(kind: str, seconds: float) -> str:
+    if kind == "overall":
+        return f"edge_tts stream exceeded overall safety timeout of {seconds:g}s"
+    return f"edge_tts stream stalled for {seconds:g}s without valid data"
+
+
 def _stream_edge_tts_sync_with_timeout(
-    communicate, on_chunk, timeout_seconds: float
+    communicate,
+    on_chunk,
+    inactivity_timeout_seconds: Union[float, None],
+    overall_timeout_seconds: Union[float, None],
 ) -> None:
     """
-    带总超时地消费 edge_tts 7.x 的同步流。
+    用可重置的无活动超时和独立总上限消费 edge_tts 7.x 同步流。
 
     实现原因：
     `stream_sync()` 本身是阻塞迭代器，网络层卡住时主线程无法及时恢复。
@@ -696,23 +933,35 @@ def _stream_edge_tts_sync_with_timeout(
     thread = threading.Thread(target=_produce_chunks, daemon=True)
     thread.start()
 
-    deadline = time.monotonic() + timeout_seconds
+    started_at = time.monotonic()
+    last_activity_at = started_at
     while True:
-        remaining_seconds = deadline - time.monotonic()
-        if remaining_seconds <= 0:
-            raise TimeoutError(
-                f"edge_tts stream timed out after {timeout_seconds:g}s"
-            )
+        now = time.monotonic()
+        remaining_limits = [0.5]
+        if inactivity_timeout_seconds:
+            inactivity_remaining = inactivity_timeout_seconds - (now - last_activity_at)
+            if inactivity_remaining <= 0:
+                raise TimeoutError(
+                    _edge_tts_timeout_message("inactivity", inactivity_timeout_seconds)
+                )
+            remaining_limits.append(inactivity_remaining)
+        if overall_timeout_seconds:
+            overall_remaining = overall_timeout_seconds - (now - started_at)
+            if overall_remaining <= 0:
+                raise TimeoutError(
+                    _edge_tts_timeout_message("overall", overall_timeout_seconds)
+                )
+            remaining_limits.append(overall_remaining)
 
         try:
-            item_type, payload = stream_queue.get(
-                timeout=min(0.5, remaining_seconds)
-            )
+            item_type, payload = stream_queue.get(timeout=min(remaining_limits))
         except queue.Empty:
             continue
 
         if item_type == "chunk":
             on_chunk(payload)
+            if _is_valid_edge_tts_chunk(payload):
+                last_activity_at = time.monotonic()
         elif item_type == "error":
             raise payload
         elif item_type == "done":
@@ -720,7 +969,10 @@ def _stream_edge_tts_sync_with_timeout(
 
 
 def stream_edge_tts_chunks(
-    communicate, on_chunk, timeout_seconds: Union[float, None] = None
+    communicate,
+    on_chunk,
+    timeout_seconds: Union[float, None] = None,
+    overall_timeout_seconds: Union[float, None] = None,
 ) -> None:
     """
     统一消费 edge_tts 的同步流和旧版异步流。
@@ -732,12 +984,16 @@ def stream_edge_tts_chunks(
     Args:
         communicate: edge_tts.Communicate 实例
         on_chunk: 每拿到一个事件块时执行的回调
-        timeout_seconds: 单次流式请求总超时；为 None 时不启用超时。
+        timeout_seconds: 无有效数据时的停滞超时；收到有效 chunk 后重置。
+        overall_timeout_seconds: 完整流的独立安全上限。
     """
     if hasattr(communicate, "stream_sync"):
-        if timeout_seconds:
+        if timeout_seconds or overall_timeout_seconds:
             _stream_edge_tts_sync_with_timeout(
-                communicate, on_chunk, timeout_seconds
+                communicate,
+                on_chunk,
+                timeout_seconds,
+                overall_timeout_seconds,
             )
             return
 
@@ -749,21 +1005,107 @@ def stream_edge_tts_chunks(
         raise AttributeError("edge_tts communicate object has no stream method")
 
     async def _consume_async_stream():
-        async for chunk in communicate.stream():
+        stream = communicate.stream().__aiter__()
+        loop = asyncio.get_running_loop()
+        started_at = loop.time()
+        last_activity_at = started_at
+        while True:
+            now = loop.time()
+            limits = []
+            if timeout_seconds:
+                inactivity_remaining = timeout_seconds - (now - last_activity_at)
+                if inactivity_remaining <= 0:
+                    raise TimeoutError(
+                        _edge_tts_timeout_message("inactivity", timeout_seconds)
+                    )
+                limits.append(inactivity_remaining)
+            if overall_timeout_seconds:
+                overall_remaining = overall_timeout_seconds - (now - started_at)
+                if overall_remaining <= 0:
+                    raise TimeoutError(
+                        _edge_tts_timeout_message("overall", overall_timeout_seconds)
+                    )
+                limits.append(overall_remaining)
+            try:
+                if limits:
+                    chunk = await asyncio.wait_for(
+                        stream.__anext__(), timeout=min(limits)
+                    )
+                else:
+                    chunk = await stream.__anext__()
+            except StopAsyncIteration:
+                return
+            except asyncio.TimeoutError as exc:
+                now = loop.time()
+                if overall_timeout_seconds and (
+                    now - started_at >= overall_timeout_seconds
+                ):
+                    message = _edge_tts_timeout_message(
+                        "overall", overall_timeout_seconds
+                    )
+                else:
+                    message = _edge_tts_timeout_message(
+                        "inactivity", float(timeout_seconds or 0)
+                    )
+                raise TimeoutError(message) from exc
             on_chunk(chunk)
+            if _is_valid_edge_tts_chunk(chunk):
+                last_activity_at = loop.time()
 
     # 这里显式创建独立事件循环，而不是复用外部上下文，目的是避免
     # 在同步调用栈里遇到“当前线程没有事件循环”或跨线程复用循环的问题。
     loop = asyncio.new_event_loop()
     try:
-        if timeout_seconds:
-            loop.run_until_complete(
-                asyncio.wait_for(_consume_async_stream(), timeout=timeout_seconds)
-            )
-        else:
-            loop.run_until_complete(_consume_async_stream())
+        loop.run_until_complete(_consume_async_stream())
     finally:
         loop.close()
+
+
+def _classify_edge_tts_failure(exc: Exception) -> TTSServiceError:
+    if isinstance(exc, TTSServiceError):
+        return exc
+
+    type_name = type(exc).__name__
+    if isinstance(exc, TimeoutError) or "Timeout" in type_name:
+        return TTSServiceError(
+            "network",
+            "Edge TTS network timeout; the speech stream stopped making progress",
+        )
+    if type_name in {
+        "ConnectError",
+        "ConnectionClosed",
+        "ConnectionError",
+        "NetworkError",
+        "RemoteProtocolError",
+        "UnexpectedResponse",
+        "UnknownResponse",
+        "WebSocketError",
+    } or isinstance(exc, ConnectionError):
+        return TTSServiceError(
+            "network",
+            "Edge TTS network or service is temporarily unavailable",
+        )
+    if isinstance(exc, (ValueError, TypeError)) or type_name == "NoAudioReceived":
+        return TTSServiceError(
+            "voice",
+            "Edge TTS voice problem; verify the selected voice and its language",
+        )
+    return TTSServiceError(
+        "configuration",
+        "Edge TTS configuration or local audio output failed",
+    )
+
+
+def _remove_partial_tts_audio(voice_file: str) -> None:
+    if not os.path.exists(voice_file):
+        return
+    try:
+        os.remove(voice_file)
+    except Exception as remove_error:
+        logger.warning(
+            "failed to remove partial tts audio: "
+            f"file={voice_file}, error={type(remove_error).__name__}"
+        )
 
 
 def azure_tts_v1(
@@ -772,7 +1114,7 @@ def azure_tts_v1(
     voice_name = parse_voice_name(voice_name)
     text = text.strip()
     rate_str = convert_rate_to_percent(voice_rate)
-    for i in range(3):
+    for i in range(_EDGE_TTS_MAX_ATTEMPTS):
         try:
             logger.info(f"start, voice name: {voice_name}, try: {i + 1}")
 
@@ -782,9 +1124,11 @@ def azure_tts_v1(
             ensure_file_path_exists(voice_file)
             communicate = create_edge_tts_communicate(text, voice_name, rate_str)
             sub_maker = edge_tts.SubMaker()
-            timeout_seconds = get_edge_tts_timeout_seconds()
+            inactivity_timeout_seconds = get_edge_tts_timeout_seconds()
+            overall_timeout_seconds = get_edge_tts_overall_timeout_seconds()
 
             with open(voice_file, "wb") as file:
+
                 def _handle_chunk(chunk):
                     chunk_type = chunk["type"]
                     if chunk_type == "audio":
@@ -796,29 +1140,42 @@ def azure_tts_v1(
                         sub_maker.feed(chunk)
 
                 stream_edge_tts_chunks(
-                    communicate, _handle_chunk, timeout_seconds=timeout_seconds
+                    communicate,
+                    _handle_chunk,
+                    timeout_seconds=inactivity_timeout_seconds,
+                    overall_timeout_seconds=overall_timeout_seconds,
                 )
 
+            if not os.path.exists(voice_file) or os.path.getsize(voice_file) <= 0:
+                raise TTSServiceError(
+                    "voice",
+                    "Edge TTS voice problem; no valid speech audio was received",
+                )
             if not sub_maker.get_srt():
-                logger.warning("failed, sub_maker.get_srt() is empty")
-                continue
+                raise TTSServiceError(
+                    "voice",
+                    "Edge TTS voice problem; no speech timing was received",
+                )
 
             logger.info(f"completed, output file: {voice_file}")
             return sub_maker
         except Exception as e:
-            logger.error(f"failed, error: {str(e)}")
-            # TTS 流式写入如果在首包前超时或网络异常，会留下 0 字节音频文件。
-            # 这种文件既不可播放，也可能误导后续排查，因此失败后只清理空文件；
-            # 如果已经写入了部分数据，则保留现场文件，便于分析服务端返回内容。
-            if os.path.exists(voice_file) and os.path.getsize(voice_file) == 0:
-                try:
-                    os.remove(voice_file)
-                except Exception as remove_error:
-                    logger.warning(
-                        "failed to remove empty tts file: "
-                        f"{voice_file}, error: {str(remove_error)}"
-                    )
-    return None
+            classified = _classify_edge_tts_failure(e)
+            _remove_partial_tts_audio(voice_file)
+            logger.error(
+                "Edge TTS attempt failed: "
+                f"category={classified.category}, attempt={i + 1}, "
+                f"reason={classified}"
+            )
+            if classified.category != "network" or i + 1 >= _EDGE_TTS_MAX_ATTEMPTS:
+                raise classified from None
+            delay = _EDGE_TTS_RETRY_BACKOFF_SECONDS * (2**i)
+            logger.warning(
+                "retrying Edge TTS after transient failure: "
+                f"next_attempt={i + 2}, backoff={delay:g}s"
+            )
+            time.sleep(delay)
+    raise TTSServiceError("network", "Edge TTS failed after bounded retries")
 
 
 def siliconflow_tts(
@@ -1785,7 +2142,14 @@ def _normalize_arabic(text: str) -> str:
     return text
 
 
-def _match_script_line(script_lines: list[str], current_text: str, sub_index: int) -> str:
+def _normalize_subtitle_match_text(text: str) -> str:
+    """Normalize only for cue/script matching; never alter displayed text."""
+    return re.sub(r"[_\W]+", "", _normalize_arabic(text or "")).casefold()
+
+
+def _match_script_line(
+    script_lines: list[str], current_text: str, sub_index: int
+) -> str:
     """
     尝试把当前累计的字幕文本，与脚本中的某一条标准断句匹配起来。
 
@@ -1805,19 +2169,95 @@ def _match_script_line(script_lines: list[str], current_text: str, sub_index: in
     if current_text == target_line:
         return target_line.strip()
 
-    current_text_normalized = re.sub(r"[_\W]+", "", current_text)
-    target_line_normalized = re.sub(r"[_\W]+", "", target_line)
+    current_text_normalized = re.sub(r"[_\W]+", "", current_text).casefold()
+    target_line_normalized = re.sub(r"[_\W]+", "", target_line).casefold()
     if current_text_normalized == target_line_normalized:
         return target_line.strip()
 
     # 最后一层阿拉伯语容错：edge-tts 返回的字母形态、变音符号或 Tatweel
     # 可能和脚本不同。只在常规匹配失败后归一化比较，非阿拉伯语文本不会受影响。
-    current_ar = re.sub(r"[_\W]+", "", _normalize_arabic(current_text))
-    target_ar = re.sub(r"[_\W]+", "", _normalize_arabic(target_line))
+    current_ar = _normalize_subtitle_match_text(current_text)
+    target_ar = _normalize_subtitle_match_text(target_line)
     if current_ar and current_ar == target_ar:
         return target_line.strip()
 
     return ""
+
+
+def _build_subtitle_items_from_timed_chunks(
+    timed_chunks: list[tuple[float, float, str]],
+    script_lines: list[str],
+    *,
+    source_name: str,
+) -> list[str]:
+    """Aggregate timed TTS chunks, including chunks crossing sentence boundaries.
+
+    Edge can return a single cue containing the tail of one sentence and the
+    beginning of the next. Matching one complete cue to one script line gets
+    permanently stuck in that case. Consume normalized text as a stream and,
+    when a chunk crosses a boundary, split that chunk's time proportionally.
+    Displayed subtitles still use the original script lines.
+    """
+    formatter = _build_subtitle_formatter()
+    target_norms = [_normalize_subtitle_match_text(line) for line in script_lines]
+    sub_items: list[str] = []
+    sub_index = 0
+    buffered_text = ""
+    buffered_start: float | None = None
+
+    for chunk_start, chunk_end, chunk_text in timed_chunks:
+        chunk_norm = _normalize_subtitle_match_text(chunk_text)
+        if not chunk_norm or chunk_end <= chunk_start:
+            continue
+        if buffered_start is None:
+            buffered_start = chunk_start
+
+        consumed = 0
+        while consumed < len(chunk_norm) and sub_index < len(script_lines):
+            target_norm = target_norms[sub_index]
+            if not target_norm:
+                sub_index += 1
+                continue
+
+            needed = len(target_norm) - len(buffered_text)
+            if needed <= 0:
+                break
+            take = min(needed, len(chunk_norm) - consumed)
+            buffered_text += chunk_norm[consumed : consumed + take]
+            consumed += take
+
+            if not target_norm.startswith(buffered_text):
+                # Preserve the old fail-closed matching behavior for genuinely
+                # different text; additional chunks cannot repair a bad prefix.
+                buffered_text += chunk_norm[consumed:]
+                consumed = len(chunk_norm)
+                break
+
+            if buffered_text != target_norm:
+                continue
+
+            boundary = chunk_start + (
+                (chunk_end - chunk_start) * consumed / len(chunk_norm)
+            )
+            boundary = max(boundary, buffered_start + 1)
+            sub_items.append(
+                formatter(
+                    idx=sub_index + 1,
+                    start_time=buffered_start,
+                    end_time=boundary,
+                    sub_text=script_lines[sub_index].strip(),
+                )
+            )
+            sub_index += 1
+            buffered_text = ""
+            buffered_start = boundary if consumed < len(chunk_norm) else None
+
+    if sub_index != len(script_lines) or buffered_text:
+        logger.warning(
+            f"{source_name} subtitle chunks did not cover every script line: "
+            f"matched={sub_index}, expected={len(script_lines)}"
+        )
+    return sub_items
 
 
 def _write_subtitle_items(sub_items: list[str], subtitle_file: str) -> bool:
@@ -1863,42 +2303,19 @@ def _build_subtitle_items_from_edge_cues(
     3. 当候选文本与脚本里当前目标断句匹配时，收敛为一个完整字幕段；
     4. 使用第一条 cue 的开始时间和最后一条 cue 的结束时间，保证时间轴连续。
     """
-    formatter = _build_subtitle_formatter()
-    sub_items = []
-    sub_index = 0
-    current_text = ""
-    current_start_time = None
-
-    for cue in sub_maker.cues:
-        cue_text = unescape(cue.content)
-        if current_start_time is None:
-            current_start_time = int(cue.start.total_seconds() * 10000000)
-
-        current_end_time = int(cue.end.total_seconds() * 10000000)
-        current_text += cue_text
-
-        matched_text = _match_script_line(script_lines, current_text, sub_index)
-        if not matched_text:
-            continue
-
-        sub_index += 1
-        sub_items.append(
-            formatter(
-                idx=sub_index,
-                start_time=current_start_time,
-                end_time=current_end_time,
-                sub_text=matched_text,
-            )
+    timed_chunks = [
+        (
+            int(cue.start.total_seconds() * 10000000),
+            int(cue.end.total_seconds() * 10000000),
+            unescape(cue.content),
         )
-        current_text = ""
-        current_start_time = None
-
-    if current_text.strip():
-        logger.warning(
-            f"edge cues still have unmatched text after aggregation: {current_text}"
-        )
-
-    return sub_items
+        for cue in sub_maker.cues
+    ]
+    return _build_subtitle_items_from_timed_chunks(
+        timed_chunks,
+        script_lines,
+        source_name="edge cues",
+    )
 
 
 def _build_subtitle_items_from_legacy_submaker(
@@ -1910,42 +2327,17 @@ def _build_subtitle_items_from_legacy_submaker(
     这部分保留了原来的核心思路，只是拆成独立函数，便于与 edge_tts 7.x
     的 cues 聚合逻辑共享同一套断句匹配与落盘流程。
     """
-    formatter = _build_subtitle_formatter()
-    start_time = -1.0
-    sub_items = []
-    sub_index = 0
-    sub_line = ""
-
     legacy_offsets = getattr(sub_maker, "offset", [])
     legacy_subs = getattr(sub_maker, "subs", [])
-    for _, (offset, sub) in enumerate(zip(legacy_offsets, legacy_subs)):
-        current_start_time, current_end_time = offset
-        if start_time < 0:
-            start_time = current_start_time
-
-        sub_line += unescape(sub)
-        matched_text = _match_script_line(script_lines, sub_line, sub_index)
-        if not matched_text:
-            continue
-
-        sub_index += 1
-        sub_items.append(
-            formatter(
-                idx=sub_index,
-                start_time=start_time,
-                end_time=current_end_time,
-                sub_text=matched_text,
-            )
-        )
-        start_time = -1.0
-        sub_line = ""
-
-    if sub_line.strip():
-        logger.warning(
-            f"legacy subtitle items still have unmatched text after aggregation: {sub_line}"
-        )
-
-    return sub_items
+    timed_chunks = [
+        (offset[0], offset[1], unescape(sub))
+        for offset, sub in zip(legacy_offsets, legacy_subs)
+    ]
+    return _build_subtitle_items_from_timed_chunks(
+        timed_chunks,
+        script_lines,
+        source_name="legacy subtitle chunks",
+    )
 
 
 def create_subtitle(sub_maker: SubMaker, text: str, subtitle_file: str):

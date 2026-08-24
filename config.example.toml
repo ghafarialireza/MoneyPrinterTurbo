@@ -38,9 +38,12 @@ loomloom_poll_interval_seconds = 2
 loomloom_run_timeout_seconds = 600
 loomloom_video_run_timeout_seconds = 1800
 
-# Timeout in seconds for a single Edge TTS streaming request.
-# 单次 Edge TTS 流式请求超时时间。慢网络可适当调大，设置为 0 表示禁用超时。
+# Edge TTS inactivity timeout. It resets whenever valid audio/boundary data arrives.
+# Edge TTS 无有效数据的停滞超时；收到有效数据后重新计时。0 表示禁用。
 edge_tts_timeout = 30
+# Independent overall safety ceiling for one complete stream. 0 disables it.
+# 单次完整流的独立总安全上限；0 表示禁用。
+edge_tts_overall_timeout = 300
 
 # Verify TLS certificates for external APIs and material downloads.
 # 默认应保持开启；仅在可信代理或自签名证书环境中临时关闭。
@@ -99,6 +102,51 @@ twelvelabs_clip_qa_fail_closed = true
 # 默认关闭，开启后会减少随机性，使素材顺序更贴近文案结构。
 match_materials_to_script = false
 
+# Smart visual matching, per beat, when a provider returns nothing usable:
+# first try the alternative phrasings the script stage generated for that beat on
+# the same provider, then move on to the next searchable provider
+# (pexels -> pixabay -> coverr, providers without an API key are skipped).
+# Set the cascade to false to stay on the selected provider only, and set the
+# variant count to 1 to spend exactly one query per provider. Each extra phrasing
+# costs one stock search plus one more round of candidate analysis.
+smart_material_provider_cascade = true
+smart_material_max_query_variants = 3
+# When no phrasing on any provider could fill a beat, describe the same narration
+# a second way and search once more before failing the video. The alternative must
+# quote the beat's own spoken text, so the video still shows what it says.
+smart_material_requirement_rewrite = true
+# Spend ceiling, in analyzed candidates, for one selection round of one beat.
+# Only a successful round stops early, so a beat that can be filled never comes
+# near this; a beat nothing can satisfy would otherwise spend the full
+# twelvelabs_max_candidates_per_slot on every phrasing of every provider. Leave it
+# unset to track the per-search cap (5x), or set 0 to remove the ceiling. A beat
+# runs at most two rounds — its planned requirement and the rewritten one — so its
+# worst case is twice this number.
+# smart_material_max_analyzed_candidates_per_round = 75
+# Last resort before the video fails: let the neighbouring shot of the same
+# semantic group absorb the window of a beat nothing could fill. Sibling shots
+# share one visual requirement, so the neighbour's clip was already approved for
+# what the open beat wanted and is simply cut wider — no extra analysis unless the
+# clip is too short to cover both. The narration timing never moves; only a cut is
+# lost. Leave it unset to allow a third of the beats, or set 0 to fail the video on
+# the first unfillable beat instead. A value above a third is honored as written:
+# it trades visual variety for finishing the video.
+# smart_material_max_merged_beats = 4
+# Spend ceiling, in analyzed candidates, for one whole video. The per-round number
+# above bounds one beat; this bounds the run, which matters because a beat that
+# cannot be filled no longer stops the video — it falls down the recovery ladder,
+# so several hard beats can each spend two full rounds. This ceiling is checked
+# only where a run is about to buy recovery (another phrasing, another provider,
+# the rewritten requirement, a fresh search for a merged window), never where a
+# beat takes its first look, so it cuts cost and not quality. Once it is spent,
+# every beat still gets one search and the free rungs of the ladder still run.
+# Leave it unset for two full candidate pages per beat (2 x beats x
+# twelvelabs_max_candidates_per_slot, e.g. 420 for 14 beats at 15 candidates), or
+# set 0 to remove the ceiling. A healthy video settles in its first batch per beat
+# and spends well under a quarter of the default, so lowering it to about one page
+# per beat costs a damaged video its rewrites and buys back the worst case.
+# smart_material_max_analyzed_candidates_per_video = 420
+
 # Optional Sonilo video-matched original background music.
 # Create a key at https://platform.sonilo.com/dashboard. The WebUI can also save
 # this value, or you can set the SONILO_API_KEY environment variable instead.
@@ -115,6 +163,14 @@ sonilo_timeout = 600
 # app/models/llm_provider.py. Leave model_name and base_url empty to follow the
 # Registry defaults; only set them when you need an explicit override.
 llm_provider = "moonshot"
+
+# Output-token ceiling for providers whose SDK requires an explicit limit
+# (currently Gemini). Structured requests such as semantic visual grouping and
+# visual requirement decomposition return multi-object JSON; a ceiling that is
+# too low truncates the response mid-object and the whole payload is discarded.
+# 0 or unset uses the built-in default.
+# 仅对必须显式声明上限的 Provider 生效；上限过低会截断结构化 JSON 响应。
+llm_max_output_tokens = 0
 
 # Kimi / Moonshot AI
 # API key: https://platform.kimi.com?track_id=track-2f5441d6ffd84c509dd079d78e9db5dc&aff=moneyprinterturbo

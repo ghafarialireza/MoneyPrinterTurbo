@@ -41,6 +41,7 @@ import tempfile
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import asdict
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, List, Optional, Sequence
@@ -50,15 +51,23 @@ from packaging.version import Version
 from loguru import logger
 
 from app.config import config
-from app.models.schema import MaterialInfo
-from app.services import material
+from app.models.schema import (
+    CriticalFactEvidence,
+    CriticalGateResult,
+    MandatoryFactResult,
+    MaterialInfo,
+    ObservedAction,
+    ObservedVisualFacts,
+    VisualRequirementSpec,
+)
+from app.services import llm, material
 from app.utils import utils
 
 DEFAULT_MARENGO_MODEL = "marengo3.0"
 DEFAULT_PEGASUS_MODEL = "pegasus1.5"
 MINIMUM_SDK_VERSION = Version("1.3.0")
 # Pegasus requires max_tokens in [512, 98304]; 512 is plenty for a one-line QA.
-_PEGASUS_MIN_MAX_TOKENS = 512
+_PEGASUS_MIN_MAX_TOKENS = 2048
 _PEGASUS_TEMPORAL_MIN_MAX_TOKENS = 2048
 DEFAULT_CLIP_QA_MIN_SCORE = 0.70
 DEFAULT_CANDIDATE_BATCH_SIZE = 5
@@ -66,8 +75,21 @@ DEFAULT_MAX_CANDIDATES_PER_SLOT = 15
 DEFAULT_STRONG_EARLY_STOP_SCORE = 0.90
 DEFAULT_PREFERRED_MAX_SOURCE_DURATION = 30.0
 DEFAULT_CANDIDATE_CONCURRENCY = 5
-EVALUATION_SCHEMA_VERSION = "smart-pexels-candidate-v1"
-_CACHE_FORMAT_VERSION = 1
+EVALUATION_SCHEMA_VERSION = "smart-stock-evidence-v3"
+_CACHE_FORMAT_VERSION = 3
+_MAX_ADJUDICATION_CANDIDATES_PER_BATCH = 5
+_TEMPORAL_RETRIEVAL_MAX_ATTEMPTS = 3
+_TEMPORAL_RETRIEVAL_BACKOFF_SECONDS = 1.0
+
+
+class TemporalSegmentationError(RuntimeError):
+    """Safe classified failure while creating or retrieving temporal analysis."""
+
+    def __init__(self, category: str, message: str):
+        super().__init__(message)
+        self.category = category
+
+
 _CACHE_LOCKS = tuple(threading.Lock() for _ in range(128))
 
 _CANDIDATE_SCORE_WEIGHTS = {
@@ -77,50 +99,130 @@ _CANDIDATE_SCORE_WEIGHTS = {
     "visual_quality": 0.15,
 }
 
-_CANDIDATE_RESPONSE_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "match": {"type": "boolean"},
-        "required_action_visible": {"type": "boolean"},
-        "subject_clearly_visible": {"type": "boolean"},
-        "scores": {
-            "type": "object",
-            "properties": {
-                "semantic_match": {"type": "number"},
-                "action_match": {"type": "number"},
-                "subject_visibility": {"type": "number"},
-                "visual_quality": {"type": "number"},
+_QUALITY_FLAG_NAMES = (
+    "severe_blur",
+    "dominant_text_or_logo",
+    "bad_orientation",
+    "awkward_or_unusable_framing",
+)
+_CRITICAL_FACT_STATUSES = (
+    "OBSERVED",
+    "NOT_OBSERVED",
+    "CONTRADICTED",
+    "UNCERTAIN",
+)
+
+
+def _candidate_response_schema(
+    requirement_spec: VisualRequirementSpec,
+) -> dict[str, Any]:
+    """Build the official structured-output schema around authoritative fact IDs."""
+    fact_ids = [fact.id for fact in requirement_spec.critical_visual_facts]
+    return {
+        "type": "object",
+        "properties": {
+            "video_summary": {"type": "string"},
+            "observed_subjects": {"type": "array", "items": {"type": "string"}},
+            "observed_actions": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "actor": {"type": "string"},
+                        "action": {"type": "string"},
+                        "object": {"type": "string"},
+                        "source_or_target": {"type": "string"},
+                        "directness": {
+                            "type": "string",
+                            "enum": [
+                                "DIRECTLY_OBSERVED",
+                                "PARTIALLY_OBSERVED",
+                                "INFERRED",
+                            ],
+                        },
+                        "evidence": {"type": "string"},
+                    },
+                    "required": [
+                        "actor",
+                        "action",
+                        "object",
+                        "source_or_target",
+                        "directness",
+                        "evidence",
+                    ],
+                },
             },
-            "required": list(_CANDIDATE_SCORE_WEIGHTS),
-        },
-        "quality_flags": {
-            "type": "object",
-            "properties": {
-                "severe_blur": {"type": "boolean"},
-                "dominant_text_or_logo": {"type": "boolean"},
-                "bad_orientation": {"type": "boolean"},
-                "awkward_or_unusable_framing": {"type": "boolean"},
+            "observed_objects": {"type": "array", "items": {"type": "string"}},
+            "observed_relations": {
+                "type": "array",
+                "items": {"type": "string"},
             },
-            "required": [
-                "severe_blur",
-                "dominant_text_or_logo",
-                "bad_orientation",
-                "awkward_or_unusable_framing",
-            ],
+            "observed_context": {"type": "array", "items": {"type": "string"}},
+            "visible_state": {"type": "array", "items": {"type": "string"}},
+            "critical_fact_evidence": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "fact_id": {"type": "string", "enum": fact_ids},
+                        "status": {
+                            "type": "string",
+                            "enum": list(_CRITICAL_FACT_STATUSES),
+                        },
+                        "evidence": {"type": "string"},
+                    },
+                    "required": ["fact_id", "status", "evidence"],
+                },
+            },
+            "missing_required_facts": {
+                "type": "array",
+                "items": {"type": "string", "enum": fact_ids},
+            },
+            "contradictory_facts": {
+                "type": "array",
+                "items": {"type": "string", "enum": fact_ids},
+            },
+            "uncertainty": {
+                "type": "array",
+                "items": {"type": "string", "enum": fact_ids},
+            },
+            "inference_warnings": {
+                "type": "array",
+                "items": {"type": "string"},
+            },
+            "scores": {
+                "type": "object",
+                "properties": {
+                    field: {"type": "number"}
+                    for field in _CANDIDATE_SCORE_WEIGHTS
+                },
+                "required": list(_CANDIDATE_SCORE_WEIGHTS),
+            },
+            "quality_flags": {
+                "type": "object",
+                "properties": {
+                    field: {"type": "boolean"} for field in _QUALITY_FLAG_NAMES
+                },
+                "required": list(_QUALITY_FLAG_NAMES),
+            },
         },
-        "visible_summary": {"type": "string"},
-        "reason": {"type": "string"},
-    },
-    "required": [
-        "match",
-        "required_action_visible",
-        "subject_clearly_visible",
-        "scores",
-        "quality_flags",
-        "visible_summary",
-        "reason",
-    ],
-}
+        "required": [
+            "video_summary",
+            "observed_subjects",
+            "observed_actions",
+            "observed_objects",
+            "observed_relations",
+            "observed_context",
+            "visible_state",
+            "critical_fact_evidence",
+            "missing_required_facts",
+            "contradictory_facts",
+            "uncertainty",
+            "inference_warnings",
+            "scores",
+            "quality_flags",
+        ],
+    }
 
 
 def is_enabled() -> bool:
@@ -291,6 +393,45 @@ def _safe_api_failure_reason(exc: Exception) -> str:
     return f"TwelveLabs API unavailable ({type_name})"
 
 
+def _is_auth_or_quota_failure(exc: Exception) -> bool:
+    reason = _safe_api_failure_reason(exc)
+    return reason.startswith(("TwelveLabs quota", "TwelveLabs authentication"))
+
+
+def _is_transient_api_failure(exc: Exception) -> bool:
+    """Recognize retryable transport/5xx failures without exposing details."""
+    status = _api_status_code(exc)
+    if status is not None:
+        return status in {408, 425} or 500 <= status <= 599
+
+    transient_names = {
+        "ConnectError",
+        "ConnectTimeout",
+        "ConnectionError",
+        "NetworkError",
+        "PoolTimeout",
+        "ProtocolError",
+        "ReadError",
+        "ReadTimeout",
+        "RemoteProtocolError",
+        "TimeoutError",
+        "TimeoutException",
+        "TransportError",
+        "WriteError",
+        "WriteTimeout",
+    }
+    current: BaseException | None = exc
+    visited: set[int] = set()
+    while current is not None and id(current) not in visited:
+        visited.add(id(current))
+        if type(current).__name__ in transient_names or isinstance(
+            current, (ConnectionError, TimeoutError)
+        ):
+            return True
+        current = current.__cause__ or current.__context__
+    return False
+
+
 def _is_direct_url_failure(exc: Exception) -> bool:
     """Only source-validation failures justify creating a temporary Asset."""
     if _api_status_code(exc) not in {400, 422}:
@@ -399,15 +540,22 @@ def _candidate_cache_dir() -> Path:
     return Path(utils.storage_dir("cache_twelvelabs_candidate", create=True))
 
 
-def _candidate_cache_digest(asset_id: str, narration_text: str) -> str:
+def _candidate_cache_digest(
+    provider: str,
+    provider_asset_id: str,
+    visual_requirement: str,
+    requirement_spec_digest: str = "",
+) -> str:
     payload = json.dumps(
         {
-            "asset_id": str(asset_id),
-            "narration_hash": hashlib.sha256(
-                narration_text.strip().encode("utf-8")
+            "provider": str(provider).strip().lower(),
+            "provider_asset_id": str(provider_asset_id).strip(),
+            "visual_requirement_hash": hashlib.sha256(
+                visual_requirement.strip().encode("utf-8")
             ).hexdigest(),
             "model": DEFAULT_PEGASUS_MODEL,
             "schema_version": EVALUATION_SCHEMA_VERSION,
+            "requirement_spec_digest": str(requirement_spec_digest or ""),
         },
         sort_keys=True,
         separators=(",", ":"),
@@ -415,23 +563,45 @@ def _candidate_cache_digest(asset_id: str, narration_text: str) -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
-def _candidate_cache_path(asset_id: str, narration_text: str) -> Path:
+def _candidate_cache_path(
+    provider: str,
+    provider_asset_id: str,
+    visual_requirement: str,
+    requirement_spec_digest: str = "",
+) -> Path:
     return _candidate_cache_dir() / (
-        f"{_candidate_cache_digest(asset_id, narration_text)}.json"
+        f"{_candidate_cache_digest(provider, provider_asset_id, visual_requirement, requirement_spec_digest)}.json"
     )
 
 
-def _candidate_cache_lock(asset_id: str, narration_text: str) -> threading.Lock:
-    digest = _candidate_cache_digest(asset_id, narration_text)
+def _candidate_cache_lock(
+    provider: str,
+    provider_asset_id: str,
+    visual_requirement: str,
+    requirement_spec_digest: str = "",
+) -> threading.Lock:
+    digest = _candidate_cache_digest(
+        provider,
+        provider_asset_id,
+        visual_requirement,
+        requirement_spec_digest,
+    )
     return _CACHE_LOCKS[int(digest[:8], 16) % len(_CACHE_LOCKS)]
 
 
 def _load_candidate_evaluation_cache(
-    asset_id: str,
-    narration_text: str,
+    provider: str,
+    provider_asset_id: str,
+    visual_requirement: str,
+    requirement_spec_digest: str = "",
 ) -> dict[str, Any] | None:
     try:
-        cache_path = _candidate_cache_path(asset_id, narration_text)
+        cache_path = _candidate_cache_path(
+            provider,
+            provider_asset_id,
+            visual_requirement,
+            requirement_spec_digest,
+        )
         with cache_path.open("r", encoding="utf-8") as cache_file:
             payload = json.load(cache_file)
         if (
@@ -439,6 +609,8 @@ def _load_candidate_evaluation_cache(
             or payload.get("version") != _CACHE_FORMAT_VERSION
             or payload.get("model") != DEFAULT_PEGASUS_MODEL
             or payload.get("schema_version") != EVALUATION_SCHEMA_VERSION
+            or payload.get("requirement_spec_digest")
+            != str(requirement_spec_digest or "")
             or not isinstance(payload.get("result"), dict)
         ):
             return None
@@ -453,20 +625,43 @@ def _load_candidate_evaluation_cache(
 
 
 def _save_candidate_evaluation_cache(
-    asset_id: str,
-    narration_text: str,
+    provider: str,
+    provider_asset_id: str,
+    visual_requirement: str,
     result: dict[str, Any],
+    requirement_spec_digest: str = "",
 ) -> None:
     temp_path: Path | None = None
     try:
-        cache_path = _candidate_cache_path(asset_id, narration_text)
+        cache_path = _candidate_cache_path(
+            provider,
+            provider_asset_id,
+            visual_requirement,
+            requirement_spec_digest,
+        )
+        safe_result_fields = {
+            "provider",
+            "model",
+            "schema_version",
+            "accepted",
+            "eligible_for_adjudication",
+            "scores",
+            "overall_score",
+            "quality_flags",
+            "visual_requirement_spec",
+            "observed_facts",
+            "critical_gate",
+            "reason",
+            "analysis_input",
+        }
         persisted_result = {
-            key: value for key, value in result.items() if not key.startswith("_")
+            key: value for key, value in result.items() if key in safe_result_fields
         }
         payload = {
             "version": _CACHE_FORMAT_VERSION,
             "model": DEFAULT_PEGASUS_MODEL,
             "schema_version": EVALUATION_SCHEMA_VERSION,
+            "requirement_spec_digest": str(requirement_spec_digest or ""),
             "result": persisted_result,
         }
         with tempfile.NamedTemporaryFile(
@@ -512,16 +707,16 @@ def _score_component(value: Any) -> float | None:
     return score
 
 
-def _candidate_is_accepted(
+def _candidate_is_rank_eligible(
     result: dict[str, Any],
     minimum_score: float,
 ) -> bool:
     flags = result.get("quality_flags")
+    gate = result.get("critical_gate")
     overall_score = _score_component(result.get("overall_score"))
     return bool(
-        result.get("match") is True
-        and result.get("required_action_visible") is True
-        and result.get("subject_clearly_visible") is True
+        isinstance(gate, dict)
+        and gate.get("decision") == "PASS"
         and isinstance(flags, dict)
         and not any(value is True for value in flags.values())
         and overall_score is not None
@@ -529,37 +724,116 @@ def _candidate_is_accepted(
     )
 
 
-def _candidate_prompt(
-    *,
-    slot_index: int,
-    slot_duration: float,
-    narration_text: str,
-    search_query: str,
-) -> str:
+def _candidate_is_accepted(
+    result: dict[str, Any],
+    minimum_score: float,
+) -> bool:
+    adjudication = result.get("semantic_adjudication")
+    return bool(
+        _candidate_is_rank_eligible(result, minimum_score)
+        and isinstance(adjudication, dict)
+        and adjudication.get("decision") == "ACCEPT"
+    )
+
+
+def _candidate_prompt(requirement_spec: VisualRequirementSpec) -> str:
     return f"""
-You are evaluating one stock-video candidate for visual use in narration slot {slot_index}.
+You are a strict visual-evidence observer, not a relevance judge.
 
-ACTUAL NARRATION REQUIREMENT:
-{narration_text.strip()}
+Inspect the complete video. First report what is directly visible, then map those
+observations to every supplied critical fact ID. Do not begin by deciding whether the
+video matches, and do not return ACCEPT/REJECT.
 
-SLOT DURATION: {slot_duration:.3f} seconds
-RETRIEVAL SEARCH QUERY: {search_query.strip()}
+Status semantics:
+- OBSERVED: the defining fact/action/relation is directly visible with sufficient
+  evidence.
+- NOT_OBSERVED: the relevant content is visible enough to determine that the fact
+  does not occur. Mere lack of visibility is not NOT_OBSERVED.
+- CONTRADICTED: the video directly shows a conflicting action/state/relation.
+- UNCERTAIN: evidence is insufficient, occluded, ambiguous, partial, too brief, or
+  otherwise does not justify the other statuses.
 
-The search query was used only to retrieve this candidate. It is a hint, not
-the acceptance requirement. Judge only the ACTUAL NARRATION REQUIREMENT against
-VISIBLE VIDEO CONTENT. A related topic alone is not enough. If the narration
-specifies an action, that exact action must be visibly occurring. If it does not
-specify an action, required_action_visible means the required scene or state is
-visibly satisfied. Reject severe blur, dominant text/logo, bad orientation, and
-awkward or unusable framing. Scores must be numbers from 0.0 to 1.0.
+Direct-evidence rules:
+- Related subjects, objects, tools, environment, titles, or metadata are never proof
+  that a requested action/relation occurred.
+- When direct_evidence_needed=true, the defining action/relation itself must be
+  visible. Do not infer it from preparation, aftermath, possession, inspection, or
+  a nearby related object.
+- For an action fact, verify the exact observable change, transition, contact, or
+  source/target relation stated in that fact. Moving or handling an object that was
+  already in a different state/location is not evidence that the requested action
+  produced that state/location.
+- Evidence for a defining action must describe the visible before/during/after
+  transition or defining relation. If that evidence is hidden or ambiguous, use
+  UNCERTAIN; if the relevant sequence is visible and the transition does not occur,
+  use NOT_OBSERVED or CONTRADICTED as appropriate.
+- Optional attributes never determine a critical fact status.
+- Report every critical fact exactly once. Evidence must state what is visible, not
+  what is likely.
+
+Only after recording observations, provide ranking scores from 0.0 to 1.0 and visual
+quality flags. Scores cannot change any critical fact status. No stock search query
+or retrieval metadata is provided because retrieval is not semantic evidence.
+
+Immutable VisualRequirementSpec:
+{json.dumps(llm.visual_requirement_spec_to_dict(requirement_spec), ensure_ascii=False)}
 """.strip()
+
+
+def _bounded_observation_strings(value: object, field_name: str) -> list[str] | None:
+    if not isinstance(value, list) or len(value) > 30:
+        return None
+    result: list[str] = []
+    for item in value:
+        if not isinstance(item, str):
+            return None
+        cleaned = _clean_text(item, 500)
+        if not cleaned:
+            return None
+        result.append(cleaned)
+    return result
+
+
+def _build_critical_gate(
+    requirement_spec: VisualRequirementSpec,
+    evidence_by_id: dict[str, CriticalFactEvidence],
+) -> CriticalGateResult:
+    fact_results: list[MandatoryFactResult] = []
+    missing: list[str] = []
+    contradictory: list[str] = []
+    uncertain: list[str] = []
+    for fact in requirement_spec.critical_visual_facts:
+        if not fact.mandatory:
+            continue
+        status = evidence_by_id[fact.id].status
+        fact_results.append(MandatoryFactResult(fact_id=fact.id, status=status))
+        if status == "NOT_OBSERVED":
+            missing.append(fact.id)
+        elif status == "CONTRADICTED":
+            contradictory.append(fact.id)
+        elif status == "UNCERTAIN":
+            uncertain.append(fact.id)
+    if missing or contradictory:
+        decision = "REJECT"
+    elif uncertain:
+        decision = "UNCERTAIN"
+    else:
+        decision = "PASS"
+    return CriticalGateResult(
+        decision=decision,
+        mandatory_fact_results=fact_results,
+        missing_fact_ids=missing,
+        contradictory_fact_ids=contradictory,
+        uncertain_fact_ids=uncertain,
+    )
 
 
 def _parse_candidate_response(
     response: Any,
     minimum_score: float,
+    requirement_spec: VisualRequirementSpec,
 ) -> dict[str, Any] | None:
-    """Validate official structured JSON; regex remains a legacy fallback only."""
+    """Validate evidence-first structured JSON and compute deterministic gates."""
     if isinstance(response, dict):
         payload = response
     elif isinstance(response, str) and response.strip():
@@ -576,55 +850,190 @@ def _parse_candidate_response(
                 return None
     else:
         return None
-
     if not isinstance(payload, dict):
         return None
-    boolean_fields = (
-        "match",
-        "required_action_visible",
-        "subject_clearly_visible",
+
+    expected_fields = set(_candidate_response_schema(requirement_spec)["required"])
+    if set(payload) != expected_fields:
+        return None
+    string_lists: dict[str, list[str]] = {}
+    for field in (
+        "observed_subjects",
+        "observed_objects",
+        "observed_relations",
+        "observed_context",
+        "visible_state",
+        "inference_warnings",
+    ):
+        parsed_list = _bounded_observation_strings(payload.get(field), field)
+        if parsed_list is None:
+            return None
+        string_lists[field] = parsed_list
+
+    raw_actions = payload.get("observed_actions")
+    if not isinstance(raw_actions, list) or len(raw_actions) > 30:
+        return None
+    observed_actions: list[ObservedAction] = []
+    action_fields = {
+        "actor",
+        "action",
+        "object",
+        "source_or_target",
+        "directness",
+        "evidence",
+    }
+    for raw_action in raw_actions:
+        if not isinstance(raw_action, dict) or set(raw_action) != action_fields:
+            return None
+        directness = raw_action.get("directness")
+        if directness not in {
+            "DIRECTLY_OBSERVED",
+            "PARTIALLY_OBSERVED",
+            "INFERRED",
+        }:
+            return None
+        cleaned_fields = {
+            field: _clean_text(raw_action.get(field), 500)
+            for field in action_fields - {"directness"}
+        }
+        if any(not value for value in cleaned_fields.values()):
+            return None
+        observed_actions.append(
+            ObservedAction(directness=directness, **cleaned_fields)
+        )
+
+    raw_evidence = payload.get("critical_fact_evidence")
+    if not isinstance(raw_evidence, list):
+        return None
+    known_fact_ids = {fact.id for fact in requirement_spec.critical_visual_facts}
+    evidence_by_id: dict[str, CriticalFactEvidence] = {}
+    for item in raw_evidence:
+        if not isinstance(item, dict) or set(item) != {
+            "fact_id",
+            "status",
+            "evidence",
+        }:
+            return None
+        fact_id = item.get("fact_id")
+        status = item.get("status")
+        evidence = _clean_text(item.get("evidence"), 500)
+        if (
+            fact_id not in known_fact_ids
+            or fact_id in evidence_by_id
+            or status not in _CRITICAL_FACT_STATUSES
+            or not evidence
+        ):
+            return None
+        evidence_by_id[fact_id] = CriticalFactEvidence(
+            fact_id=fact_id,
+            status=status,
+            evidence=evidence,
+        )
+    if set(evidence_by_id) != known_fact_ids:
+        return None
+
+    missing = _bounded_observation_strings(
+        payload.get("missing_required_facts"), "missing_required_facts"
     )
-    if any(not isinstance(payload.get(field), bool) for field in boolean_fields):
+    contradictory = _bounded_observation_strings(
+        payload.get("contradictory_facts"), "contradictory_facts"
+    )
+    uncertainty = _bounded_observation_strings(
+        payload.get("uncertainty"), "uncertainty"
+    )
+    if missing is None or contradictory is None or uncertainty is None:
+        return None
+    mandatory_ids = {
+        fact.id for fact in requirement_spec.critical_visual_facts if fact.mandatory
+    }
+    expected_missing = {
+        fact_id
+        for fact_id in mandatory_ids
+        if evidence_by_id[fact_id].status == "NOT_OBSERVED"
+    }
+    expected_contradictory = {
+        fact_id
+        for fact_id, evidence in evidence_by_id.items()
+        if evidence.status == "CONTRADICTED"
+    }
+    expected_uncertainty = {
+        fact_id
+        for fact_id, evidence in evidence_by_id.items()
+        if evidence.status == "UNCERTAIN"
+    }
+    if (
+        set(missing) != expected_missing
+        or set(contradictory) != expected_contradictory
+        or set(uncertainty) != expected_uncertainty
+        or len(missing) != len(set(missing))
+        or len(contradictory) != len(set(contradictory))
+        or len(uncertainty) != len(set(uncertainty))
+    ):
         return None
 
     raw_scores = payload.get("scores")
     raw_flags = payload.get("quality_flags")
-    if not isinstance(raw_scores, dict) or not isinstance(raw_flags, dict):
+    if not isinstance(raw_scores, dict) or set(raw_scores) != set(
+        _CANDIDATE_SCORE_WEIGHTS
+    ):
         return None
-
+    if not isinstance(raw_flags, dict) or set(raw_flags) != set(_QUALITY_FLAG_NAMES):
+        return None
     scores: dict[str, float] = {}
     for field in _CANDIDATE_SCORE_WEIGHTS:
         score = _score_component(raw_scores.get(field))
         if score is None:
             return None
         scores[field] = round(score, 4)
-
-    flag_names = tuple(
-        _CANDIDATE_RESPONSE_SCHEMA["properties"]["quality_flags"]["required"]
-    )
-    if any(not isinstance(raw_flags.get(field), bool) for field in flag_names):
+    if any(not isinstance(raw_flags.get(field), bool) for field in _QUALITY_FLAG_NAMES):
         return None
-    quality_flags = {field: raw_flags[field] for field in flag_names}
+    quality_flags = {field: raw_flags[field] for field in _QUALITY_FLAG_NAMES}
     overall_score = round(
         sum(
             scores[field] * weight for field, weight in _CANDIDATE_SCORE_WEIGHTS.items()
         ),
         4,
     )
+    observed_facts = ObservedVisualFacts(
+        video_summary=_clean_text(payload.get("video_summary"), 500),
+        observed_subjects=string_lists["observed_subjects"],
+        observed_actions=observed_actions,
+        observed_objects=string_lists["observed_objects"],
+        observed_relations=string_lists["observed_relations"],
+        observed_context=string_lists["observed_context"],
+        visible_state=string_lists["visible_state"],
+        critical_fact_evidence=[
+            evidence_by_id[fact.id]
+            for fact in requirement_spec.critical_visual_facts
+        ],
+        missing_required_facts=missing,
+        contradictory_facts=contradictory,
+        uncertainty=uncertainty,
+        inference_warnings=string_lists["inference_warnings"],
+    )
+    gate = _build_critical_gate(requirement_spec, evidence_by_id)
     result = {
         "provider": "twelvelabs",
         "model": DEFAULT_PEGASUS_MODEL,
         "schema_version": EVALUATION_SCHEMA_VERSION,
-        "match": payload["match"],
-        "required_action_visible": payload["required_action_visible"],
-        "subject_clearly_visible": payload["subject_clearly_visible"],
+        "visual_requirement_spec": llm.visual_requirement_spec_to_dict(
+            requirement_spec
+        ),
+        "observed_facts": asdict(observed_facts),
+        "critical_gate": asdict(gate),
         "scores": scores,
         "overall_score": overall_score,
         "quality_flags": quality_flags,
-        "visible_summary": _clean_text(payload.get("visible_summary"), 500),
-        "reason": _clean_text(payload.get("reason"), 500),
+        "reason": (
+            "critical evidence passed"
+            if gate.decision == "PASS"
+            else f"critical evidence gate: {gate.decision.lower()}"
+        ),
+        "accepted": False,
     }
-    result["accepted"] = _candidate_is_accepted(result, minimum_score)
+    result["eligible_for_adjudication"] = _candidate_is_rank_eligible(
+        result, minimum_score
+    )
     return result
 
 
@@ -632,24 +1041,30 @@ def _failed_candidate_evaluation(
     reason: str,
     *,
     api_call: bool,
+    requirement_spec: VisualRequirementSpec | None = None,
 ) -> dict[str, Any]:
     return {
         "provider": "twelvelabs",
         "model": DEFAULT_PEGASUS_MODEL,
         "schema_version": EVALUATION_SCHEMA_VERSION,
+        "visual_requirement_spec": (
+            llm.visual_requirement_spec_to_dict(requirement_spec)
+            if requirement_spec is not None
+            else None
+        ),
+        "observed_facts": None,
+        "critical_gate": {
+            "decision": "UNCERTAIN",
+            "mandatory_fact_results": [],
+            "missing_fact_ids": [],
+            "contradictory_fact_ids": [],
+            "uncertain_fact_ids": [],
+        },
+        "eligible_for_adjudication": False,
         "accepted": False,
-        "match": False,
-        "required_action_visible": False,
-        "subject_clearly_visible": False,
         "scores": {field: 0.0 for field in _CANDIDATE_SCORE_WEIGHTS},
         "overall_score": 0.0,
-        "quality_flags": {
-            field: False
-            for field in _CANDIDATE_RESPONSE_SCHEMA["properties"]["quality_flags"][
-                "required"
-            ]
-        },
-        "visible_summary": "",
+        "quality_flags": {field: False for field in _QUALITY_FLAG_NAMES},
         "reason": _clean_text(reason, 500),
         "_cache_hit": False,
         "_api_call": api_call,
@@ -687,6 +1102,7 @@ def _delete_temporary_asset(client, asset_id: str | None) -> None:
 def _sync_candidate_analysis(
     video_url: str,
     prompt: str,
+    response_schema: dict[str, Any],
 ) -> tuple[Any, str]:
     from twelvelabs.types import (
         AnalyzePromptV2,
@@ -704,7 +1120,7 @@ def _sync_candidate_analysis(
             prompt_v_2=AnalyzePromptV2(input_text=prompt),
             response_format=SyncResponseFormat(
                 type="json_schema",
-                json_schema=_CANDIDATE_RESPONSE_SCHEMA,
+                json_schema=response_schema,
             ),
             max_tokens=_PEGASUS_MIN_MAX_TOKENS,
         )
@@ -740,62 +1156,102 @@ def evaluate_candidate(
     slot_duration: float,
     narration_text: str,
     search_query: str,
+    requirement_spec: VisualRequirementSpec,
+    provider: str = "pexels",
     minimum_score: float | None = None,
 ) -> dict[str, Any]:
     """Score one candidate with structured Pegasus 1.5 output and disk cache."""
+    provider = str(provider or "").strip().lower()
     narration_text = str(narration_text or "").strip()
-    search_query = str(search_query or "").strip()
     asset_id = str(asset_id or "").strip()
     video_url = str(video_url or "").strip()
-    if not all((asset_id, video_url, narration_text, search_query)):
+    if not all((provider, asset_id, video_url, narration_text)):
         return _failed_candidate_evaluation(
             "candidate metadata or narration requirement is missing",
             api_call=False,
+            requirement_spec=requirement_spec,
+        )
+    if llm.normalize_visual_requirement(
+        narration_text
+    ) != llm.normalize_visual_requirement(requirement_spec.original_requirement):
+        return _failed_candidate_evaluation(
+            "candidate narration does not match its visual requirement spec",
+            api_call=False,
+            requirement_spec=requirement_spec,
         )
     threshold = _clip_qa_min_score(minimum_score)
-    cache_lock = _candidate_cache_lock(asset_id, narration_text)
+    requirement_digest = llm.visual_requirement_spec_digest(requirement_spec)
+    cache_lock = _candidate_cache_lock(
+        provider,
+        asset_id,
+        narration_text,
+        requirement_digest,
+    )
     with cache_lock:
-        cached = _load_candidate_evaluation_cache(asset_id, narration_text)
+        cached = _load_candidate_evaluation_cache(
+            provider,
+            asset_id,
+            narration_text,
+            requirement_digest,
+        )
         if cached is not None:
-            cached["accepted"] = _candidate_is_accepted(cached, threshold)
+            cached["eligible_for_adjudication"] = _candidate_is_rank_eligible(
+                cached, threshold
+            )
+            cached["accepted"] = False
             cached["_cache_hit"] = True
             cached["_api_call"] = False
             return cached
 
-        prompt = _candidate_prompt(
-            slot_index=slot_index,
-            slot_duration=slot_duration,
-            narration_text=narration_text,
-            search_query=search_query,
-        )
+        prompt = _candidate_prompt(requirement_spec)
         try:
-            response, input_method = _sync_candidate_analysis(video_url, prompt)
+            response, input_method = _sync_candidate_analysis(
+                video_url,
+                prompt,
+                _candidate_response_schema(requirement_spec),
+            )
         except Exception as exc:
             reason = _safe_api_failure_reason(exc)
             logger.warning(
                 "TwelveLabs candidate analysis failed: "
-                f"slot={slot_index}, asset_id={asset_id}, reason={reason}"
+                f"slot={slot_index}, provider={provider}, "
+                f"asset_id={asset_id}, reason={reason}"
             )
-            return _failed_candidate_evaluation(reason, api_call=True)
+            return _failed_candidate_evaluation(
+                reason,
+                api_call=True,
+                requirement_spec=requirement_spec,
+            )
 
         if getattr(response, "finish_reason", None) == "length":
             result = None
         else:
             response_data = getattr(response, "data", response)
-            result = _parse_candidate_response(response_data, threshold)
+            result = _parse_candidate_response(
+                response_data,
+                threshold,
+                requirement_spec,
+            )
         if result is None:
             logger.warning(
                 "TwelveLabs candidate analysis returned malformed structured data: "
-                f"slot={slot_index}, asset_id={asset_id}"
+                f"slot={slot_index}, provider={provider}, asset_id={asset_id}"
             )
             return _failed_candidate_evaluation(
                 "malformed TwelveLabs structured response",
                 api_call=True,
+                requirement_spec=requirement_spec,
             )
         result["analysis_input"] = input_method
         result["_cache_hit"] = False
         result["_api_call"] = True
-        _save_candidate_evaluation_cache(asset_id, narration_text, result)
+        _save_candidate_evaluation_cache(
+            provider,
+            asset_id,
+            narration_text,
+            result,
+            requirement_digest,
+        )
         return result
 
 
@@ -806,13 +1262,15 @@ def select_best_candidate(
     slot_duration: float,
     narration_text: str,
     search_query: str,
+    requirement_spec: VisualRequirementSpec,
     batch_size: int | None = None,
     max_candidates: int | None = None,
     minimum_score: float | None = None,
     strong_early_stop_score: float | None = None,
     concurrency: int | None = None,
+    app_config=None,
 ) -> tuple[MaterialInfo | None, dict[str, Any]]:
-    """Evaluate complete bounded batches and choose the global best candidate."""
+    """Observe bounded batches, gate evidence, then adjudicate viable candidates."""
     settings = candidate_selection_settings()
     batch_size = min(5, max(1, int(batch_size or settings["batch_size"])))
     max_candidates = min(
@@ -836,6 +1294,9 @@ def select_best_candidate(
     cached_candidates_used = 0
     source_seconds_analyzed = 0.0
     batches_processed = 0
+    adjudication_calls = 0
+    candidates_adjudicated = 0
+    adjudication_failures = 0
 
     for batch_start in range(0, len(bounded_candidates), batch_size):
         batch = bounded_candidates[batch_start : batch_start + batch_size]
@@ -845,33 +1306,37 @@ def select_best_candidate(
         with ThreadPoolExecutor(max_workers=min(concurrency, len(batch))) as executor:
             futures = {}
             for offset, candidate in enumerate(batch):
-                source = (
-                    candidate.source_info
-                    if isinstance(candidate.source_info, dict)
-                    else {}
-                )
                 candidate_index = batch_start + offset
-                asset_id = str(source.get("asset_id") or "")
+                identity = material._provider_asset_identity(candidate)
+                provider, asset_id = identity or ("", "")
                 future = executor.submit(
                     evaluate_candidate,
+                    provider=provider,
                     asset_id=asset_id,
                     video_url=candidate.url,
                     slot_index=slot_index,
                     slot_duration=slot_duration,
                     narration_text=narration_text,
                     search_query=search_query,
+                    requirement_spec=requirement_spec,
                     minimum_score=threshold,
                 )
-                futures[future] = (candidate_index, candidate, asset_id)
+                futures[future] = (
+                    candidate_index,
+                    candidate,
+                    provider,
+                    asset_id,
+                )
 
             for future in as_completed(futures):
-                candidate_index, candidate, asset_id = futures[future]
+                candidate_index, candidate, provider, asset_id = futures[future]
                 try:
                     result = future.result()
                 except Exception as exc:
                     result = _failed_candidate_evaluation(
                         _safe_api_failure_reason(exc),
                         api_call=True,
+                        requirement_spec=requirement_spec,
                     )
                 if result.get("_cache_hit"):
                     cached_candidates_used += 1
@@ -880,7 +1345,8 @@ def select_best_candidate(
                     source_seconds_analyzed += float(candidate.duration)
                 logger.info(
                     "TwelveLabs candidate result: "
-                    f"slot={slot_index}, asset_id={asset_id or 'unknown'}, "
+                    f"slot={slot_index}, provider={provider or 'unknown'}, "
+                    f"asset_id={asset_id or 'unknown'}, "
                     f"duration={candidate.duration}, batch={batch_number}, "
                     f"accepted={bool(result.get('accepted'))}, "
                     f"overall_score={float(result.get('overall_score') or 0):.4f}, "
@@ -889,6 +1355,54 @@ def select_best_candidate(
                 batch_results.append((candidate_index, candidate, result))
 
         batch_results.sort(key=lambda item: item[0])
+        eligible_batch = sorted(
+            (
+                item
+                for item in batch_results
+                if item[2].get("eligible_for_adjudication") is True
+            ),
+            key=lambda item: (-float(item[2]["overall_score"]), item[0]),
+        )[:_MAX_ADJUDICATION_CANDIDATES_PER_BATCH]
+        if eligible_batch:
+            adjudication_calls += 1
+            adjudication_inputs: list[dict[str, Any]] = []
+            candidate_ids: dict[str, tuple[int, MaterialInfo, dict[str, Any]]] = {}
+            for candidate_index, candidate, result in eligible_batch:
+                identity = material._provider_asset_identity(candidate)
+                provider, asset_id = identity or ("unknown", str(candidate_index))
+                candidate_id = f"{provider}:{asset_id}"
+                candidate_ids[candidate_id] = (candidate_index, candidate, result)
+                adjudication_inputs.append(
+                    {
+                        "candidate_id": candidate_id,
+                        "observed_facts": result.get("observed_facts"),
+                    }
+                )
+            decisions = llm.adjudicate_visual_candidates(
+                requirement_spec,
+                adjudication_inputs,
+                app_config=app_config,
+            )
+            if set(decisions) != set(candidate_ids):
+                adjudication_failures += 1
+                for _, _, result in eligible_batch:
+                    result["semantic_adjudication"] = {
+                        "candidate_id": "",
+                        "decision": "UNCERTAIN",
+                        "mandatory_fact_results": [],
+                        "missing_or_contradictory_facts": [],
+                        "reason": "semantic adjudication unavailable or malformed",
+                    }
+                    result["reason"] = "semantic adjudication unavailable or malformed"
+                    result["accepted"] = False
+            else:
+                candidates_adjudicated += len(eligible_batch)
+                for candidate_id, (_, _, result) in candidate_ids.items():
+                    decision = decisions[candidate_id]
+                    result["semantic_adjudication"] = asdict(decision)
+                    result["accepted"] = _candidate_is_accepted(result, threshold)
+                    result["reason"] = _clean_text(decision.reason, 500)
+
         evaluated.extend(batch_results)
         accepted_so_far = [
             item for item in evaluated if item[2].get("accepted") is True
@@ -930,6 +1444,43 @@ def select_best_candidate(
         }
         winner.overall_score = float(winner_result["overall_score"])
 
+    ranked_indexes = {
+        candidate_index: rank
+        for rank, (candidate_index, _, _) in enumerate(
+            sorted(
+                evaluated,
+                key=lambda item: (
+                    -float(item[2].get("overall_score") or 0.0),
+                    item[0],
+                ),
+            ),
+            start=1,
+        )
+    }
+    candidate_evaluations = []
+    for candidate_index, candidate, result in evaluated:
+        provider, provider_asset_id = material._provider_asset_identity(candidate) or (
+            "",
+            "",
+        )
+        candidate_evaluations.append(
+            {
+                "provider": provider,
+                "provider_asset_id": provider_asset_id,
+                "input_order": candidate_index + 1,
+                "ranking_position": ranked_indexes[candidate_index],
+                "observed_facts": result.get("observed_facts"),
+                "critical_gate": result.get("critical_gate"),
+                "semantic_adjudication": result.get("semantic_adjudication"),
+                "scores": result.get("scores"),
+                "overall_score": float(result.get("overall_score") or 0.0),
+                "quality_flags": result.get("quality_flags"),
+                "accepted": result.get("accepted") is True,
+                "reason": _clean_text(result.get("reason"), 240),
+                "cache_hit": result.get("_cache_hit") is True,
+            }
+        )
+
     stats = {
         "candidates_considered": len(bounded_candidates),
         "candidates_evaluated": len(evaluated),
@@ -937,9 +1488,25 @@ def select_best_candidate(
         "cached_candidates_used": cached_candidates_used,
         "source_seconds_analyzed": round(source_seconds_analyzed, 3),
         "batches_processed": batches_processed,
+        "adjudication_calls": adjudication_calls,
+        "candidates_adjudicated": candidates_adjudicated,
+        "adjudication_failures": adjudication_failures,
+        "critical_gate_rejections": sum(
+            1
+            for _, _, result in evaluated
+            if isinstance(result.get("critical_gate"), dict)
+            and result["critical_gate"].get("decision") == "REJECT"
+        ),
+        "critical_gate_uncertain": sum(
+            1
+            for _, _, result in evaluated
+            if isinstance(result.get("critical_gate"), dict)
+            and result["critical_gate"].get("decision") == "UNCERTAIN"
+        ),
         "early_stopped": len(evaluated) < len(bounded_candidates),
         "winner_evaluation": winner_result,
         "api_failure_reason": api_failure_reason,
+        "candidate_evaluations": candidate_evaluations,
     }
     return winner, stats
 
@@ -1014,17 +1581,53 @@ def _wait_for_temporal_task(
     task_id: str,
     *,
     timeout_seconds: float = 300.0,
+    max_retrieval_attempts: int = _TEMPORAL_RETRIEVAL_MAX_ATTEMPTS,
+    backoff_seconds: float = _TEMPORAL_RETRIEVAL_BACKOFF_SECONDS,
 ):
     deadline = time.monotonic() + timeout_seconds
+    retrieval_failures = 0
     while True:
-        result = client.analyze_async.tasks.retrieve(task_id)
+        try:
+            result = client.analyze_async.tasks.retrieve(task_id)
+            retrieval_failures = 0
+        except Exception as exc:
+            reason = _safe_api_failure_reason(exc)
+            if _is_auth_or_quota_failure(exc):
+                raise TemporalSegmentationError("auth_quota", reason) from None
+
+            retrieval_failures += 1
+            if not _is_transient_api_failure(exc) or retrieval_failures >= max(
+                1, int(max_retrieval_attempts)
+            ):
+                raise TemporalSegmentationError("service", reason) from None
+
+            delay = max(0.0, float(backoff_seconds)) * (2 ** (retrieval_failures - 1))
+            if time.monotonic() + delay >= deadline:
+                raise TemporalSegmentationError(
+                    "service",
+                    "TwelveLabs temporal segmentation timed out",
+                ) from None
+            logger.warning(
+                "retrying TwelveLabs temporal task retrieval: "
+                f"task_id={task_id}, attempt={retrieval_failures + 1}, "
+                f"reason={reason}"
+            )
+            time.sleep(delay)
+            continue
+
         status = str(getattr(result, "status", "") or "")
         if status == "ready":
             return result
         if status == "failed":
-            raise RuntimeError("TwelveLabs temporal segmentation failed")
+            raise TemporalSegmentationError(
+                "service",
+                "TwelveLabs temporal analysis failed",
+            )
         if time.monotonic() >= deadline:
-            raise TimeoutError("TwelveLabs temporal segmentation timed out")
+            raise TemporalSegmentationError(
+                "service",
+                "TwelveLabs temporal segmentation timed out",
+            )
         time.sleep(2.0)
 
 
@@ -1123,11 +1726,15 @@ def segment_winner(
     slot_duration: float,
     source_duration: float,
     clip_speed: float = 1.0,
+    requested_source_duration: float | None = None,
 ) -> dict[str, Any] | None:
     """Run one async time-based segmentation call for the selected winner."""
     from twelvelabs.types import VideoContext_AssetId, VideoContext_Url
 
-    requested_source_duration = float(slot_duration) * float(clip_speed)
+    if requested_source_duration is None:
+        requested_source_duration = float(slot_duration) * float(clip_speed)
+    else:
+        requested_source_duration = float(requested_source_duration)
     if requested_source_duration <= 0 or float(source_duration) < 4.0:
         return None
     client = _client()
@@ -1170,12 +1777,13 @@ def segment_winner(
         if result is not None:
             result["analysis_input"] = input_method
         return result
+    except TemporalSegmentationError:
+        raise
     except Exception as exc:
-        logger.warning(
-            "TwelveLabs winner segmentation failed: "
-            f"reason={_safe_api_failure_reason(exc)}"
-        )
-        return None
+        reason = _safe_api_failure_reason(exc)
+        category = "auth_quota" if _is_auth_or_quota_failure(exc) else "service"
+        logger.warning(f"TwelveLabs winner segmentation failed: reason={reason}")
+        raise TemporalSegmentationError(category, reason) from None
     finally:
         _delete_temporary_asset(client, asset_id)
 

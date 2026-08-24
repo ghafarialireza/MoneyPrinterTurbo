@@ -252,6 +252,14 @@ def split_string_by_punctuations(s):
             txt += char
             continue
 
+        if char == ",":
+            # An ordinary ASCII comma is usually an intra-sentence pause in
+            # natural English prose, not a reliable narration/timeline boundary.
+            # Keep it in the readable subtitle text and let periods, explicit
+            # newlines, and language-specific punctuation end the segment.
+            txt += char
+            continue
+
         if char not in const.PUNCTUATIONS:
             txt += char
         else:
