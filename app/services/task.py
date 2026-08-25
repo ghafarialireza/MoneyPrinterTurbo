@@ -1447,6 +1447,125 @@ def _build_visual_beats_from_valid_spans(
     return visual_beats
 
 
+def refine_split_span_shot_requirements(visual_beats: list[VisualBeat]) -> int:
+    """Give each shot of a split span a requirement of its own.
+
+    A span long enough to be split becomes several shots, and every shot
+    inherits the span's single ``visual_requirement`` verbatim. That requirement
+    describes the whole span, so it usually names several moments at once -- a
+    drip, a canyon, a thousand years. Three consequences follow, and all three
+    are paid for on every run: the beats deduplicate into one stock search and
+    buy near-identical clips, the requirement checklist turns every moment into a
+    mandatory fact that no single clip can show, and so each of those shots
+    exhausts its candidates and drops into the failure ladder.
+
+    One batched provider-neutral call splits the parent across its shots, using
+    each shot's own spoken text to decide which part is that shot's. Failure is
+    free: a shot with no usable answer keeps the parent requirement and behaves
+    exactly as it did before this stage existed.
+
+    Returns the number of beats whose requirement was replaced, and mutates
+    those beats in place so both the search queries and the checklist -- built
+    afterwards -- read the refined text without knowing about this stage.
+    """
+    groups: dict[int, list[VisualBeat]] = {}
+    for beat in visual_beats:
+        if beat.duration_policy != "long_span_split":
+            continue
+        groups.setdefault(beat.semantic_group_id, []).append(beat)
+
+    requestable: dict[int, list[VisualBeat]] = {}
+    for group_id, group in groups.items():
+        # One shot already owns its span's requirement, so there is nothing to
+        # divide. Shots that do not share one parent are left alone as well,
+        # because then the parent sent with the request would not be the parent
+        # of every shot in it.
+        if len(group) < 2:
+            continue
+        if len({beat.visual_requirement for beat in group}) != 1:
+            continue
+        requestable[group_id] = sorted(group, key=lambda beat: beat.shot_index)
+    if not requestable:
+        return 0
+
+    try:
+        answers = llm.generate_shot_visual_requirements(
+            [
+                {
+                    "span_requirement": group[0].visual_requirement,
+                    "shots": [
+                        {
+                            "shot_id": beat.index,
+                            "spoken_text": beat.spoken_text,
+                        }
+                        for beat in group
+                    ],
+                }
+                for group in requestable.values()
+            ]
+        )
+    except Exception as exc:
+        logger.warning(
+            "shot visual requirement split failed: "
+            f"error={type(exc).__name__}, spans={len(requestable)}"
+        )
+        return 0
+    if not answers:
+        logger.warning(
+            "shot visual requirement split returned nothing usable; every shot "
+            f"of a split span keeps its span requirement: spans={len(requestable)}"
+        )
+        return 0
+
+    refined = 0
+    over_long = 0
+    duplicated = 0
+    for group in requestable.values():
+        claimed: set[str] = set()
+        for beat in group:
+            requirement = " ".join(str(answers.get(beat.index) or "").split())
+            if not requirement:
+                continue
+            # The ceiling the LLM grouping path validates spans against. A
+            # bloated requirement is carried into the checklist and into every
+            # adjudication prompt of this beat, so it is not adopted.
+            if len(requirement) > _SEMANTIC_VISUAL_REQUIREMENT_MAX_CHARS:
+                over_long += 1
+                continue
+            # Identical siblings are the exact pathology this stage removes, and
+            # the query cache keys on the group plus the requirement, so a
+            # repeated answer would collapse back into one search. The later
+            # shot keeps the parent instead: still a distinct string, so both
+            # shots are searched separately.
+            key = requirement.casefold()
+            if key in claimed:
+                duplicated += 1
+                continue
+            claimed.add(key)
+            if requirement == beat.visual_requirement:
+                continue
+            beat.visual_requirement = requirement
+            refined += 1
+
+    if over_long:
+        logger.warning(
+            "shot visual requirements exceeded the span limit and were "
+            f"discarded: count={over_long}"
+        )
+    if duplicated:
+        logger.warning(
+            "shot visual requirements repeated a sibling answer and were "
+            f"discarded: count={duplicated}"
+        )
+    logger.info(
+        "split span shot requirements refined: "
+        f"spans={len(requestable)}, "
+        f"shots={sum(len(group) for group in requestable.values())}, "
+        f"refined_shots={refined}"
+    )
+    return refined
+
+
 def _validate_complete_visual_beat_timeline(
     visual_beats: list[VisualBeat],
     audio_duration: float,
@@ -3040,6 +3159,16 @@ def _run_pipeline(
                 visual_beats=visual_beats,
             )
         else:
+            # Before the beat queries and before the checklist, because both key
+            # on the requirement text: refining it afterwards would leave the
+            # shots of a split span sharing one search and one checklist entry.
+            # Gated on the beat timeline alone rather than on the verification
+            # credentials, because a distinct query per shot is what buys
+            # distinct footage whether or not candidates are ever adjudicated.
+            # Not run on the `stop_at == "subtitle"` path above, which never
+            # searches for anything and so must not pay for this.
+            if visual_beats:
+                refine_split_span_shot_requirements(visual_beats)
             try:
                 # Ask for as many phrasings as material selection is allowed to
                 # try on one provider. Fewer may come back; that only costs a

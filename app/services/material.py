@@ -2864,9 +2864,17 @@ def _merged_visual_beat(survivor: VisualBeat, absorbed: VisualBeat) -> VisualBea
     its verifier runs already refer to it. The absorbed index is retired rather
     than reused, so a run record saying beat 5 was unfillable still points at a
     beat that no longer exists in the timeline — which is exactly what happened to
-    it. Everything else is inherited from the survivor, which is sound only because
-    both beats are shots of one semantic group and therefore already share a
-    requirement and a source span.
+    it.
+
+    The survivor's ``visual_requirement`` is kept, and it is not necessarily the
+    absorbed beat's: shots of one split span are given their own requirements at
+    the script stage precisely so they do not describe the same moment. So the
+    merged beat is an approved clip for the survivor's requirement covering the
+    absorbed beat's window as well, which is the honest description of a rescue
+    and is why the merge record notes the requirement that went unfilled. The
+    alternative to inheriting is another paid selection round for a beat whose own
+    requirement has already been established as unfillable, or failing the video
+    over one shot.
     """
     first, second = (
         (survivor, absorbed)
@@ -3207,18 +3215,24 @@ def _merge_unfillable_beats(
             f"merged_into={merged_beat.index}, fill={merge_fill}, "
             f"merged_duration={required_target_duration:.3f}s"
         )
-        result.verifier_runs.append(
-            {
-                "visual_item_type": item_type,
-                "visual_item_index": beat.index,
-                "visual_requirement": outcome.requirement,
-                "final_decision": "UNFILLABLE_BEAT_MERGED",
-                "merged_into_visual_item_index": merged_beat.index,
-                "merged_target_duration": round(required_target_duration, 3),
-                "merge_fill": merge_fill,
-                "reason": "; ".join(outcome.failures)[:240],
-            }
-        )
+        merge_record = {
+            "visual_item_type": item_type,
+            "visual_item_index": beat.index,
+            "visual_requirement": outcome.requirement,
+            "final_decision": "UNFILLABLE_BEAT_MERGED",
+            "merged_into_visual_item_index": merged_beat.index,
+            "merged_target_duration": round(required_target_duration, 3),
+            "merge_fill": merge_fill,
+            "reason": "; ".join(outcome.failures)[:240],
+        }
+        # Shots of one split span carry requirements of their own, so the clip now
+        # covering this window was approved for a different requirement than the
+        # one above. Recorded when the two differ, so a report reading this run
+        # cannot mistake the rescue for an approval of the unfilled requirement.
+        covering_requirement = (survivor.requirement or "").strip()
+        if covering_requirement != (outcome.requirement or "").strip():
+            merge_record["merged_into_visual_requirement"] = covering_requirement
+        result.verifier_runs.append(merge_record)
     return result
 
 

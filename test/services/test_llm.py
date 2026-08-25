@@ -3084,6 +3084,227 @@ class TestNarrationVisualRequirementRepair(unittest.TestCase):
         self.assertIsNone(result)
 
 
+class TestShotVisualRequirementSplit(unittest.TestCase):
+    """The call that divides one span requirement across the shots it became.
+
+    A span long enough to be split describes several moments at once, and every
+    shot inherited that whole description. This call narrows each shot to the
+    moment its own spoken text is about, so its failures must leave the parent
+    requirement standing rather than replace it with something narrower than the
+    narration supports.
+    """
+
+    PARENT = "A slow water drip carving a canyon through solid rock over time"
+
+    @staticmethod
+    def _spans(count, shots_per_span=2):
+        return [
+            {
+                "span_requirement": f"Parent requirement {span_index}",
+                "shots": [
+                    {
+                        "shot_id": (span_index - 1) * shots_per_span + shot_offset,
+                        "spoken_text": (
+                            f"Spoken fragment {span_index}.{shot_offset}"
+                        ),
+                    }
+                    for shot_offset in range(1, shots_per_span + 1)
+                ],
+            }
+            for span_index in range(1, count + 1)
+        ]
+
+    def _real_split_span(self):
+        """The span from task 93b80e04, whose three shots all inherited PARENT."""
+        return [
+            {
+                "span_requirement": self.PARENT,
+                "shots": [
+                    {
+                        "shot_id": 1,
+                        "spoken_text": "It starts with a single drop of water.",
+                    },
+                    {
+                        "shot_id": 2,
+                        "spoken_text": "Over a thousand years that drip carves",
+                    },
+                    {
+                        "shot_id": 3,
+                        "spoken_text": "solid rock, and the stone never fought back.",
+                    },
+                ],
+            }
+        ]
+
+    def test_each_shot_is_asked_for_the_moment_its_own_words_describe(self):
+        captured = {}
+
+        def fake_generate_response(prompt, app_config=None):
+            captured["prompt"] = prompt
+            return (
+                '[{"shot_id":1,"visual_requirement":"A single drop falling"},'
+                '{"shot_id":2,"visual_requirement":"  Water   tracing a groove "},'
+                '{"shot_id":3,"visual_requirement":"A canyon cut into bare stone"}]'
+            )
+
+        with patch.object(
+            llm, "_generate_response", side_effect=fake_generate_response
+        ) as generate:
+            result = llm.generate_shot_visual_requirements(self._real_split_span())
+
+        self.assertEqual(generate.call_count, 1)
+        self.assertEqual(
+            result,
+            {
+                1: "A single drop falling",
+                2: "Water tracing a groove",
+                3: "A canyon cut into bare stone",
+            },
+        )
+        # The parent is the boundary of the answer, and each shot's own words are
+        # what decides which part of it belongs to that shot.
+        self.assertIn(f'1|"{self.PARENT}"', captured["prompt"])
+        self.assertIn(
+            '1|1|"It starts with a single drop of water."', captured["prompt"]
+        )
+        self.assertIn(
+            "introduce a subject the parent does not contain", captured["prompt"]
+        )
+        self.assertIn("must describe different moments", captured["prompt"])
+
+    def test_a_shot_adding_no_visible_moment_comes_back_absent(self):
+        payload = (
+            '[{"shot_id":1,"visual_requirement":"A single drop falling"},'
+            '{"shot_id":2,"visual_requirement":""},'
+            '{"shot_id":3,"visual_requirement":"   "}]'
+        )
+        with patch.object(llm, "_generate_response", return_value=payload):
+            result = llm.generate_shot_visual_requirements(self._real_split_span())
+
+        # Absent, not empty: the caller leaves such a shot on the parent
+        # requirement, while an empty string would reach stock search.
+        self.assertEqual(result, {1: "A single drop falling"})
+
+    def test_an_unusable_object_never_discards_the_shots_that_came_back(self):
+        payload = (
+            '[{"shot_id":1,"visual_requirement":"A single drop falling"},'
+            '{"shot_id":"2","visual_requirement":"Water tracing a groove"},'
+            '{"shot_id":3,"visual_requirement":17},'
+            '{"shot_id":2,"visual_requirement":"A canyon","span_id":1},'
+            '{"shot_id":99,"visual_requirement":"A shot that was never requested"},'
+            '{"shot_id":1,"visual_requirement":"A duplicate answer"}]'
+        )
+        with patch.object(llm, "_generate_response", return_value=payload):
+            result = llm.generate_shot_visual_requirements(self._real_split_span())
+
+        self.assertEqual(result, {1: "A single drop falling"})
+
+    def test_provider_failure_reads_as_unavailable_not_as_nothing_to_narrow(self):
+        with patch.object(
+            llm, "_generate_response", return_value="Error: provider unavailable"
+        ):
+            unavailable = llm.generate_shot_visual_requirements(
+                self._real_split_span()
+            )
+
+        # None and {} mean different things: one says the stage never ran, the
+        # other says the provider found nothing in the parent worth narrowing.
+        self.assertIsNone(unavailable)
+
+        with patch.object(llm, "_generate_response", return_value="[]") as generate:
+            nothing_to_narrow = llm.generate_shot_visual_requirements(
+                self._real_split_span()
+            )
+
+        self.assertEqual(nothing_to_narrow, {})
+        self.assertEqual(generate.call_count, 1)
+
+    def test_many_split_spans_are_asked_for_in_bounded_batches(self):
+        span_count = llm._SHOT_REQUIREMENT_SPANS_PER_BATCH + 2
+        requested_batches = []
+
+        def fake_generate_response(prompt, app_config=None):
+            # Two blocks in this prompt start with a digit: parents carry two
+            # fields and shots carry three, so they are told apart by width.
+            shot_ids = []
+            parents = set()
+            for line in prompt.splitlines():
+                if not line or not line[0].isdigit() or "|" not in line:
+                    continue
+                fields = line.split("|")
+                if len(fields) == 3:
+                    shot_ids.append(int(fields[1]))
+                elif len(fields) == 2:
+                    parents.add(int(fields[0]))
+            requested_batches.append((sorted(parents), shot_ids))
+            return json.dumps(
+                [
+                    {"shot_id": shot_id, "visual_requirement": f"Moment {shot_id}"}
+                    for shot_id in shot_ids
+                ]
+            )
+
+        with patch.object(
+            llm, "_generate_response", side_effect=fake_generate_response
+        ) as generate:
+            result = llm.generate_shot_visual_requirements(self._spans(span_count))
+
+        self.assertEqual(generate.call_count, 2)
+        self.assertEqual(
+            len(requested_batches[0][0]),
+            llm._SHOT_REQUIREMENT_SPANS_PER_BATCH,
+        )
+        self.assertEqual(len(requested_batches[1][0]), 2)
+        # Every shot of a span is answered in the same request as its siblings,
+        # because the whole point is that they must differ from each other.
+        self.assertEqual(len(result), span_count * 2)
+        self.assertEqual(requested_batches[1][1], [9, 10, 11, 12])
+        self.assertEqual(result[12], "Moment 12")
+
+    def test_a_failed_batch_keeps_the_spans_that_answered(self):
+        span_count = llm._SHOT_REQUIREMENT_SPANS_PER_BATCH + 1
+        answered = []
+
+        def fake_generate_response(prompt, app_config=None):
+            if not answered:
+                answered.append("first")
+                return json.dumps(
+                    [{"shot_id": 1, "visual_requirement": "A single drop falling"}]
+                )
+            return "not json at all"
+
+        with patch.object(
+            llm, "_generate_response", side_effect=fake_generate_response
+        ):
+            result = llm.generate_shot_visual_requirements(self._spans(span_count))
+
+        # A failed batch costs only its own spans, which keep the parent and
+        # behave exactly as they did before this stage existed.
+        self.assertEqual(result, {1: "A single drop falling"})
+
+    def test_a_span_with_one_shot_is_never_sent(self):
+        over_long_parent = "y" * (llm._MAX_STRUCTURED_TEXT_LENGTH + 1)
+        with patch.object(llm, "_generate_response") as generate:
+            result = llm.generate_shot_visual_requirements(
+                [
+                    {
+                        "span_requirement": self.PARENT,
+                        "shots": [{"shot_id": 1, "spoken_text": "One drop."}],
+                    },
+                    {"span_requirement": "   ", "shots": self._spans(1)[0]["shots"]},
+                    {
+                        "span_requirement": over_long_parent,
+                        "shots": self._spans(1)[0]["shots"],
+                    },
+                ]
+            )
+
+        # A span that owns its requirement has no question to answer, so asking
+        # would spend a request on nothing.
+        generate.assert_not_called()
+        self.assertIsNone(result)
+
+
 FOUNDRY_KEY = os.environ.get("ANTHROPIC_FOUNDRY_API_KEY", "")
 FOUNDRY_BASE = "https://amanrai-test-resource.services.ai.azure.com/anthropic"
 FOUNDRY_MODEL = "azure_ai/claude-sonnet-4-6"

@@ -62,6 +62,12 @@ _VISUAL_REQUIREMENT_BATCH_SIZE = 4
 # larger than a decomposition batch. The bound exists because the model has to
 # keep every requested line index straight in one answer, not because of size.
 _NARRATION_REQUIREMENT_BATCH_SIZE = 25
+# Shots of one span must be answered together, because the whole point is that
+# they differ from each other. Batching is therefore by span, and this bounds how
+# many spans share a request: a failed batch costs only those spans, which keep
+# their parent requirement and behave exactly as they did before this stage
+# existed.
+_SHOT_REQUIREMENT_SPANS_PER_BATCH = 4
 # Providers that require an explicit output ceiling used to get 2048 tokens,
 # which silently truncated every multi-object structured response.
 _DEFAULT_MAX_OUTPUT_TOKENS = 8192
@@ -1328,6 +1334,230 @@ Example shape only:
         except ValueError as exc:
             logger.warning(
                 "narration visual requirement repair returned an unusable batch: "
+                f"reason={exc}"
+            )
+    if not parsed_any_batch:
+        return None
+    return requirements
+
+
+def _validated_shot_visual_requirements(
+    parsed: object,
+    requested_shot_ids: set[int],
+) -> dict[int, str]:
+    """Keep the well-formed shot answers and drop the rest.
+
+    A requested shot is absent from the result when the provider left it out,
+    answered it with an empty string, or answered it with something malformed.
+    The caller treats all three the same way -- that shot keeps its parent
+    span's requirement -- so one bad object never discards the shots that came
+    back correctly.
+    """
+    if not isinstance(parsed, list):
+        raise ValueError("shot visual requirements must be a JSON array")
+    if len(parsed) > 2 * max(1, len(requested_shot_ids)):
+        raise ValueError("shot visual requirements returned too many objects")
+
+    requirements: dict[int, str] = {}
+    rejected = 0
+    for item in parsed:
+        if not isinstance(item, dict) or set(item) - {
+            "shot_id",
+            "visual_requirement",
+        }:
+            rejected += 1
+            continue
+        shot_id = item.get("shot_id")
+        if isinstance(shot_id, bool) or not isinstance(shot_id, int):
+            rejected += 1
+            continue
+        if shot_id not in requested_shot_ids or shot_id in requirements:
+            rejected += 1
+            continue
+        raw_requirement = item.get("visual_requirement")
+        if isinstance(raw_requirement, str) and not raw_requirement.strip():
+            # The documented way to say "this shot cannot be narrowed any
+            # further". It is an answer, not a provider failure.
+            continue
+        try:
+            requirements[shot_id] = _bounded_structured_text(
+                raw_requirement,
+                "visual_requirement",
+            )
+        except ValueError:
+            rejected += 1
+    if rejected:
+        logger.warning(
+            "shot visual requirement objects were unusable: "
+            f"rejected={rejected}, accepted={len(requirements)}"
+        )
+    return requirements
+
+
+def _requestable_shot_requirement_spans(spans: list[dict]) -> list[dict]:
+    """Spans worth asking about: a usable parent plus two or more shots."""
+    requestable: list[dict] = []
+    for span in spans:
+        if not isinstance(span, dict):
+            continue
+        parent = " ".join(str(span.get("span_requirement") or "").split())
+        if not parent or len(parent) > _MAX_STRUCTURED_TEXT_LENGTH:
+            continue
+        shots: list[dict] = []
+        seen_shot_ids: set[int] = set()
+        for shot in span.get("shots") or []:
+            if not isinstance(shot, dict):
+                continue
+            shot_id = shot.get("shot_id")
+            if isinstance(shot_id, bool) or not isinstance(shot_id, int):
+                continue
+            spoken_text = " ".join(str(shot.get("spoken_text") or "").split())
+            if not spoken_text or shot_id in seen_shot_ids:
+                continue
+            if len(spoken_text) > _MAX_STRUCTURED_TEXT_LENGTH:
+                continue
+            seen_shot_ids.add(shot_id)
+            shots.append({"shot_id": shot_id, "spoken_text": spoken_text})
+        # A span with one shot already owns its requirement, so asking about it
+        # would spend a request on a question that has no answer.
+        if len(shots) < 2:
+            continue
+        requestable.append({"span_requirement": parent, "shots": shots})
+    return requestable
+
+
+def generate_shot_visual_requirements(
+    spans: list[dict],
+    app_config=None,
+) -> dict[int, str] | None:
+    """Give each shot of a split span one visible moment of its own.
+
+    A long semantic span is cut into several consecutive shots, and every shot
+    used to inherit the span's entire requirement. Three shots then searched for
+    the same multi-event scene, so provider de-duplication had to buy three
+    near-duplicate clips, and each one was verified against facts that belong to
+    the other two. This narrows the parent requirement to the moment each shot's
+    own words describe.
+
+    Returns the accepted requirements keyed by the caller's shot id. A shot that
+    cannot be narrowed is deliberately absent rather than given an invented
+    scene, so the caller simply keeps the parent requirement for it.
+
+    Returns ``None`` only when no batch produced a parseable payload at all,
+    which the caller must treat as "this stage is unavailable" and never as "no
+    shot could be narrowed".
+    """
+    requestable = _requestable_shot_requirement_spans(spans)
+    if not requestable:
+        return None
+
+    requirements: dict[int, str] = {}
+    parsed_any_batch = False
+    for batch_start in range(
+        0,
+        len(requestable),
+        _SHOT_REQUIREMENT_SPANS_PER_BATCH,
+    ):
+        batch = requestable[
+            batch_start : batch_start + _SHOT_REQUIREMENT_SPANS_PER_BATCH
+        ]
+        parent_block = chr(10).join(
+            "|".join(
+                (
+                    str(span_position),
+                    json.dumps(span["span_requirement"], ensure_ascii=False),
+                )
+            )
+            for span_position, span in enumerate(batch, start=1)
+        )
+        shot_block = chr(10).join(
+            "|".join(
+                (
+                    str(span_position),
+                    str(shot["shot_id"]),
+                    json.dumps(shot["spoken_text"], ensure_ascii=False),
+                )
+            )
+            for span_position, span in enumerate(batch, start=1)
+            for shot in span["shots"]
+        )
+        prompt = f"""
+# Role: Split One Visual Requirement Across Its Shots
+
+## Goal
+A long spoken passage was cut into consecutive shots. Each shot needs its own
+description of what a real stock video clip would have to show while that shot's
+words are spoken. The result is used to search stock catalogs and to verify a
+candidate clip against it, so it must describe visible things only.
+
+## Parent Requirements
+Each line is: span_id|parent_requirement
+This is the whole passage's visual requirement, and it is the boundary for that
+span's shots: a shot requirement must be a narrower part of it.
+
+{parent_block}
+
+## Shots
+Each line is: span_id|shot_id|spoken_text
+Shot ids are authoritative. Answer every shot exactly once and never rewrite,
+merge, split, reorder, or invent shots. Shots of one span are in spoken order.
+
+{shot_block}
+
+## Rules
+1. visual_requirement must be ONE camera-visible moment: a single subject and
+   action that a camera can record in one continuous shot.
+2. Stay inside the parent requirement of that shot's span. Narrow it, and never
+   introduce a subject the parent does not contain.
+3. Prefer the part of the parent that this shot's own spoken_text describes.
+   Shots are sentence fragments, so read the parent to resolve them.
+4. Shots of the same span must describe different moments. Never return the
+   same requirement for two shots of one span.
+5. Never request on-screen text, captions, logos, brands, or named real people.
+6. A shot whose words add no visible moment of their own must return an empty
+   string. Never invent a nonsense visual to fill it.
+7. Describe one visible situation in under 20 words.
+
+## Strict Output
+Return one JSON array only. Every object must contain exactly:
+- shot_id: integer, one of the shot ids above
+- visual_requirement: string, empty only for a shot that cannot be narrowed
+
+Do not return span ids, timestamps, durations, spoken text, search queries,
+explanations, provider data, or any other fields.
+
+Example shape only:
+[
+  {{"shot_id": 1,
+    "visual_requirement": "A single water drop falling onto bare stone"}},
+  {{"shot_id": 2,
+    "visual_requirement": "Water running over a grooved rock face"}},
+  {{"shot_id": 3, "visual_requirement": ""}}
+]
+""".strip()
+
+        parsed = _generate_structured_response(
+            prompt,
+            purpose="shot visual requirement split",
+            app_config=app_config,
+        )
+        if parsed is None:
+            continue
+        parsed_any_batch = True
+        try:
+            requirements.update(
+                _validated_shot_visual_requirements(
+                    parsed,
+                    {
+                        shot["shot_id"]
+                        for span in batch
+                        for shot in span["shots"]
+                    },
+                )
+            )
+        except ValueError as exc:
+            logger.warning(
+                "shot visual requirement split returned an unusable batch: "
                 f"reason={exc}"
             )
     if not parsed_any_batch:

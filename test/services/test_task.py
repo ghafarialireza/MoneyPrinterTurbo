@@ -1937,6 +1937,195 @@ class TestTaskService(unittest.TestCase):
         self.assertEqual(beats[0].search_queries, phrasings)
         self.assertEqual(beats[1].search_queries, phrasings)
 
+    # The requirement three shots of one split span really shared in task
+    # 93b80e04, where all three searched one phrase and bought one clip.
+    DRIP_SPAN_REQUIREMENT = (
+        "A slow water drip carving a canyon through solid rock over time"
+    )
+
+    def _split_span_beats(self, shots=3, group_id=1, policy="long_span_split"):
+        spoken = [
+            "It starts with a single drop of water.",
+            "Over a thousand years that same slow drip carves",
+            "solid rock, and nothing about the stone ever fought back.",
+        ]
+        return [
+            VisualBeat(
+                index=index,
+                semantic_group_id=group_id,
+                shot_index=index,
+                start_time=float(index - 1),
+                end_time=float(index),
+                duration=1.0,
+                spoken_text=spoken[(index - 1) % len(spoken)],
+                visual_requirement=self.DRIP_SPAN_REQUIREMENT,
+                source_semantic_span_index=group_id,
+                source_narration_slot_indexes=[index],
+                start_unit=index - 1,
+                end_unit_exclusive=index,
+                timing_source="edge_tts_boundary",
+                timing_quality="boundary",
+                duration_policy=policy,
+                rapid_cut=False,
+            )
+            for index in range(1, shots + 1)
+        ]
+
+    def test_each_shot_of_a_split_span_gets_its_own_requirement_and_query(self):
+        beats = self._split_span_beats()
+        answers = {
+            1: "A single drop of water falling into stillness",
+            2: "Water tracing a groove down a rock face",
+            3: "A deep canyon cut into bare stone",
+        }
+
+        with patch.object(
+            tm.llm, "generate_shot_visual_requirements", return_value=answers
+        ) as split:
+            refined = tm.refine_split_span_shot_requirements(beats)
+
+        self.assertEqual(refined, 3)
+        self.assertEqual([beat.visual_requirement for beat in beats], list(
+            answers.values()
+        ))
+        # Siblings are answered in one request, because the requirement being
+        # divided is theirs jointly and they have to come back different.
+        sent = split.call_args.args[0]
+        self.assertEqual(len(sent), 1)
+        self.assertEqual(sent[0]["span_requirement"], self.DRIP_SPAN_REQUIREMENT)
+        self.assertEqual(
+            [shot["shot_id"] for shot in sent[0]["shots"]], [1, 2, 3]
+        )
+        self.assertEqual(
+            sent[0]["shots"][0]["spoken_text"],
+            "It starts with a single drop of water.",
+        )
+
+        # The payoff: beat queries deduplicate on group plus requirement, so
+        # before this stage these three shots shared one search and one clip.
+        with patch.object(
+            tm.llm,
+            "generate_visual_slot_queries",
+            return_value={1: ["drop of water"], 2: ["water on rock"], 3: ["canyon"]},
+        ) as generate:
+            flat_queries = tm.generate_visual_beat_search_queries(beats)
+
+        self.assertEqual(len(generate.call_args.kwargs["visual_slots"]), 3)
+        self.assertEqual(flat_queries, ["drop of water", "water on rock", "canyon"])
+
+    def test_a_repeated_sibling_answer_keeps_the_parent_requirement(self):
+        beats = self._split_span_beats()
+        answers = {
+            1: "A single drop of water",
+            2: "a  SINGLE   drop of water",
+            3: "A deep canyon cut into bare stone",
+        }
+
+        with patch.object(
+            tm.llm, "generate_shot_visual_requirements", return_value=answers
+        ):
+            refined = tm.refine_split_span_shot_requirements(beats)
+
+        # Identical siblings are the pathology being removed, so the repeat is
+        # dropped rather than adopted — and the parent is still a distinct
+        # string, so this shot is searched separately anyway.
+        self.assertEqual(refined, 2)
+        self.assertEqual(beats[1].visual_requirement, self.DRIP_SPAN_REQUIREMENT)
+        self.assertEqual(
+            len({beat.visual_requirement for beat in beats}), 3
+        )
+
+    def test_an_over_long_shot_requirement_keeps_the_parent(self):
+        beats = self._split_span_beats()
+        over_long = "z" * (tm._SEMANTIC_VISUAL_REQUIREMENT_MAX_CHARS + 1)
+
+        with patch.object(
+            tm.llm,
+            "generate_shot_visual_requirements",
+            return_value={1: over_long, 2: "Water tracing a groove", 3: ""},
+        ):
+            refined = tm.refine_split_span_shot_requirements(beats)
+
+        # A bloated requirement is carried into the checklist and into every
+        # adjudication prompt of that beat, so it is not adopted.
+        self.assertEqual(refined, 1)
+        self.assertEqual(beats[0].visual_requirement, self.DRIP_SPAN_REQUIREMENT)
+        self.assertEqual(beats[1].visual_requirement, "Water tracing a groove")
+        self.assertEqual(beats[2].visual_requirement, self.DRIP_SPAN_REQUIREMENT)
+
+    def test_a_failed_split_leaves_every_shot_on_its_span_requirement(self):
+        for label, kwargs in (
+            ("unavailable", {"return_value": None}),
+            ("nothing to narrow", {"return_value": {}}),
+            ("raised", {"side_effect": RuntimeError("provider exploded")}),
+        ):
+            with self.subTest(outcome=label):
+                beats = self._split_span_beats()
+                with patch.object(
+                    tm.llm, "generate_shot_visual_requirements", **kwargs
+                ):
+                    refined = tm.refine_split_span_shot_requirements(beats)
+
+                # Failing open costs nothing: the shots behave exactly as they
+                # did before this stage existed.
+                self.assertEqual(refined, 0)
+                self.assertEqual(
+                    [beat.visual_requirement for beat in beats],
+                    [self.DRIP_SPAN_REQUIREMENT] * 3,
+                )
+
+    def test_only_a_split_span_with_more_than_one_shot_is_ever_sent(self):
+        cases = {
+            "one shot": self._split_span_beats(shots=1),
+            "not split": self._split_span_beats(policy="semantic_original"),
+            "no beats": [],
+        }
+        for label, beats in cases.items():
+            with self.subTest(timeline=label):
+                with patch.object(
+                    tm.llm, "generate_shot_visual_requirements"
+                ) as split:
+                    refined = tm.refine_split_span_shot_requirements(beats)
+
+                split.assert_not_called()
+                self.assertEqual(refined, 0)
+
+    def test_two_split_spans_are_divided_without_crossing_each_other(self):
+        beats = self._split_span_beats(shots=2, group_id=1)
+        second = self._split_span_beats(shots=2, group_id=2)
+        for offset, beat in enumerate(second, start=3):
+            beat.index = offset
+            beat.visual_requirement = "Snow gathering on a slope until it releases"
+        beats.extend(second)
+
+        with patch.object(
+            tm.llm,
+            "generate_shot_visual_requirements",
+            return_value={
+                1: "A drop falling",
+                2: "A groove in rock",
+                3: "Snow settling flake by flake",
+                4: "A slope releasing in an avalanche",
+            },
+        ) as split:
+            refined = tm.refine_split_span_shot_requirements(beats)
+
+        self.assertEqual(refined, 4)
+        sent = split.call_args.args[0]
+        self.assertEqual(
+            [[shot["shot_id"] for shot in span["shots"]] for span in sent],
+            [[1, 2], [3, 4]],
+        )
+        # Each span carries its own parent, so a shot can never be narrowed
+        # against a requirement that belongs to a different part of the script.
+        self.assertEqual(
+            [span["span_requirement"] for span in sent],
+            [
+                self.DRIP_SPAN_REQUIREMENT,
+                "Snow gathering on a slope until it releases",
+            ],
+        )
+
     def test_visual_beats_assign_initial_interspan_and_trailing_silence(self):
         script = "Cherries grow. Workers sort beans."
         units = self._timed_units_with_ranges(
@@ -3004,6 +3193,13 @@ class TestTaskService(unittest.TestCase):
             patch.object(tm, "build_visual_slots", return_value=visual_slots),
             patch.object(tm, "generate_semantic_visual_spans", return_value=[]),
             patch.object(tm, "build_visual_beats", return_value=visual_beats),
+            # Same hazard as the checklist gate above: this stage runs on the
+            # real beat timeline, so a fixture with split-span shots would call
+            # the configured provider for real. Tests about the split call the
+            # function directly instead.
+            patch.object(
+                tm, "refine_split_span_shot_requirements", return_value=0
+            ),
             patch.object(
                 tm, "generate_visual_beat_search_queries", **beat_queries
             ),
