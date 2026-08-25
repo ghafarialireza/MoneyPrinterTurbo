@@ -1929,6 +1929,130 @@ class TestGeneralSemanticVerifierLLM(unittest.TestCase):
 
         self.assertEqual(result, {})
 
+    def test_provider_outage_is_reported_separately_from_an_unusable_answer(self):
+        """A quota refusal and a bad answer both return {} but mean different things.
+
+        The caller turns this into a user-facing sentence, and blaming the
+        requirement's wording for the provider's quota is how run e04d3f7e told
+        the user to rewrite a requirement that was never actually judged.
+        """
+        self.addCleanup(llm.reset_visual_requirement_rejection_memo)
+        with (
+            patch.object(
+                llm,
+                "_selected_llm_identity",
+                return_value=("test-provider", "test-model"),
+            ),
+            patch.object(llm, "_load_visual_requirement_spec_cache", return_value=None),
+            patch.object(
+                llm,
+                "_generate_response",
+                return_value="Error: 429 RESOURCE_EXHAUSTED, quota exceeded",
+            ) as unavailable,
+            llm.record_provider_availability() as outage,
+        ):
+            outage_result = llm.generate_visual_requirement_specs(
+                ["Worker installs a new tire"]
+            )
+
+        self.assertEqual(outage_result, {})
+        self.assertTrue(outage.get("provider_unavailable"))
+        self.assertEqual(
+            unavailable.call_count, 1, "a quota refusal must not be retried"
+        )
+
+        with (
+            patch.object(
+                llm,
+                "_selected_llm_identity",
+                return_value=("test-provider", "test-model"),
+            ),
+            patch.object(llm, "_load_visual_requirement_spec_cache", return_value=None),
+            patch.object(llm, "_generate_response", return_value="not json at all"),
+            llm.record_provider_availability() as bad_answer,
+        ):
+            bad_result = llm.generate_visual_requirement_specs(
+                ["Worker replaces a cracked windshield"]
+            )
+
+        self.assertEqual(bad_result, {})
+        self.assertNotIn("provider_unavailable", bad_answer)
+
+    def test_a_recorder_does_not_leak_a_flag_out_of_its_own_block(self):
+        with llm.record_provider_availability() as outer:
+            with (
+                patch.object(
+                    llm,
+                    "_generate_response",
+                    return_value="Error: 503 the model is overloaded",
+                ),
+                llm.record_provider_availability() as inner,
+            ):
+                llm.generate_semantic_visual_span_specs(
+                    "One drop.", [{"text": "One drop.", "index": 0}]
+                )
+            self.assertTrue(inner.get("provider_unavailable"))
+            # An enclosing recorder decides what to tell the user about the whole
+            # recovery, so it must see a failure raised inside a nested block.
+            self.assertTrue(outer.get("provider_unavailable"))
+
+        with llm.record_provider_availability() as after:
+            pass
+        self.assertEqual(after, {})
+
+    def test_a_provider_outage_does_not_blacklist_an_unjudged_requirement(self):
+        """An in-process rejection memo is permanent, so only a real answer may fill it.
+
+        Run e04d3f7e hit a quota error mid-batch; poisoning the memo there would
+        make every later stage in the same process skip requirements that had
+        never been evaluated at all.
+        """
+        self.addCleanup(llm.reset_visual_requirement_rejection_memo)
+        requirement = "Worker installs a new tire"
+        with (
+            patch.object(
+                llm,
+                "_selected_llm_identity",
+                return_value=("test-provider", "test-model"),
+            ),
+            patch.object(llm, "_load_visual_requirement_spec_cache", return_value=None),
+            patch.object(
+                llm,
+                "_generate_response",
+                return_value="Error: 429 RESOURCE_EXHAUSTED, quota exceeded",
+            ),
+        ):
+            llm.generate_visual_requirement_specs([requirement])
+
+        self.assertFalse(
+            llm._visual_requirement_was_rejected(
+                requirement, "test-provider", "test-model"
+            )
+        )
+
+    def test_alternative_wording_reports_a_provider_outage_to_its_caller(self):
+        with (
+            patch.object(
+                llm,
+                "_generate_response",
+                return_value="Error: 429 RESOURCE_EXHAUSTED, quota exceeded",
+            ),
+            llm.record_provider_availability() as outage,
+        ):
+            result = llm.generate_alternative_visual_requirements(
+                [
+                    {
+                        "item_index": 3,
+                        "narration_text": "A seed cracks open in the dark.",
+                        "failed_requirement": "A seed germinating underground",
+                        "problem": "no candidate matched",
+                    }
+                ]
+            )
+
+        self.assertEqual(result, {})
+        self.assertTrue(outage.get("provider_unavailable"))
+
     @classmethod
     def _batch_response_with_override(
         cls, requirements: list[str], index: int, **overrides
@@ -2334,6 +2458,123 @@ class TestGeneralSemanticVerifierLLM(unittest.TestCase):
             spec.critical_visual_facts[0].basis_type,
             "logically_necessary",
         )
+
+    def test_optional_list_field_accepts_null_as_an_empty_list(self):
+        requirement = "Worker installs a new tire"
+        raw = json.loads(self._spec_response(requirement))["specs"][0]
+        raw["ambiguity_notes"] = None
+
+        spec = llm._validate_visual_requirement_spec_item(
+            raw,
+            requirement_id=0,
+            original_requirement=requirement,
+            provider_id="test-provider",
+            model_name="test-model",
+        )
+
+        self.assertEqual(spec.ambiguity_notes, [])
+
+    def test_optional_list_field_still_rejects_a_non_list_and_a_missing_key(self):
+        requirement = "Worker installs a new tire"
+        not_a_list = json.loads(self._spec_response(requirement))["specs"][0]
+        not_a_list["ambiguity_notes"] = "the notes"
+        with self.assertRaisesRegex(ValueError, "bounded string array"):
+            llm._validate_visual_requirement_spec_item(
+                not_a_list,
+                requirement_id=0,
+                original_requirement=requirement,
+                provider_id="test-provider",
+                model_name="test-model",
+            )
+
+        absent = json.loads(self._spec_response(requirement))["specs"][0]
+        del absent["ambiguity_notes"]
+        with self.assertRaisesRegex(ValueError, "fields are invalid"):
+            llm._validate_visual_requirement_spec_item(
+                absent,
+                requirement_id=0,
+                original_requirement=requirement,
+                provider_id="test-provider",
+                model_name="test-model",
+            )
+
+    @staticmethod
+    def _two_action_spec(requirement: str, *, cite_the_action: bool) -> dict:
+        citing_quote = "pushing roots into soil"
+        return {
+            "requirement_id": 0,
+            "original_requirement": requirement,
+            "subjects": ["seed"],
+            "primary_action": "pushing roots into soil",
+            "objects": [],
+            "required_relations": [],
+            "required_context": [],
+            "required_visible_state": [],
+            "optional_attributes": [],
+            "critical_visual_facts": [
+                {
+                    "id": "f1",
+                    "fact": "roots visibly push down into the soil",
+                    "mandatory": True,
+                    "direct_evidence_needed": True,
+                    "evidence_description": "The roots move into the soil.",
+                    "basis_type": "logically_necessary",
+                    "basis_quote": (
+                        citing_quote
+                        if cite_the_action
+                        else "seed germinating underground"
+                    ),
+                },
+                {
+                    "id": "f2",
+                    "fact": "shoots visibly rise above the surface",
+                    "mandatory": True,
+                    "direct_evidence_needed": True,
+                    "evidence_description": "The shoots grow upward.",
+                    "basis_type": "logically_necessary",
+                    "basis_quote": "sprouting shoots upward",
+                },
+            ],
+            "ambiguity_notes": [],
+        }
+
+    def test_a_second_inferred_fact_need_not_recite_the_primary_action(self):
+        requirement = (
+            "A seed germinating underground, pushing roots into soil and "
+            "sprouting shoots upward"
+        )
+
+        spec = llm._validate_visual_requirement_spec_item(
+            self._two_action_spec(requirement, cite_the_action=True),
+            requirement_id=0,
+            original_requirement=requirement,
+            provider_id="test-provider",
+            model_name="test-model",
+        )
+
+        self.assertEqual(len(spec.critical_visual_facts), 2)
+        self.assertEqual(
+            spec.critical_visual_facts[1].basis_quote,
+            "sprouting shoots upward",
+        )
+
+    def test_no_inferred_fact_citing_the_action_is_still_rejected(self):
+        requirement = (
+            "A seed germinating underground, pushing roots into soil and "
+            "sprouting shoots upward"
+        )
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "defining logically necessary evidence fact",
+        ):
+            llm._validate_visual_requirement_spec_item(
+                self._two_action_spec(requirement, cite_the_action=False),
+                requirement_id=0,
+                original_requirement=requirement,
+                provider_id="test-provider",
+                model_name="test-model",
+            )
 
     def test_continuous_visible_state_does_not_require_invented_action(self):
         requirement = "Coffee beans are dark brown inside the roaster"

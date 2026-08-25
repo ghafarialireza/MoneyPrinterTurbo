@@ -4,10 +4,11 @@ import logging
 import re
 import tempfile
 import threading
+from contextlib import contextmanager
 from dataclasses import asdict
 from pathlib import Path
 from time import perf_counter
-from typing import Any, List
+from typing import Any, Iterator, List
 
 from loguru import logger
 from openai import AzureOpenAI, OpenAI
@@ -771,6 +772,46 @@ def _response_diagnostic(response: str) -> str:
     return f"response_length={len(text)}, response_preview={preview!r}"
 
 
+_PROVIDER_AVAILABILITY = threading.local()
+
+
+@contextmanager
+def record_provider_availability() -> Iterator[dict[str, bool]]:
+    """Collect provider-outage flags raised by structured calls inside this block.
+
+    ``None`` is the only failure signal the structured generators return, and it
+    covers two very different causes: an answer we could not use, and no answer at
+    all. A caller that puts the reason in front of a user has to tell those apart,
+    because "reword this" is useless advice when the account is simply out of
+    quota. Run e04d3f7e reported a Gemini 429 as an ungroundable requirement for
+    exactly this reason.
+
+    Scoped to this thread and this block, so nothing leaks between beats. A
+    recorder observes rather than being passed down, which keeps every generator
+    signature — and therefore every test stub of one — untouched.
+    """
+    stack = getattr(_PROVIDER_AVAILABILITY, "stack", None)
+    if stack is None:
+        stack = []
+        _PROVIDER_AVAILABILITY.stack = stack
+    marker: dict[str, bool] = {}
+    stack.append(marker)
+    try:
+        yield marker
+    finally:
+        stack.pop()
+
+
+def _record_provider_unavailable() -> None:
+    """Flag every recorder currently open on this thread, not just the innermost.
+
+    A nested recorder exists to attribute one call; an outer one exists to decide
+    what to tell the user about the whole recovery attempt. Both need to know.
+    """
+    for marker in getattr(_PROVIDER_AVAILABILITY, "stack", None) or ():
+        marker["provider_unavailable"] = True
+
+
 def _generate_structured_response(
     prompt: str,
     *,
@@ -782,7 +823,9 @@ def _generate_structured_response(
 
     Returns the parsed payload, or ``None`` when every attempt failed. Provider
     unavailability is not retried: ``_generate_response`` already exhausts its own
-    transport retries and returns a sanitized ``Error: `` string.
+    transport retries and returns a sanitized ``Error: `` string, and a quota or
+    rate-limit refusal is not cured by asking again immediately. It is reported
+    through ``record_provider_availability`` so a caller can name the real cause.
     """
     for attempt in range(1, max(1, attempts) + 1):
         if app_config is None:
@@ -794,6 +837,7 @@ def _generate_structured_response(
                 f"{purpose} provider is unavailable: "
                 f"{response[:_LOGGED_RESPONSE_PREVIEW_LENGTH]}"
             )
+            _record_provider_unavailable()
             return None
         try:
             return json.loads(_extract_json_payload(response))
@@ -1188,6 +1232,11 @@ be copied into the response.
 5. A multi-word unit is indivisible. Boundaries may occur only between unit IDs.
 6. visual_requirement must be concise, concrete, camera-visible, and must
    preserve the real subject/action without adding facts.
+7. visual_requirement must name ONE continuous camera moment: one subject with at
+   most one visible action or state. Never chain events with "and", "then", or a
+   comma list, even when the span covers several sentences. One stock clip cannot
+   show a sequence, so pick the single moment that best stands for the whole span
+   and still give the span its full unit range.
 
 ## Strict Output
 Return one JSON array only. Every object must contain exactly:
@@ -1700,6 +1749,17 @@ def _bounded_structured_text(value: object, field_name: str) -> str:
 
 
 def _bounded_structured_string_list(value: object, field_name: str) -> list[str]:
+    """Validate an optional list-of-constraints field, treating null as empty.
+
+    Every caller uses this for a field that *narrows* a requirement, so "no
+    entries" and "field omitted" constrain the result identically. Models
+    routinely express the former as ``null`` rather than ``[]``, and rejecting
+    that spelling threw away otherwise-valid specs we had already paid for.
+    The key itself is still mandatory: the caller compares the whole field set
+    before reaching here, so a genuinely missing field is caught there.
+    """
+    if value is None:
+        return []
     if not isinstance(value, list) or len(value) > _MAX_REQUIREMENT_LIST_ITEMS:
         raise ValueError(f"{field_name} must be a bounded string array")
     return [
@@ -1863,13 +1923,10 @@ def _validate_visual_requirement_spec_item(
         )
         if not _contains_word_sequence(original, basis_quote):
             raise ValueError("critical fact basis_quote is not from the requirement")
-        if basis_type == "logically_necessary":
-            if primary_action is None or not _is_grounded_phrase(
-                primary_action, basis_quote
-            ):
-                raise ValueError(
-                    "logically necessary facts must cite the requested action phrase"
-                )
+        if basis_type == "logically_necessary" and primary_action is None:
+            raise ValueError(
+                "logically necessary facts require a requested action to infer from"
+            )
         fact_text = _bounded_structured_text(raw_fact.get("fact"), "critical fact")
         if (
             mandatory
@@ -1900,10 +1957,16 @@ def _validate_visual_requirement_spec_item(
 
     if not any(fact.mandatory for fact in critical_facts):
         raise ValueError("at least one critical visual fact must be mandatory")
+    # The action citation is required once, of the fact that defines the action --
+    # not of every inferred fact. Demanding it per fact was unsatisfiable as soon
+    # as a requirement named more than one action, because a quote covering one
+    # clause cannot contain the words of another, and it also punished a spec for
+    # carrying a second, perfectly sound inference.
     if primary_action is not None and not any(
         fact.mandatory
         and fact.direct_evidence_needed
         and fact.basis_type == "logically_necessary"
+        and _is_grounded_phrase(primary_action, fact.basis_quote)
         for fact in critical_facts
     ):
         raise ValueError(
@@ -2156,7 +2219,9 @@ def generate_visual_requirement_specs(
 
     Returned keys are normalized requirements. Missing keys mean the provider
     response was unavailable or failed strict source-grounding validation; no
-    synthetic fallback spec is invented.
+    synthetic fallback spec is invented. Those two causes need different words in
+    front of a user, so wrap the call in ``record_provider_availability`` to learn
+    which one applied.
     """
     unique_requirements: list[str] = []
     seen: set[str] = set()
@@ -2206,6 +2271,7 @@ def generate_visual_requirement_specs(
             return resolved
 
         failed_batches = 0
+        unavailable_batches = 0
         rejected_items = 0
         for chunk_start in range(0, len(uncached), _VISUAL_REQUIREMENT_BATCH_SIZE):
             chunk = uncached[chunk_start : chunk_start + _VISUAL_REQUIREMENT_BATCH_SIZE]
@@ -2227,8 +2293,9 @@ needed to distinguish the requested scene/action from merely related footage.
    requirement, or logically necessary for the requested action/relation to be true.
 3. Clothing, weather, location, camera angle, colors, and background details are
    optional unless explicitly required by the source wording.
-4. basis_quote must be an exact contiguous quote from visual_requirement. For a
-   logically_necessary fact that quote must cover the requested action. Mandatory
+4. basis_quote must be an exact contiguous quote from visual_requirement. At least
+   one logically_necessary fact must quote a span that covers the requested action.
+   Mandatory
    fact wording and every required field must use only words that appear in
    visual_requirement; a different grammatical form of such a word is fine
    ("carves" -> "carving"), and ordinary function words such as a, the, of, into
@@ -2256,7 +2323,8 @@ required_relations, required_context, required_visible_state, optional_attribute
 critical_visual_facts, ambiguity_notes.
 
 primary_action is a source-grounded string or null. All plural fields are arrays of
-strings. critical_visual_facts is a non-empty array of at most
+strings; use [] for a plural field that has no entries, never null.
+critical_visual_facts is a non-empty array of at most
 {_MAX_CRITICAL_VISUAL_FACTS} objects, with sequential IDs f1, f2, ... and exactly:
 id, fact, mandatory, direct_evidence_needed, evidence_description, basis_type,
 basis_quote. basis_type is explicit or logically_necessary.
@@ -2264,13 +2332,16 @@ basis_quote. basis_type is explicit or logically_necessary.
 Inputs:
 {json.dumps(request_items, ensure_ascii=False)}
 """.strip()
-            parsed = _generate_structured_response(
-                prompt,
-                purpose="visual requirement decomposition",
-                app_config=app_config,
-            )
+            with record_provider_availability() as batch_failure:
+                parsed = _generate_structured_response(
+                    prompt,
+                    purpose="visual requirement decomposition",
+                    app_config=app_config,
+                )
             if parsed is None:
                 failed_batches += 1
+                if batch_failure.get("provider_unavailable"):
+                    unavailable_batches += 1
                 continue
             try:
                 specs, rejections = _validated_requirement_specs(
@@ -2290,7 +2361,7 @@ Inputs:
             if rejections:
                 rejected_items += len(rejections)
                 logger.warning(
-                    "visual requirement decomposition dropped ungrounded items: "
+                    "visual requirement decomposition dropped unusable items: "
                     f"batch_start={chunk_start}, "
                     f"dropped={len(rejections)}/{len(chunk)}, "
                     f"reasons={'; '.join(rejections)}"
@@ -2315,7 +2386,8 @@ Inputs:
             f"unique={len(unique_requirements)}, requested={len(uncached)}, "
             f"generated={len(resolved) - cached_count}, cached={cached_count}, "
             f"skipped_ungrounded={len(known_ungrounded)}, "
-            f"rejected_items={rejected_items}, failed_batches={failed_batches}"
+            f"rejected_items={rejected_items}, failed_batches={failed_batches}, "
+            f"unavailable_batches={unavailable_batches}"
         )
         return resolved
     except Exception as exc:
@@ -2407,7 +2479,9 @@ def generate_alternative_visual_requirements(
     must keep treating that beat as unfilled. Every proposal must carry a
     `narration_basis` quote which is verified here to be a real fragment of that
     beat's spoken text, because an ungrounded rewrite would quietly replace the
-    requested scene with a different one.
+    requested scene with a different one. A missing key does not by itself mean
+    the wording was at fault: wrap the call in ``record_provider_availability`` to
+    learn whether the provider simply never answered.
     """
     requests: list[dict] = []
     for item in items or []:

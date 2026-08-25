@@ -2585,25 +2585,37 @@ def _rewrite_requirement_and_reselect(
     if not narration_text:
         return _unavailable("the item carries no spoken text to re-describe")
 
-    alternatives = llm.generate_alternative_visual_requirements(
-        [
-            {
-                "item_index": visual_item.index,
-                "narration_text": narration_text,
-                "failed_requirement": failed_requirement,
-                "problem": failure_summary,
-            }
-        ]
-    )
+    with llm.record_provider_availability() as rewrite_failure:
+        alternatives = llm.generate_alternative_visual_requirements(
+            [
+                {
+                    "item_index": visual_item.index,
+                    "narration_text": narration_text,
+                    "failed_requirement": failed_requirement,
+                    "problem": failure_summary,
+                }
+            ]
+        )
     alternative = alternatives.get(visual_item.index) or {}
     alternative_requirement = str(alternative.get("visual_requirement") or "").strip()
     if not alternative_requirement:
+        if rewrite_failure.get("provider_unavailable"):
+            return _unavailable(
+                "the LLM provider was unavailable while re-describing it; "
+                "check the provider quota or key"
+            )
         return _unavailable("no grounded alternative wording was returned")
 
-    requirement_spec = llm.generate_visual_requirement_specs(
-        [alternative_requirement]
-    ).get(llm.normalize_visual_requirement(alternative_requirement))
+    with llm.record_provider_availability() as decompose_failure:
+        requirement_spec = llm.generate_visual_requirement_specs(
+            [alternative_requirement]
+        ).get(llm.normalize_visual_requirement(alternative_requirement))
     if requirement_spec is None and settings["fail_closed"]:
+        if decompose_failure.get("provider_unavailable"):
+            return _unavailable(
+                "the LLM provider was unavailable while decomposing it, so the "
+                "wording was never judged; check the provider quota or key"
+            )
         return _unavailable("the alternative wording could not be decomposed either")
 
     item_queries = _alternative_item_search_queries(

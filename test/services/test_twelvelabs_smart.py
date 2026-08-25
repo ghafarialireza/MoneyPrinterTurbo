@@ -3454,6 +3454,7 @@ class TestUnfillableRequirementRewrite(unittest.TestCase):
         self,
         *,
         undecomposable=(),
+        decomposition_outage=(),
         alternative=None,
         alternative_queries=(ALTERNATIVE_QUERY,),
         approved_queries=(),
@@ -3463,11 +3464,16 @@ class TestUnfillableRequirementRewrite(unittest.TestCase):
     ):
         beat = _visual_beat(requirement=self.ORIGINAL, query=self.ORIGINAL_QUERY)
         undecomposable = set(undecomposable)
+        decomposition_outage = set(decomposition_outage)
         asset_id_for = asset_id_for or (lambda term: term.replace(" ", "-"))
         searches: list[str] = []
         analyzed: list[str] = []
 
         def decompose(requirements):
+            if decomposition_outage.intersection(requirements):
+                # What the real generator does when the provider refuses: no spec
+                # and no verdict, only a note that nobody answered.
+                material.llm._record_provider_unavailable()
             return {
                 material.llm.normalize_visual_requirement(requirement): (
                     _requirement_spec(requirement)
@@ -3676,6 +3682,29 @@ class TestUnfillableRequirementRewrite(unittest.TestCase):
             ["DECOMPOSITION_FAILED", "REQUIREMENT_REWRITE_UNAVAILABLE"],
         )
         self.assertIn("could not be decomposed", outcome.runs[-1]["reason"])
+
+    def test_a_provider_outage_is_not_reported_as_a_wording_problem(self):
+        """Run e04d3f7e told the user to reword a requirement Gemini never judged.
+
+        A 429 and an ungroundable requirement both leave the beat without a spec.
+        Only one of them is the requirement's fault, and only one of them is worth
+        the user's time to fix.
+        """
+        outcome = self._run(
+            undecomposable={self.ORIGINAL, self.ALTERNATIVE},
+            decomposition_outage={self.ALTERNATIVE},
+            alternative=self._grounded_alternative(),
+        )
+
+        self.assertIsNotNone(outcome.error)
+        self.assertEqual(outcome.searches, [])
+        self.assertEqual(
+            outcome.decisions,
+            ["DECOMPOSITION_FAILED", "REQUIREMENT_REWRITE_UNAVAILABLE"],
+        )
+        reason = outcome.runs[-1]["reason"]
+        self.assertIn("provider was unavailable", reason)
+        self.assertNotIn("could not be decomposed", reason)
 
     def test_the_rewrite_can_be_switched_off_without_changing_anything_else(self):
         outcome = self._run(
