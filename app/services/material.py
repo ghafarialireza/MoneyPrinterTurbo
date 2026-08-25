@@ -890,6 +890,15 @@ def required_source_duration_for_timeline(
     return target_duration * utils.normalize_clip_speed(clip_speed)
 
 
+# The segmentation service reports its interval rounded to three decimals, so an
+# interval that is exactly long enough can measure up to 0.001 s short here purely
+# from that rounding. Comparing it against a 1e-6 tolerance rejected correct
+# windows roughly half the time, discarding candidates that had already passed the
+# semantic gate. The accepted interval is re-derived from the unrounded requirement
+# below, so this slack never reaches the timeline.
+_SOURCE_RANGE_ROUNDING_SLACK_SECONDS = 2e-3
+
+
 def _normalize_selected_source_range(
     segment: dict[str, Any],
     *,
@@ -906,7 +915,9 @@ def _normalize_selected_source_range(
     if (
         not all(math.isfinite(value) for value in (start_time, end_time, required))
         or required <= 0
-        or end_time - start_time < required - 1e-6
+        or end_time <= start_time
+        or end_time - start_time
+        < required - _SOURCE_RANGE_ROUNDING_SLACK_SECONDS
     ):
         return None
 
@@ -1221,6 +1232,11 @@ def search_videos_coverr(
     """
     aspect = VideoAspect(video_aspect)
     api_key = get_api_key("coverr_api_keys")
+    if not api_key:
+        logger.warning(
+            "skipping coverr search because no coverr_api_keys entry is configured"
+        )
+        return []
     headers = {"Authorization": f"Bearer {api_key}"}
     params = {
         "query": search_term,
@@ -1249,7 +1265,18 @@ def search_videos_coverr(
         video_items: List[MaterialInfo] = []
 
         if not isinstance(response, dict) or "hits" not in response:
-            logger.error("coverr video search returned an unsupported response")
+            # Naming the shape is what makes this actionable. Every coverr call in
+            # task 3f0f2b07 logged the bare "unsupported response" message, which
+            # cannot distinguish a rejected key from a changed API, so the whole
+            # provider stayed broken across runs. Only the status code and the
+            # top-level key names are logged; response values never are, because a
+            # rejected-auth body can echo the credential back.
+            logger.error(
+                "coverr video search returned an unsupported response: "
+                f"status={r.status_code}, "
+                f"type={type(response).__name__}, "
+                f"keys={sorted(response)[:6] if isinstance(response, dict) else 'n/a'}"
+            )
             return video_items
 
         for v in response["hits"]:

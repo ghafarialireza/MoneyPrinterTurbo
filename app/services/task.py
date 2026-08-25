@@ -67,6 +67,10 @@ _ACTIVE_CROSS_POST_STATES = {
 }
 _CROSS_POST_STATE_WRITE_ATTEMPTS = 3
 _SEMANTIC_VISUAL_REQUIREMENT_MAX_CHARS = 240
+# Read-only spoken context sent when a shot has to be described from its own
+# words. Generous enough to hold the sentences a split span was cut from, and
+# capped because it is interpolated into the prompt verbatim.
+_SHOT_RESCUE_NARRATION_CONTEXT_MAX_CHARS = 1200
 _SEMANTIC_SPAN_OUTPUT_FIELDS = {
     "start_unit",
     "end_unit_exclusive",
@@ -1447,6 +1451,97 @@ def _build_visual_beats_from_valid_spans(
     return visual_beats
 
 
+def _rescue_unrefined_shot_requirements(
+    groups: dict[int, list[VisualBeat]],
+    parents: dict[int, str],
+) -> int:
+    """Describe a shot from its own words when the parent could not be divided.
+
+    A shot that keeps its span's requirement is the pathology this whole stage
+    exists to remove, not a neutral outcome: the parent names several moments at
+    once, so the checklist makes every one of them mandatory and no single clip
+    can satisfy all of them. In task 3f0f2b07 two of eleven shots stayed on the
+    parent, one of them failed outright, and its rewrite came back as "A
+    motionless stone" -- the parent's entire causal action dropped.
+
+    This asks a different and much easier question than the split did: not which
+    part of the parent belongs to this shot, but what a camera would see while
+    this line is spoken. It does not raise the run's LLM bill, because the beats
+    it repairs are exactly the ones that would otherwise reach the rewrite rung
+    and pay for a call there anyway -- except this one happens before any stock
+    search or clip analysis is paid for. Failure stays free: the shot keeps the
+    parent and behaves as it did before this stage existed.
+    """
+    leftovers: list[VisualBeat] = []
+    context_parts: list[str] = []
+    for group_id, group in groups.items():
+        unrefined = [
+            beat for beat in group if beat.visual_requirement == parents[group_id]
+        ]
+        if not unrefined:
+            continue
+        leftovers.extend(unrefined)
+        # Read-only context, so a dependent fragment such as "solid rock, and
+        # nothing about the stone" can be resolved against the sentence it was
+        # cut from. Only spans that still need help contribute, and the join is
+        # capped because it is sent verbatim in the prompt.
+        context_parts.extend(
+            " ".join(str(beat.spoken_text or "").split()) for beat in group
+        )
+    if not leftovers:
+        return 0
+
+    context = " ".join(part for part in context_parts if part)[
+        :_SHOT_RESCUE_NARRATION_CONTEXT_MAX_CHARS
+    ]
+    try:
+        answers = llm.generate_narration_visual_requirements(
+            context,
+            [
+                {"index": beat.index, "spoken_text": beat.spoken_text}
+                for beat in leftovers
+            ],
+        )
+    except Exception as exc:
+        logger.warning(
+            "shot requirement rescue failed: "
+            f"error={type(exc).__name__}, shots={len(leftovers)}"
+        )
+        return 0
+    if not answers:
+        logger.warning(
+            "shot requirement rescue returned nothing usable; those shots keep "
+            f"their span requirement: shots={len(leftovers)}"
+        )
+        return 0
+
+    rescued = 0
+    for group_id, group in groups.items():
+        taken = {beat.visual_requirement.casefold() for beat in group}
+        for beat in group:
+            if beat.visual_requirement != parents[group_id]:
+                continue
+            requirement = " ".join(str(answers.get(beat.index) or "").split())
+            if not requirement:
+                continue
+            if len(requirement) > _SEMANTIC_VISUAL_REQUIREMENT_MAX_CHARS:
+                continue
+            key = requirement.casefold()
+            if key in taken:
+                # Either the parent again or a sibling's text. Adopting it would
+                # undo the de-duplication this stage exists to create, and the
+                # parent is at least still a distinct string.
+                continue
+            taken.add(key)
+            beat.visual_requirement = requirement
+            rescued += 1
+    logger.info(
+        f"shot requirement rescue completed: shots={len(leftovers)}, "
+        f"rescued={rescued}"
+    )
+    return rescued
+
+
 def refine_split_span_shot_requirements(visual_beats: list[VisualBeat]) -> int:
     """Give each shot of a split span a requirement of its own.
 
@@ -1460,13 +1555,16 @@ def refine_split_span_shot_requirements(visual_beats: list[VisualBeat]) -> int:
     exhausts its candidates and drops into the failure ladder.
 
     One batched provider-neutral call splits the parent across its shots, using
-    each shot's own spoken text to decide which part is that shot's. Failure is
-    free: a shot with no usable answer keeps the parent requirement and behaves
-    exactly as it did before this stage existed.
+    each shot's own spoken text to decide which part is that shot's. Any shot
+    the split could not narrow is then described from its own spoken line
+    instead, because keeping the parent is the pathology above and not a safe
+    default. Failure of both is free: the shot keeps the parent requirement and
+    behaves exactly as it did before this stage existed.
 
-    Returns the number of beats whose requirement was replaced, and mutates
-    those beats in place so both the search queries and the checklist -- built
-    afterwards -- read the refined text without knowing about this stage.
+    Returns the number of beats whose requirement was replaced by either route,
+    and mutates those beats in place so both the search queries and the
+    checklist -- built afterwards -- read the refined text without knowing about
+    this stage.
     """
     groups: dict[int, list[VisualBeat]] = {}
     for beat in visual_beats:
@@ -1488,6 +1586,12 @@ def refine_split_span_shot_requirements(visual_beats: list[VisualBeat]) -> int:
     if not requestable:
         return 0
 
+    # Captured before anything is mutated, so a shot that still holds this text
+    # afterwards is exactly a shot the split could not narrow.
+    parents = {
+        group_id: group[0].visual_requirement
+        for group_id, group in requestable.items()
+    }
     try:
         answers = llm.generate_shot_visual_requirements(
             [
@@ -1510,12 +1614,24 @@ def refine_split_span_shot_requirements(visual_beats: list[VisualBeat]) -> int:
             f"error={type(exc).__name__}, spans={len(requestable)}"
         )
         return 0
-    if not answers:
+    if answers is None:
+        # The documented "this stage is unavailable" signal: no batch produced a
+        # parseable payload. Asking a second question of the same provider in
+        # that state would only pay for another unparseable answer, so the shots
+        # keep their span requirement exactly as they did before.
         logger.warning(
-            "shot visual requirement split returned nothing usable; every shot "
+            "shot visual requirement split is unavailable; every shot "
             f"of a split span keeps its span requirement: spans={len(requestable)}"
         )
         return 0
+    if not answers:
+        # Answered, but narrowed nothing. That is a statement about the parent
+        # being hard to divide, not about the provider, so the rescue below still
+        # has a real chance and every shot is a leftover.
+        logger.warning(
+            "shot visual requirement split narrowed no shot: "
+            f"spans={len(requestable)}"
+        )
 
     refined = 0
     over_long = 0
@@ -1557,13 +1673,15 @@ def refine_split_span_shot_requirements(visual_beats: list[VisualBeat]) -> int:
             "shot visual requirements repeated a sibling answer and were "
             f"discarded: count={duplicated}"
         )
+
+    rescued = _rescue_unrefined_shot_requirements(requestable, parents)
     logger.info(
         "split span shot requirements refined: "
         f"spans={len(requestable)}, "
         f"shots={sum(len(group) for group in requestable.values())}, "
-        f"refined_shots={refined}"
+        f"refined_shots={refined}, rescued_shots={rescued}"
     )
-    return refined
+    return refined + rescued
 
 
 def _validate_complete_visual_beat_timeline(

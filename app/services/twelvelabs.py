@@ -1688,6 +1688,20 @@ def _parse_temporal_segments(
 
     matched, match_quality, _, start_time, end_time, metadata = max(valid_segments)
     if not matched or match_quality < _clip_qa_min_score():
+        # This is a second, independent semantic gate: the candidate already
+        # passed adjudication, and is being dropped because the segmentation call
+        # could not find one interval where the action and subject are both on
+        # screen. Without this line the caller only ever reports "no valid
+        # temporal segment matched", which is indistinguishable from a service
+        # failure and cost a whole render to diagnose once already.
+        logger.debug(
+            "temporal segmentation rejected an adjudicated candidate: "
+            f"action_visible={metadata.get('action_visible') is True}, "
+            f"subject_visible={metadata.get('subject_visible') is True}, "
+            f"match_quality={match_quality:.4f}, "
+            f"min_score={_clip_qa_min_score():.4f}, "
+            f"segments_considered={len(valid_segments)}"
+        )
         return None
     source_duration = max(0.0, float(source_duration))
     start_time = min(source_duration, max(0.0, start_time))

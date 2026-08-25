@@ -48,6 +48,11 @@ _VISUAL_REQUIREMENT_CACHE_FORMAT_VERSION = 2
 _VISUAL_REQUIREMENT_CACHE_LOCKS = tuple(threading.Lock() for _ in range(64))
 _SEMANTIC_ADJUDICATION_CACHE_FORMAT_VERSION = 1
 _SEMANTIC_ADJUDICATION_CACHE_LOCKS = tuple(threading.Lock() for _ in range(64))
+# Requirements this process already failed to ground, so the material stage does
+# not re-pay for what the script stage already established. In memory only; see
+# _remember_visual_requirement_rejection for why it is never persisted.
+_VISUAL_REQUIREMENT_REJECTIONS: set[tuple[str, str, str]] = set()
+_VISUAL_REQUIREMENT_REJECTION_LOCK = threading.Lock()
 _MAX_REQUIREMENT_TEXT_LENGTH = 500
 _MAX_REQUIREMENT_LIST_ITEMS = 12
 _MAX_CRITICAL_VISUAL_FACTS = 8
@@ -87,6 +92,50 @@ _CRITICAL_FACT_BOILERPLATE_WORDS = {
     "shown",
     "the",
     "visible",
+}
+# Words a grounded phrase may use even though the source requirement does not
+# contain them. Every entry is a function word or a copula, never a content word:
+# the guard still refuses to let a model introduce a new subject, object, action
+# or setting. Requiring these to be present in the source made it impossible to
+# phrase a fact as a grammatical English sentence, which is what rejected 100% of
+# real answers in task 3f0f2b07.
+_GROUNDING_FUNCTION_WORDS = _CRITICAL_FACT_BOILERPLATE_WORDS | {
+    "against",
+    "and",
+    "as",
+    "at",
+    "being",
+    "by",
+    "for",
+    "from",
+    "in",
+    "inside",
+    "into",
+    "it",
+    "its",
+    "of",
+    "off",
+    "on",
+    "onto",
+    "or",
+    "out",
+    "over",
+    "same",
+    "that",
+    "their",
+    "then",
+    "there",
+    "this",
+    "through",
+    "to",
+    "under",
+    "up",
+    "upon",
+    "was",
+    "were",
+    "while",
+    "with",
+    "within",
 }
 
 DEFAULT_SCRIPT_SYSTEM_PROMPT = """
@@ -1576,6 +1625,59 @@ def _semantic_words(value: str) -> str:
     )
 
 
+def _grounding_stem(word: str) -> str:
+    """Crudely strip common English inflections for grounding comparisons.
+
+    Deliberately shallow: this only has to make "carves", "carving" and "carved"
+    compare equal so a model is not punished for choosing a different form of a
+    word the requirement already contains. Short words are left alone, which is
+    what keeps "seed" from collapsing to "se".
+    """
+    stem = word
+    for suffix in ("ing", "ed", "es", "s"):
+        if len(stem) > len(suffix) + 2 and stem.endswith(suffix):
+            stem = stem[: -len(suffix)]
+            break
+    if len(stem) > 3 and stem[-1] == stem[-2] and stem[-1] not in "aeiou":
+        stem = stem[:-1]
+    if len(stem) > 3 and stem.endswith("e"):
+        stem = stem[:-1]
+    return stem
+
+
+def _is_grounded_phrase(phrase: str, source: str) -> bool:
+    """True when every content word of ``phrase`` also occurs in ``source``.
+
+    Compared as whole stems rather than as a raw substring. The substring test
+    this replaces was wrong in both directions: it rejected every morphological
+    variant a model naturally produces, and it accepted an unrelated fragment
+    whenever a short word happened to sit inside a longer one ("car" matched
+    "carves"). Function words are always allowed, because requiring them to be
+    present made grammatical phrasing impossible.
+    """
+    phrase_words = _semantic_words(phrase).split()
+    if not phrase_words:
+        return False
+    source_stems = {_grounding_stem(word) for word in _semantic_words(source).split()}
+    return all(
+        word in _GROUNDING_FUNCTION_WORDS or _grounding_stem(word) in source_stems
+        for word in phrase_words
+    )
+
+
+def _contains_word_sequence(haystack: str, needle: str) -> bool:
+    """True when ``needle`` is a contiguous whole-word run inside ``haystack``.
+
+    Padding both sides is what makes this a word comparison instead of a
+    character one, so a short quote cannot match inside a longer word.
+    """
+    haystack_words = _semantic_words(haystack)
+    needle_words = _semantic_words(needle)
+    if not needle_words or not haystack_words:
+        return False
+    return f" {needle_words} " in f" {haystack_words} "
+
+
 def _selected_llm_identity(app_config=None) -> tuple[str, str]:
     runtime_app_config = app_config if app_config is not None else config.app
     provider_id = str(
@@ -1727,8 +1829,7 @@ def _validate_visual_requirement_spec_item(
         primary_action = _bounded_structured_text(
             primary_action_value, "primary_action"
         )
-        action_words = _semantic_words(primary_action)
-        if not action_words or action_words not in _semantic_words(original):
+        if not _is_grounded_phrase(primary_action, original):
             raise ValueError("primary_action is not grounded in the source requirement")
 
     raw_facts = item.get("critical_visual_facts")
@@ -1741,8 +1842,6 @@ def _validate_visual_requirement_spec_item(
 
     critical_facts: list[CriticalVisualFact] = []
     fact_ids: set[str] = set()
-    source_words = _semantic_words(original)
-    source_word_set = set(source_words.split())
     for fact_index, raw_fact in enumerate(raw_facts, start=1):
         if not isinstance(raw_fact, dict) or set(raw_fact) != _CRITICAL_VISUAL_FACT_FIELDS:
             raise ValueError("critical visual fact fields are invalid")
@@ -1762,19 +1861,21 @@ def _validate_visual_requirement_spec_item(
         basis_quote = _bounded_structured_text(
             raw_fact.get("basis_quote"), "critical fact basis_quote"
         )
-        quote_words = _semantic_words(basis_quote)
-        if not quote_words or quote_words not in source_words:
+        if not _contains_word_sequence(original, basis_quote):
             raise ValueError("critical fact basis_quote is not from the requirement")
         if basis_type == "logically_necessary":
-            if primary_action is None or _semantic_words(primary_action) not in quote_words:
+            if primary_action is None or not _is_grounded_phrase(
+                primary_action, basis_quote
+            ):
                 raise ValueError(
                     "logically necessary facts must cite the requested action phrase"
                 )
         fact_text = _bounded_structured_text(raw_fact.get("fact"), "critical fact")
-        unsupported_fact_words = set(_semantic_words(fact_text).split()) - (
-            source_word_set | _CRITICAL_FACT_BOILERPLATE_WORDS
-        )
-        if mandatory and basis_type == "explicit" and unsupported_fact_words:
+        if (
+            mandatory
+            and basis_type == "explicit"
+            and not _is_grounded_phrase(fact_text, original)
+        ):
             raise ValueError(
                 "mandatory critical facts must use only source-grounded wording"
             )
@@ -1828,7 +1929,7 @@ def _validate_visual_requirement_spec_item(
         ("required_visible_state", required_visible_state),
     ):
         for value in values:
-            if not set(_semantic_words(value).split()).issubset(source_word_set):
+            if not _is_grounded_phrase(value, original):
                 raise ValueError(f"{field_name} contains unsupported source details")
 
     return VisualRequirementSpec(
@@ -1937,16 +2038,74 @@ def _save_visual_requirement_spec_cache(spec: VisualRequirementSpec) -> None:
                 pass
 
 
+def _visual_requirement_rejection_key(
+    requirement: str,
+    provider_id: str,
+    model_name: str,
+) -> tuple[str, str, str]:
+    return (normalize_visual_requirement(requirement), provider_id, model_name)
+
+
+def _remember_visual_requirement_rejection(
+    requirement: str,
+    provider_id: str,
+    model_name: str,
+) -> None:
+    """Record that this requirement failed grounding, for this process only.
+
+    Deliberately in-process and never written to disk. A run asks for the same
+    requirements twice — once at the script stage and again at the material stage
+    — and task 3f0f2b07 paid the full decomposition bill both times because a
+    failed spec is never cached. Suppressing the second ask halves that waste.
+
+    It stays in memory because a model's answer is not deterministic: a
+    requirement that failed once may well succeed on a later run, and a
+    persistent tombstone would silently blacklist it forever. Only per-item
+    grounding rejections are recorded. A batch that failed structurally, or a
+    provider that was simply unavailable, is not remembered, because those say
+    nothing about the requirement itself.
+    """
+    with _VISUAL_REQUIREMENT_REJECTION_LOCK:
+        _VISUAL_REQUIREMENT_REJECTIONS.add(
+            _visual_requirement_rejection_key(requirement, provider_id, model_name)
+        )
+
+
+def _visual_requirement_was_rejected(
+    requirement: str,
+    provider_id: str,
+    model_name: str,
+) -> bool:
+    with _VISUAL_REQUIREMENT_REJECTION_LOCK:
+        return (
+            _visual_requirement_rejection_key(requirement, provider_id, model_name)
+            in _VISUAL_REQUIREMENT_REJECTIONS
+        )
+
+
+def reset_visual_requirement_rejection_memo() -> None:
+    """Forget every in-process grounding rejection. For tests and re-runs."""
+    with _VISUAL_REQUIREMENT_REJECTION_LOCK:
+        _VISUAL_REQUIREMENT_REJECTIONS.clear()
+
+
 def _validated_requirement_specs(
     parsed: Any,
     *,
     chunk: list[str],
     provider_id: str,
     model_name: str,
-) -> list[VisualRequirementSpec]:
-    """Validate one decomposition batch and return specs ordered like ``chunk``.
+) -> tuple[dict[int, VisualRequirementSpec], list[str]]:
+    """Validate one decomposition batch, salvaging every item that is usable.
 
-    Raises on any structural problem so the caller can drop this batch alone.
+    Raises only on a structural problem — a malformed root, the wrong number of
+    specs, or duplicate/unknown ids — because those mean the whole response is
+    untrustworthy and the caller should drop this batch alone. A single item that
+    fails source grounding is dropped by itself and reported in the returned
+    rejection list, so its siblings still reach the checklist. Failing the whole
+    batch on one over-eager sentence is how task 3f0f2b07 ended up with no
+    checklist at all for any beat.
+
     Requirement ids are batch-local, which is what keeps a malformed batch from
     invalidating the batches that parsed cleanly.
     """
@@ -1967,16 +2126,21 @@ def _validated_requirement_specs(
         by_id[raw_id] = raw_spec
     if set(by_id) != set(range(len(chunk))):
         raise ValueError("visual requirement decomposition is incomplete")
-    return [
-        _validate_visual_requirement_spec_item(
-            by_id[requirement_id],
-            requirement_id=requirement_id,
-            original_requirement=requirement,
-            provider_id=provider_id,
-            model_name=model_name,
-        )
-        for requirement_id, requirement in enumerate(chunk)
-    ]
+
+    specs: dict[int, VisualRequirementSpec] = {}
+    rejections: list[str] = []
+    for requirement_id, requirement in enumerate(chunk):
+        try:
+            specs[requirement_id] = _validate_visual_requirement_spec_item(
+                by_id[requirement_id],
+                requirement_id=requirement_id,
+                original_requirement=requirement,
+                provider_id=provider_id,
+                model_name=model_name,
+            )
+        except ValueError as exc:
+            rejections.append(f"id={requirement_id}: {exc}")
+    return specs, rejections
 
 
 def generate_visual_requirement_specs(
@@ -2013,6 +2177,7 @@ def generate_visual_requirement_specs(
     provider_id, model_name = _selected_llm_identity(app_config)
     resolved: dict[str, VisualRequirementSpec] = {}
     uncached: list[str] = []
+    known_ungrounded: list[str] = []
     try:
         for requirement in unique_requirements:
             normalized = normalize_visual_requirement(requirement)
@@ -2023,15 +2188,25 @@ def generate_visual_requirement_specs(
                 cached = _load_visual_requirement_spec_cache(
                     requirement, provider_id, model_name
                 )
-            if cached is None:
-                uncached.append(requirement)
-            else:
+            if cached is not None:
                 resolved[normalized] = cached
+            elif _visual_requirement_was_rejected(
+                requirement, provider_id, model_name
+            ):
+                known_ungrounded.append(requirement)
+            else:
+                uncached.append(requirement)
 
+        if known_ungrounded:
+            logger.warning(
+                "skipping visual requirements this process already failed to "
+                f"ground: count={len(known_ungrounded)}"
+            )
         if not uncached:
             return resolved
 
         failed_batches = 0
+        rejected_items = 0
         for chunk_start in range(0, len(uncached), _VISUAL_REQUIREMENT_BATCH_SIZE):
             chunk = uncached[chunk_start : chunk_start + _VISUAL_REQUIREMENT_BATCH_SIZE]
             request_items = [
@@ -2052,10 +2227,13 @@ needed to distinguish the requested scene/action from merely related footage.
    requirement, or logically necessary for the requested action/relation to be true.
 3. Clothing, weather, location, camera angle, colors, and background details are
    optional unless explicitly required by the source wording.
-4. basis_quote must be an exact quote from visual_requirement. For a
-   logically_necessary fact it must include the exact requested action phrase.
-   Mandatory fact wording and every required field must use only words grounded in
-   visual_requirement. Put any merely plausible additions in optional_attributes.
+4. basis_quote must be an exact contiguous quote from visual_requirement. For a
+   logically_necessary fact that quote must cover the requested action. Mandatory
+   fact wording and every required field must use only words that appear in
+   visual_requirement; a different grammatical form of such a word is fine
+   ("carves" -> "carving"), and ordinary function words such as a, the, of, into
+   and through are always allowed. Put any merely plausible additions in
+   optional_attributes.
 5. Keep optional details in optional_attributes; they can never become hard gates.
 6. Set direct_evidence_needed=true only when the defining action/relation/event
    itself must be visible. Related subjects or objects alone are not evidence.
@@ -2095,7 +2273,7 @@ Inputs:
                 failed_batches += 1
                 continue
             try:
-                specs = _validated_requirement_specs(
+                specs, rejections = _validated_requirement_specs(
                     parsed,
                     chunk=chunk,
                     provider_id=provider_id,
@@ -2109,20 +2287,35 @@ Inputs:
                     f"error={type(exc).__name__}: {exc}"
                 )
                 continue
-            for requirement, spec in zip(chunk, specs):
-                normalized = normalize_visual_requirement(requirement)
+            if rejections:
+                rejected_items += len(rejections)
+                logger.warning(
+                    "visual requirement decomposition dropped ungrounded items: "
+                    f"batch_start={chunk_start}, "
+                    f"dropped={len(rejections)}/{len(chunk)}, "
+                    f"reasons={'; '.join(rejections)}"
+                )
+                for requirement_id in range(len(chunk)):
+                    if requirement_id in specs:
+                        continue
+                    _remember_visual_requirement_rejection(
+                        chunk[requirement_id], provider_id, model_name
+                    )
+            for requirement_id, spec in specs.items():
+                normalized = normalize_visual_requirement(chunk[requirement_id])
                 resolved[normalized] = spec
                 with _visual_requirement_spec_cache_lock(
                     normalized, provider_id, model_name
                 ):
                     _save_visual_requirement_spec_cache(spec)
 
-        cached_count = len(unique_requirements) - len(uncached)
+        cached_count = len(unique_requirements) - len(uncached) - len(known_ungrounded)
         logger.info(
             "visual requirement decomposition completed: "
             f"unique={len(unique_requirements)}, requested={len(uncached)}, "
             f"generated={len(resolved) - cached_count}, cached={cached_count}, "
-            f"failed_batches={failed_batches}"
+            f"skipped_ungrounded={len(known_ungrounded)}, "
+            f"rejected_items={rejected_items}, failed_batches={failed_batches}"
         )
         return resolved
     except Exception as exc:
@@ -2277,6 +2470,10 @@ be easier to film and easier to find, without changing what the line says.
    that the alternative still describes this line.
 7. visual_requirement must be one short concrete English phrase, because it is used
    for stock search and footage comparison. No timestamps and no lists.
+8. If the spoken line describes a change, a process, or something happening over
+   time, the alternative must still show that happening. A still object with no
+   visible action is never an acceptable substitute for a line about change:
+   simplify which moment of the change is shown, never remove the change itself.
 
 ## Strict JSON output
 Return one object with exactly one key, alternatives. alternatives must contain at

@@ -1971,6 +1971,23 @@ class TestTaskService(unittest.TestCase):
             for index in range(1, shots + 1)
         ]
 
+    def _refine(self, beats, *, split, rescue=None):
+        """Run the stage with both of its provider calls under control.
+
+        The rescue call is patched even in the cases that must never reach it,
+        because an unpatched call here would bill the live provider from the
+        test suite.
+        """
+        with patch.object(
+            tm.llm, "generate_shot_visual_requirements", **split
+        ) as split_call, patch.object(
+            tm.llm,
+            "generate_narration_visual_requirements",
+            **({"return_value": {}} if rescue is None else rescue),
+        ) as rescue_call:
+            refined = tm.refine_split_span_shot_requirements(beats)
+        return refined, split_call, rescue_call
+
     def test_each_shot_of_a_split_span_gets_its_own_requirement_and_query(self):
         beats = self._split_span_beats()
         answers = {
@@ -1979,12 +1996,11 @@ class TestTaskService(unittest.TestCase):
             3: "A deep canyon cut into bare stone",
         }
 
-        with patch.object(
-            tm.llm, "generate_shot_visual_requirements", return_value=answers
-        ) as split:
-            refined = tm.refine_split_span_shot_requirements(beats)
+        refined, split, rescue = self._refine(beats, split={"return_value": answers})
 
         self.assertEqual(refined, 3)
+        # No shot was left on the parent, so the rescue must not be paid for.
+        rescue.assert_not_called()
         self.assertEqual([beat.visual_requirement for beat in beats], list(
             answers.values()
         ))
@@ -2021,10 +2037,7 @@ class TestTaskService(unittest.TestCase):
             3: "A deep canyon cut into bare stone",
         }
 
-        with patch.object(
-            tm.llm, "generate_shot_visual_requirements", return_value=answers
-        ):
-            refined = tm.refine_split_span_shot_requirements(beats)
+        refined, _, rescue = self._refine(beats, split={"return_value": answers})
 
         # Identical siblings are the pathology being removed, so the repeat is
         # dropped rather than adopted — and the parent is still a distinct
@@ -2034,17 +2047,18 @@ class TestTaskService(unittest.TestCase):
         self.assertEqual(
             len({beat.visual_requirement for beat in beats}), 3
         )
+        # Still on the parent still means unfillable, so that one shot — and
+        # only that one — is offered to the rescue.
+        self.assertEqual([line["index"] for line in rescue.call_args.args[1]], [2])
 
     def test_an_over_long_shot_requirement_keeps_the_parent(self):
         beats = self._split_span_beats()
         over_long = "z" * (tm._SEMANTIC_VISUAL_REQUIREMENT_MAX_CHARS + 1)
 
-        with patch.object(
-            tm.llm,
-            "generate_shot_visual_requirements",
-            return_value={1: over_long, 2: "Water tracing a groove", 3: ""},
-        ):
-            refined = tm.refine_split_span_shot_requirements(beats)
+        refined, _, rescue = self._refine(
+            beats,
+            split={"return_value": {1: over_long, 2: "Water tracing a groove", 3: ""}},
+        )
 
         # A bloated requirement is carried into the checklist and into every
         # adjudication prompt of that beat, so it is not adopted.
@@ -2052,19 +2066,24 @@ class TestTaskService(unittest.TestCase):
         self.assertEqual(beats[0].visual_requirement, self.DRIP_SPAN_REQUIREMENT)
         self.assertEqual(beats[1].visual_requirement, "Water tracing a groove")
         self.assertEqual(beats[2].visual_requirement, self.DRIP_SPAN_REQUIREMENT)
+        # The discarded answer and the deliberately empty one are both still
+        # unfillable shots, so both are offered to the rescue.
+        self.assertEqual([line["index"] for line in rescue.call_args.args[1]], [1, 3])
 
     def test_a_failed_split_leaves_every_shot_on_its_span_requirement(self):
-        for label, kwargs in (
-            ("unavailable", {"return_value": None}),
-            ("nothing to narrow", {"return_value": {}}),
-            ("raised", {"side_effect": RuntimeError("provider exploded")}),
+        # An unavailable provider is not asked a second question, because that
+        # signal means no batch parsed at all. A provider that answered and
+        # narrowed nothing is asked, because that says the parent was hard to
+        # divide, not that the provider is unusable.
+        for label, kwargs, offered in (
+            ("unavailable", {"return_value": None}, []),
+            ("nothing to narrow", {"return_value": {}}, [1, 2, 3]),
+            ("raised", {"side_effect": RuntimeError("provider exploded")}, []),
         ):
             with self.subTest(outcome=label):
                 beats = self._split_span_beats()
-                with patch.object(
-                    tm.llm, "generate_shot_visual_requirements", **kwargs
-                ):
-                    refined = tm.refine_split_span_shot_requirements(beats)
+
+                refined, _, rescue = self._refine(beats, split=kwargs)
 
                 # Failing open costs nothing: the shots behave exactly as they
                 # did before this stage existed.
@@ -2073,6 +2092,76 @@ class TestTaskService(unittest.TestCase):
                     [beat.visual_requirement for beat in beats],
                     [self.DRIP_SPAN_REQUIREMENT] * 3,
                 )
+                self.assertEqual(
+                    [
+                        line["index"]
+                        for call in rescue.call_args_list
+                        for line in call.args[1]
+                    ],
+                    offered,
+                )
+
+    def test_a_shot_the_split_could_not_narrow_is_described_from_its_own_line(self):
+        beats = self._split_span_beats()
+
+        refined, _, rescue = self._refine(
+            beats,
+            split={"return_value": {2: "Water tracing a groove down a rock face"}},
+            rescue={
+                "return_value": {
+                    1: "A single drop of water falling",
+                    3: "A canyon cut into bare stone",
+                }
+            },
+        )
+
+        # Inheriting a multi-event parent is what made beats 4 and 10 of task
+        # 3f0f2b07 unfillable and sent one of them into a rewrite that dropped
+        # the action entirely, so a skipped shot is described from its own
+        # spoken line rather than left on the parent.
+        self.assertEqual(refined, 3)
+        self.assertEqual(
+            [beat.visual_requirement for beat in beats],
+            [
+                "A single drop of water falling",
+                "Water tracing a groove down a rock face",
+                "A canyon cut into bare stone",
+            ],
+        )
+        context, lines = rescue.call_args.args
+        self.assertEqual([line["index"] for line in lines], [1, 3])
+        # The whole span's words are the read-only context, because a shot's own
+        # line is often a fragment that cannot be resolved on its own.
+        self.assertIn("It starts with a single drop of water.", context)
+        self.assertIn("nothing about the stone ever fought back", context)
+
+    def test_a_rescued_requirement_is_held_to_the_same_rules_as_a_split_one(self):
+        sibling = "Water tracing a groove down a rock face"
+        cases = {
+            "the parent verbatim": self.DRIP_SPAN_REQUIREMENT,
+            "a sibling's refined text": sibling,
+            "over the span character limit": "z"
+            * (tm._SEMANTIC_VISUAL_REQUIREMENT_MAX_CHARS + 1),
+            "an empty answer": "",
+        }
+        for label, answer in cases.items():
+            with self.subTest(rescue=label):
+                beats = self._split_span_beats(shots=2)
+
+                refined, _, _ = self._refine(
+                    beats,
+                    split={"return_value": {2: sibling}},
+                    rescue={"return_value": {1: answer}},
+                )
+
+                # A rescue that would collapse two shots back into one search,
+                # or bloat every adjudication prompt of this beat, is no better
+                # than the parent it would replace.
+                self.assertEqual(refined, 1)
+                self.assertEqual(
+                    beats[0].visual_requirement, self.DRIP_SPAN_REQUIREMENT
+                )
+                self.assertEqual(beats[1].visual_requirement, sibling)
 
     def test_only_a_split_span_with_more_than_one_shot_is_ever_sent(self):
         cases = {
@@ -2082,12 +2171,10 @@ class TestTaskService(unittest.TestCase):
         }
         for label, beats in cases.items():
             with self.subTest(timeline=label):
-                with patch.object(
-                    tm.llm, "generate_shot_visual_requirements"
-                ) as split:
-                    refined = tm.refine_split_span_shot_requirements(beats)
+                refined, split, rescue = self._refine(beats, split={})
 
                 split.assert_not_called()
+                rescue.assert_not_called()
                 self.assertEqual(refined, 0)
 
     def test_two_split_spans_are_divided_without_crossing_each_other(self):
@@ -2098,19 +2185,20 @@ class TestTaskService(unittest.TestCase):
             beat.visual_requirement = "Snow gathering on a slope until it releases"
         beats.extend(second)
 
-        with patch.object(
-            tm.llm,
-            "generate_shot_visual_requirements",
-            return_value={
-                1: "A drop falling",
-                2: "A groove in rock",
-                3: "Snow settling flake by flake",
-                4: "A slope releasing in an avalanche",
+        refined, split, rescue = self._refine(
+            beats,
+            split={
+                "return_value": {
+                    1: "A drop falling",
+                    2: "A groove in rock",
+                    3: "Snow settling flake by flake",
+                    4: "A slope releasing in an avalanche",
+                }
             },
-        ) as split:
-            refined = tm.refine_split_span_shot_requirements(beats)
+        )
 
         self.assertEqual(refined, 4)
+        rescue.assert_not_called()
         sent = split.call_args.args[0]
         self.assertEqual(
             [[shot["shot_id"] for shot in span["shots"]] for span in sent],

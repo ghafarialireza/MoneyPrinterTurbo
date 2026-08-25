@@ -1930,6 +1930,133 @@ class TestGeneralSemanticVerifierLLM(unittest.TestCase):
         self.assertEqual(result, {})
 
     @classmethod
+    def _batch_response_with_override(
+        cls, requirements: list[str], index: int, **overrides
+    ) -> str:
+        """One well-formed batch response with a single item deliberately broken."""
+        specs = []
+        for requirement_id, requirement in enumerate(requirements):
+            spec = json.loads(cls._spec_response(requirement))["specs"][0]
+            spec["requirement_id"] = requirement_id
+            if requirement_id == index:
+                spec.update(overrides)
+            specs.append(spec)
+        return json.dumps({"specs": specs})
+
+    def test_one_ungrounded_item_does_not_discard_its_batch_siblings(self):
+        """单个条目越界不得连坐同批次其他条目，否则整条时间线都拿不到清单。"""
+        self.addCleanup(llm.reset_visual_requirement_rejection_memo)
+        requirements = self._batch_requirements()[:2]
+        response = self._batch_response_with_override(
+            requirements, 1, subjects=["Astronaut"]
+        )
+
+        with (
+            patch.object(
+                llm, "_selected_llm_identity", return_value=("test-provider", "test-model")
+            ),
+            patch.object(llm, "_load_visual_requirement_spec_cache", return_value=None),
+            patch.object(llm, "_save_visual_requirement_spec_cache"),
+            patch.object(llm, "_generate_response", return_value=response) as generate,
+        ):
+            resolved = llm.generate_visual_requirement_specs(requirements)
+
+        self.assertEqual(generate.call_count, 1)
+        self.assertEqual(
+            set(resolved), {llm.normalize_visual_requirement(requirements[0])}
+        )
+
+    def test_a_grounding_rejection_is_not_requested_again_in_one_process(self):
+        """脚本阶段与素材阶段请求同一批需求，接地失败的条目不得被重复付费。"""
+        self.addCleanup(llm.reset_visual_requirement_rejection_memo)
+        llm.reset_visual_requirement_rejection_memo()
+        requirement = self._batch_requirements()[0]
+        response = self._batch_response_with_override(
+            [requirement], 0, subjects=["Astronaut"]
+        )
+
+        with (
+            patch.object(
+                llm, "_selected_llm_identity", return_value=("test-provider", "test-model")
+            ),
+            patch.object(llm, "_load_visual_requirement_spec_cache", return_value=None),
+            patch.object(llm, "_save_visual_requirement_spec_cache"),
+            patch.object(llm, "_generate_response", return_value=response) as generate,
+        ):
+            first = llm.generate_visual_requirement_specs([requirement])
+            second = llm.generate_visual_requirement_specs([requirement])
+
+        self.assertEqual(first, {})
+        self.assertEqual(second, {})
+        self.assertEqual(generate.call_count, 1)
+
+    _CANYON_REQUIREMENT = "A slow water drip carves a canyon through solid rock"
+
+    @classmethod
+    def _canyon_item(cls, **overrides) -> dict:
+        item = {
+            "requirement_id": 0,
+            "original_requirement": cls._CANYON_REQUIREMENT,
+            "subjects": ["the water drip"],
+            "primary_action": "carving a canyon",
+            "objects": ["solid rock"],
+            "required_relations": [],
+            "required_context": [],
+            "required_visible_state": [],
+            "optional_attributes": ["desert light"],
+            "critical_visual_facts": [
+                {
+                    "id": "f1",
+                    "fact": "Water is carving into the rock",
+                    "mandatory": True,
+                    "direct_evidence_needed": True,
+                    "evidence_description": "The drip meets the rock on camera.",
+                    "basis_type": "logically_necessary",
+                    "basis_quote": "carves a canyon through solid rock",
+                }
+            ],
+            "ambiguity_notes": [],
+        }
+        item.update(overrides)
+        return item
+
+    def _validated_canyon_spec(self, **overrides):
+        return llm._validate_visual_requirement_spec_item(
+            self._canyon_item(**overrides),
+            requirement_id=0,
+            original_requirement=self._CANYON_REQUIREMENT,
+            provider_id="test-provider",
+            model_name="test-model",
+        )
+
+    def test_source_grounding_accepts_another_form_of_a_source_word(self):
+        """carves 与 carving 是同一个词，换词形不等于脱离原始需求。"""
+        spec = self._validated_canyon_spec()
+        self.assertEqual(spec.primary_action, "carving a canyon")
+        self.assertEqual(spec.subjects, ["the water drip"])
+
+    def test_source_grounding_still_rejects_an_invented_entity(self):
+        """放宽词形不等于放宽内容：需求里没有的实体仍必须被拒绝。"""
+        for field, value in (
+            ("subjects", ["a climbing tourist"]),
+            ("objects", ["a suspension bridge"]),
+            ("required_context", ["at golden hour"]),
+            ("primary_action", "photographing the canyon"),
+        ):
+            with self.subTest(field=field):
+                with self.assertRaises(ValueError):
+                    self._validated_canyon_spec(**{field: value})
+
+    def test_a_basis_quote_must_be_a_contiguous_run_of_whole_words(self):
+        """basis_quote 必须是原文里连续的整词序列，不能是词内片段或重排。"""
+        for quote in ("solid rock canyon", "carv a canyon", "rock solid"):
+            with self.subTest(quote=quote):
+                facts = [dict(self._canyon_item()["critical_visual_facts"][0])]
+                facts[0]["basis_quote"] = quote
+                with self.assertRaises(ValueError):
+                    self._validated_canyon_spec(critical_visual_facts=facts)
+
+    @classmethod
     def _specs_response(cls, requirements: list[str]) -> str:
         """Build one well-formed batch response for the requested requirements."""
         specs = []
