@@ -61,6 +61,15 @@ def write_script_data(task_id: str, payload: Mapping[str, Any]) -> None:
     _write_json_atomic(_script_file(task_id), payload)
 
 
+def read_script_data(task_id: str) -> dict[str, Any]:
+    """读取任务的 ``script.json``；无效清单由调用方按流水线错误处理。"""
+    with _script_file(task_id).open("r", encoding="utf-8") as script_file:
+        payload = json.load(script_file)
+    if not isinstance(payload, dict):
+        raise ValueError("task script data must be a JSON object")
+    return payload
+
+
 def patch_script_data(task_id: str, **updates: Any) -> bool:
     """
     在保留原有字段的前提下补充任务清单，失败时返回 ``False``。

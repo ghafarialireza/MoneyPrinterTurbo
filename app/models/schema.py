@@ -55,10 +55,50 @@ class MaterialInfo:
     provider: str = "pexels"
     url: str = ""
     duration: int = 0
+    source_start_time: Optional[float] = None
+    source_end_time: Optional[float] = None
+    semantic_evaluation: Optional[dict[str, Any]] = None
+    overall_score: Optional[float] = None
     # 在线素材搜索会附带经过筛选的公开来源信息，供搜索缓存和任务记录复用。
     # 本地上传素材不需要填写；写入任务文件前仍会按字段白名单重新构造，
     # 避免外部请求传入的签名 URL、凭据或无关字段进入持久化数据。
     source_info: Optional[dict[str, Any]] = None
+
+
+NarrationTimingSource = Literal[
+    "edge_tts_boundary",
+    "azure_tts_boundary",
+    "whisper",
+    "estimated",
+]
+NarrationTimingQuality = Literal[
+    "boundary",
+    "speech_recognition",
+    "estimated",
+]
+
+
+@pydantic.dataclasses.dataclass(config=_Config)
+class NarrationSlot:
+    index: int
+    start_time: float
+    end_time: float
+    duration: float
+    text: str
+    timing_source: NarrationTimingSource
+
+
+@pydantic.dataclasses.dataclass(config=_Config)
+class VisualSlot:
+    index: int
+    start_time: float
+    end_time: float
+    duration: float
+    narration_slot_indexes: List[int]
+    narration_text: str
+    search_queries: List[str]
+    timing_source: NarrationTimingSource
+    timing_quality: NarrationTimingQuality
 
 
 class VideoParams(BaseModel):
@@ -91,8 +131,10 @@ class VideoParams(BaseModel):
     video_materials: Optional[List[MaterialInfo]] = (
         None  # Materials used to generate the video
     )
-    
-    custom_audio_file: Optional[str] = None  # Custom audio file path, will ignore TTS and can still use Whisper subtitles
+
+    custom_audio_file: Optional[str] = (
+        None  # Custom audio file path, will ignore TTS and can still use Whisper subtitles
+    )
     video_language: Optional[str] = ""  # auto detect
 
     voice_name: Optional[str] = ""
@@ -107,7 +149,9 @@ class VideoParams(BaseModel):
     sonilo_bgm_prompt: str = Field(default="", max_length=2000)
 
     subtitle_enabled: Optional[bool] = True
-    subtitle_position: Optional[str] = config.ui.get("subtitle_position", "bottom")  # top, bottom, center, custom
+    subtitle_position: Optional[str] = config.ui.get(
+        "subtitle_position", "bottom"
+    )  # top, bottom, center, custom
     custom_position: float = config.ui.get("custom_position", 70.0)
     font_name: Optional[str] = "STHeitiMedium.ttc"
     text_fore_color: Optional[str] = "#FFFFFF"
@@ -438,6 +482,7 @@ class BgmUploadResponse(BaseResponse):
             },
         }
 
+
 class VideoMaterialRetrieveResponse(BaseResponse):
     class Config:
         json_schema_extra = {
@@ -455,6 +500,7 @@ class VideoMaterialRetrieveResponse(BaseResponse):
                 },
             },
         }
+
 
 class VideoMaterialUploadResponse(BaseResponse):
     class Config:

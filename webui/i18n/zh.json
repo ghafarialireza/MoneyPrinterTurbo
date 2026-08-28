@@ -352,6 +352,20 @@
     "Resume LoomLoom Status Check": "继续查询状态",
     "Stop Tracking LoomLoom Run": "停止跟踪",
     "Stop Tracking LoomLoom Run Help": "只停止本地状态查询，不会取消胜算云中可能仍在执行的付费任务。",
-    "llm_provider_tips.litellm": "##### LiteLLM 配置说明\n- **API Key**: 无需在此处填写；请通过环境变量配置目标 Provider 的密钥\n- **Base Url**: 无需填写\n- **Model Name**: 默认 `{default_model}`；使用 `provider/model` 格式，[查看 Provider 列表](https://docs.litellm.ai/docs/providers)"
+    "llm_provider_tips.litellm": "##### LiteLLM 配置说明\n- **API Key**: 无需在此处填写；请通过环境变量配置目标 Provider 的密钥\n- **Base Url**: 无需填写\n- **Model Name**: 默认 `{default_model}`；使用 `provider/model` 格式，[查看 Provider 列表](https://docs.litellm.ai/docs/providers)",
+    "Smart TwelveLabs Visual Matching": "TwelveLabs 智能画面匹配",
+    "Enable Smart TwelveLabs Visual Matching": "启用智能画面匹配",
+    "Smart TwelveLabs Visual Matching Help": "为每个按旁白排序的画面段使用 Pegasus 1.5 评分有限数量的 Pexels 候选，并只渲染最佳时间片段。",
+    "TwelveLabs API Keys": "TwelveLabs API Key（可多个）",
+    "TwelveLabs API Keys Help": "仅保存在被 Git 忽略的本地 config.toml。可输入一个 Key 或用逗号分隔多个 Key；切换账号时直接替换。",
+    "Advanced TwelveLabs Settings": "TwelveLabs 高级设置",
+    "Candidate Batch Size": "每批候选数量",
+    "Maximum Candidates per Visual Slot": "每个画面段最多候选数",
+    "Minimum Accepted Score": "最低接受分数",
+    "Strong Early Stop Score": "强匹配提前停止分数",
+    "Preferred Maximum Source Duration": "优先素材最大时长（秒）",
+    "Maximum Concurrent Analyses": "最大并发分析数",
+    "Fail Closed When TwelveLabs Is Unavailable": "TwelveLabs 不可用时终止当前素材匹配",
+    "Please Enter the TwelveLabs API Key": "请先填写 TwelveLabs API Key，再启用智能画面匹配。"
   }
 }

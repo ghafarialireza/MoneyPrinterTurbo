@@ -47,6 +47,7 @@ from app.services import (
     cache_manager,
     llm,
     loomloom,
+    twelvelabs,
     video,
     voice,
     webui_task,
@@ -3037,6 +3038,104 @@ def _render_video_settings(panel, params):
                 params.match_materials_to_script,
             )
 
+            if params.video_source == "pexels":
+                st.markdown(f"##### {tr('Smart TwelveLabs Visual Matching')}")
+                twelvelabs_enabled = st.checkbox(
+                    tr("Enable Smart TwelveLabs Visual Matching"),
+                    value=bool(config.app.get("twelvelabs_clip_qa", False)),
+                    help=tr("Smart TwelveLabs Visual Matching Help"),
+                    key="twelvelabs_visual_matching_enabled",
+                )
+                _set_runtime_config(
+                    "app",
+                    "twelvelabs_clip_qa",
+                    twelvelabs_enabled,
+                )
+
+                twelvelabs_api_keys = st.text_input(
+                    tr("TwelveLabs API Keys"),
+                    value=_get_material_api_keys("twelvelabs_api_keys"),
+                    type="password",
+                    help=tr("TwelveLabs API Keys Help"),
+                    key="twelvelabs_api_keys_input",
+                )
+                _save_material_api_keys(
+                    "twelvelabs_api_keys",
+                    twelvelabs_api_keys,
+                )
+
+                twelve_settings = twelvelabs.candidate_selection_settings()
+                with st.expander(tr("Advanced TwelveLabs Settings")):
+                    candidate_batch_size = st.number_input(
+                        tr("Candidate Batch Size"),
+                        min_value=1,
+                        max_value=5,
+                        value=int(twelve_settings["batch_size"]),
+                        step=1,
+                        key="twelvelabs_candidate_batch_size_input",
+                    )
+                    max_candidates = st.number_input(
+                        tr("Maximum Candidates per Visual Slot"),
+                        min_value=1,
+                        max_value=15,
+                        value=int(twelve_settings["max_candidates"]),
+                        step=1,
+                        key="twelvelabs_max_candidates_input",
+                    )
+                    minimum_score = st.number_input(
+                        tr("Minimum Accepted Score"),
+                        min_value=0.0,
+                        max_value=1.0,
+                        value=float(twelve_settings["minimum_score"]),
+                        step=0.05,
+                        format="%.2f",
+                        key="twelvelabs_minimum_score_input",
+                    )
+                    strong_score = st.number_input(
+                        tr("Strong Early Stop Score"),
+                        min_value=0.0,
+                        max_value=1.0,
+                        value=float(twelve_settings["strong_early_stop_score"]),
+                        step=0.05,
+                        format="%.2f",
+                        key="twelvelabs_strong_score_input",
+                    )
+                    preferred_duration = st.number_input(
+                        tr("Preferred Maximum Source Duration"),
+                        min_value=4.0,
+                        max_value=600.0,
+                        value=float(twelve_settings["preferred_max_source_duration"]),
+                        step=1.0,
+                        key="twelvelabs_preferred_duration_input",
+                    )
+                    concurrency = st.number_input(
+                        tr("Maximum Concurrent Analyses"),
+                        min_value=1,
+                        max_value=5,
+                        value=int(twelve_settings["concurrency"]),
+                        step=1,
+                        key="twelvelabs_concurrency_input",
+                    )
+                    fail_closed = st.checkbox(
+                        tr("Fail Closed When TwelveLabs Is Unavailable"),
+                        value=bool(twelve_settings["fail_closed"]),
+                        key="twelvelabs_fail_closed_input",
+                    )
+
+                for setting_key, setting_value in (
+                    ("twelvelabs_candidate_batch_size", candidate_batch_size),
+                    ("twelvelabs_max_candidates_per_slot", max_candidates),
+                    ("twelvelabs_clip_qa_min_score", minimum_score),
+                    ("twelvelabs_strong_early_stop_score", strong_score),
+                    (
+                        "twelvelabs_preferred_max_source_duration",
+                        preferred_duration,
+                    ),
+                    ("twelvelabs_candidate_concurrency", concurrency),
+                    ("twelvelabs_clip_qa_fail_closed", fail_closed),
+                ):
+                    _set_runtime_config("app", setting_key, setting_value)
+
             # 视频转场模式
             video_transition_modes = [
                 (tr("None"), VideoTransitionMode.none.value),
@@ -4693,6 +4792,16 @@ def _render_generation_controls(
         ):
             _remove_active_generation_task(task_id)
             st.error(tr("Please Enter the Pexels API Key"))
+            st.stop()
+
+        if (
+            params.video_source == "pexels"
+            and params.match_materials_to_script
+            and config.app.get("twelvelabs_clip_qa", False)
+            and not config.app.get("twelvelabs_api_keys", "")
+        ):
+            _remove_active_generation_task(task_id)
+            st.error(tr("Please Enter the TwelveLabs API Key"))
             st.stop()
 
         if params.video_source == "pixabay" and not config.app.get(

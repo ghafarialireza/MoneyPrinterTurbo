@@ -1,5 +1,7 @@
+import math
 import os
 import random
+import re
 import threading
 from pathlib import Path
 from typing import Any, Callable, List
@@ -10,13 +12,19 @@ from loguru import logger
 from moviepy.video.io.VideoFileClip import VideoFileClip
 
 from app.config import config
-from app.models.schema import MaterialInfo, VideoAspect, VideoConcatMode
+from app.models.schema import MaterialInfo, VideoAspect, VideoConcatMode, VisualSlot
 from app.services import material_cache, task_artifacts
 from app.utils import utils
 
 # Thread-safe counter for API key rotation
 _api_key_counter = 0
 _api_key_lock = threading.Lock()
+_MIN_STOCK_RENDITION_SHORT_EDGE = 720
+_MIN_SEMANTIC_QA_DURATION = 4
+
+
+class SmartMaterialSelectionError(RuntimeError):
+    """A safe user-facing failure from opt-in smart material selection."""
 
 
 def _safe_public_url(value: Any) -> str | None:
@@ -104,6 +112,74 @@ def _material_source_record(item: MaterialInfo, local_path: str) -> dict[str, An
                 rendition[field] = str(value) if field == "id" else value
         if rendition:
             record["rendition"] = rendition
+
+    raw_semantic_qa = source.get("semantic_qa")
+    if isinstance(raw_semantic_qa, dict):
+        provider = str(raw_semantic_qa.get("provider") or "").strip()
+        accepted = raw_semantic_qa.get("accepted")
+        score = raw_semantic_qa.get("score")
+        reason = re.sub(
+            r"[\x00-\x1f\x7f]+",
+            " ",
+            str(raw_semantic_qa.get("reason") or "").strip(),
+        )
+        semantic_qa: dict[str, Any] = {}
+        if provider:
+            semantic_qa["provider"] = provider[:40]
+        if isinstance(accepted, bool):
+            semantic_qa["accepted"] = accepted
+        try:
+            semantic_qa["score"] = round(min(1.0, max(0.0, float(score))), 4)
+        except (TypeError, ValueError):
+            pass
+        if reason:
+            semantic_qa["reason"] = reason[:240]
+        if semantic_qa:
+            record["semantic_qa"] = semantic_qa
+
+    slot_index = source.get("slot_index")
+    if isinstance(slot_index, int) and slot_index > 0:
+        record["slot_index"] = slot_index
+
+    if item.source_start_time is not None and item.source_end_time is not None:
+        try:
+            source_start = max(0.0, float(item.source_start_time))
+            source_end = min(float(item.duration), float(item.source_end_time))
+            if math.isfinite(source_start) and math.isfinite(source_end):
+                if source_end > source_start:
+                    record["source_start_time"] = round(source_start, 3)
+                    record["source_end_time"] = round(source_end, 3)
+        except (TypeError, ValueError):
+            pass
+
+    if isinstance(item.semantic_evaluation, dict):
+        evaluation = {}
+        for field in (
+            "provider",
+            "model",
+            "schema_version",
+            "accepted",
+            "match",
+            "required_action_visible",
+            "subject_clearly_visible",
+            "scores",
+            "overall_score",
+            "quality_flags",
+            "visible_summary",
+            "reason",
+            "analysis_input",
+        ):
+            if field in item.semantic_evaluation:
+                evaluation[field] = item.semantic_evaluation[field]
+        if evaluation:
+            record["semantic_evaluation"] = evaluation
+    if item.overall_score is not None:
+        try:
+            record["overall_score"] = round(
+                min(1.0, max(0.0, float(item.overall_score))), 4
+            )
+        except (TypeError, ValueError):
+            pass
     return record
 
 
@@ -135,6 +211,49 @@ def _persist_material_sources(
             "failed to persist material source records: "
             f"task_id={task_id}, error={type(exc).__name__}, detail={exc}"
         )
+
+
+def load_selected_source_ranges(
+    task_id: str,
+    video_paths: List[str],
+) -> list[tuple[float, float]]:
+    """Load the exact TwelveLabs-selected range for every downloaded winner."""
+    payload = task_artifacts.read_script_data(task_id)
+    records = payload.get("material_sources")
+    if not isinstance(records, list):
+        raise ValueError("smart material source ranges are missing from script.json")
+
+    records_by_file: dict[str, dict[str, Any]] = {}
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        local_file = str(record.get("local_file") or "").strip()
+        if not local_file or local_file in records_by_file:
+            raise ValueError("smart material source records are ambiguous")
+        records_by_file[local_file] = record
+
+    ranges: list[tuple[float, float]] = []
+    for video_path in video_paths:
+        record = records_by_file.get(Path(video_path).name)
+        if record is None:
+            raise ValueError("smart material source range is missing for a winner")
+        try:
+            start_time = float(record["source_start_time"])
+            end_time = float(record["source_end_time"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError("smart material source range is invalid") from exc
+        if (
+            not math.isfinite(start_time)
+            or not math.isfinite(end_time)
+            or start_time < 0
+            or end_time <= start_time
+        ):
+            raise ValueError("smart material source range is invalid")
+        ranges.append((start_time, end_time))
+
+    if len(ranges) != len(video_paths):
+        raise ValueError("smart material source range count does not match winners")
+    return ranges
 
 
 def _get_tls_verify() -> bool:
@@ -291,6 +410,112 @@ def _filter_materials_by_aspect(
     return filtered_items
 
 
+def _prepare_twelvelabs_candidates(
+    items: List[MaterialInfo],
+    *,
+    video_aspect: VideoAspect,
+    required_source_duration: float,
+    preferred_max_source_duration: float,
+) -> List[MaterialInfo]:
+    """Apply cheap metadata gates before any TwelveLabs call.
+
+    Short stock clips stay in the original Pexels order. Longer clips are not
+    discarded; they form a second bucket used only after the preferred bucket.
+    """
+    short_candidates: list[MaterialInfo] = []
+    long_candidates: list[MaterialInfo] = []
+    seen_asset_ids: set[str] = set()
+    seen_urls: set[str] = set()
+    aspect = VideoAspect(video_aspect)
+    minimum_duration = max(4.0, float(required_source_duration))
+
+    for item in items:
+        source = item.source_info if isinstance(item.source_info, dict) else {}
+        rendition = source.get("rendition")
+        rendition = rendition if isinstance(rendition, dict) else {}
+        asset_id = str(source.get("asset_id") or "").strip()
+        url = str(item.url or "").strip()
+        try:
+            duration = float(item.duration)
+            width = int(rendition.get("width") or 0)
+            height = int(rendition.get("height") or 0)
+            parsed = urlsplit(url)
+        except (TypeError, ValueError):
+            continue
+        if (
+            not asset_id
+            or not math.isfinite(duration)
+            or duration < minimum_duration
+            or parsed.scheme != "https"
+            or not parsed.hostname
+            or parsed.username is not None
+            or parsed.password is not None
+            or not parsed.path.lower().endswith(".mp4")
+            or not _matches_video_aspect(width, height, aspect)
+            or min(width, height) < _MIN_STOCK_RENDITION_SHORT_EDGE
+            or asset_id in seen_asset_ids
+            or url in seen_urls
+        ):
+            continue
+        seen_asset_ids.add(asset_id)
+        seen_urls.add(url)
+        if duration <= preferred_max_source_duration:
+            short_candidates.append(item)
+        else:
+            long_candidates.append(item)
+    return short_candidates + long_candidates
+
+
+def _select_best_video_rendition(
+    renditions: Any,
+    video_aspect: VideoAspect,
+) -> dict[str, Any] | None:
+    """Choose a usable rendition without requiring one exact resolution.
+
+    Stock providers do not guarantee that every asset has a 1080x1920 or
+    1920x1080 rendition. Requiring that exact pair discarded otherwise useful
+    HD candidates. Prefer the closest rendition at or above the output size;
+    if none exists, use the highest-quality 720p-or-better fallback with the
+    correct orientation.
+    """
+    if not isinstance(renditions, list):
+        return None
+
+    aspect = VideoAspect(video_aspect)
+    target_width, target_height = aspect.to_resolution()
+    target_pixels = target_width * target_height
+    ranked: list[tuple[tuple[int, int], dict[str, Any]]] = []
+
+    for rendition in renditions:
+        if not isinstance(rendition, dict):
+            continue
+        try:
+            width = int(rendition.get("width") or 0)
+            height = int(rendition.get("height") or 0)
+        except (TypeError, ValueError):
+            continue
+        if (
+            not _matches_video_aspect(width, height, aspect)
+            or min(width, height) < _MIN_STOCK_RENDITION_SHORT_EDGE
+            or not rendition.get("link")
+        ):
+            continue
+
+        pixels = width * height
+        meets_target = width >= target_width and height >= target_height
+        if meets_target:
+            # Prefer the smallest rendition that already meets the output size
+            # to avoid downloading a 4K file when Full HD is available.
+            score = (2, -(pixels - target_pixels))
+        else:
+            score = (1, pixels)
+        ranked.append((score, rendition))
+
+    if not ranked:
+        return None
+    return max(ranked, key=lambda candidate: candidate[0])[1]
+
+
 def search_videos_pexels(
     search_term: str,
     minimum_duration: int,
@@ -298,14 +523,13 @@ def search_videos_pexels(
 ) -> List[MaterialInfo]:
     aspect = VideoAspect(video_aspect)
     video_orientation = aspect.name
-    video_width, video_height = aspect.to_resolution()
     api_key = get_api_key("pexels_api_keys")
     headers = {
         "Authorization": api_key,
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36",
     }
     # Build URL
-    params = {"query": search_term, "per_page": 20, "orientation": video_orientation}
+    params = {"query": search_term, "per_page": 80, "orientation": video_orientation}
     query_url = f"https://api.pexels.com/v1/videos/search?{urlencode(params)}"
     logger.info(f"searching videos on pexels: term={search_term!r}")
 
@@ -329,40 +553,30 @@ def search_videos_pexels(
             # check if video has desired minimum duration
             if duration < minimum_duration:
                 continue
-            video_files = v["video_files"]
-            # loop through each url to determine the best quality
-            for video in video_files:
-                w = int(video["width"])
-                h = int(video["height"])
-                if (
-                    _matches_video_aspect(w, h, aspect)
-                    and w == video_width
-                    and h == video_height
-                ):
-                    item = MaterialInfo()
-                    item.provider = "pexels"
-                    item.url = video["link"]
-                    item.duration = duration
-                    item.source_info = {
-                        "provider": "pexels",
-                        "search_term": search_term,
-                        "asset_id": (
-                            str(v.get("id")) if v.get("id") is not None else None
-                        ),
-                        "source_page": _safe_public_url(v.get("url")),
-                        "creator": _creator_info(v.get("user")),
-                        "rendition": {
-                            "id": (
-                                str(video.get("id"))
-                                if video.get("id") is not None
-                                else None
-                            ),
-                            "width": w,
-                            "height": h,
-                        },
-                    }
-                    video_items.append(item)
-                    break
+            video = _select_best_video_rendition(v.get("video_files"), aspect)
+            if video is None:
+                continue
+            w = int(video["width"])
+            h = int(video["height"])
+            item = MaterialInfo()
+            item.provider = "pexels"
+            item.url = video["link"]
+            item.duration = duration
+            item.source_info = {
+                "provider": "pexels",
+                "search_term": search_term,
+                "asset_id": str(v.get("id")) if v.get("id") is not None else None,
+                "source_page": _safe_public_url(v.get("url")),
+                "creator": _creator_info(v.get("user")),
+                "rendition": {
+                    "id": (
+                        str(video.get("id")) if video.get("id") is not None else None
+                    ),
+                    "width": w,
+                    "height": h,
+                },
+            }
+            video_items.append(item)
         return video_items
     except Exception as e:
         logger.error(
@@ -603,7 +817,57 @@ def search_videos_coverr(
     return []
 
 
-def save_video(video_url: str, save_dir: str = "") -> str:
+def _validate_saved_video(
+    video_path: str,
+    video_aspect: VideoAspect | None = None,
+) -> bool:
+    """Verify a downloaded/cached clip can be decoded and has the right shape."""
+    clip = None
+    try:
+        clip = VideoFileClip(video_path)
+        if clip.duration <= 0 or clip.fps <= 0:
+            return False
+
+        if video_aspect is not None and VideoAspect(video_aspect) != VideoAspect.square:
+            width = getattr(clip, "w", None)
+            height = getattr(clip, "h", None)
+            if not _matches_video_aspect(width, height, video_aspect):
+                logger.warning(
+                    "video orientation does not match output: "
+                    f"path={video_path}, width={width}, height={height}, "
+                    f"expected={VideoAspect(video_aspect).value}"
+                )
+                return False
+        return True
+    except Exception as e:
+        logger.warning(f"invalid video file: {video_path} => {str(e)}")
+        return False
+    finally:
+        if clip is not None:
+            try:
+                clip.close()
+            except Exception as close_error:
+                logger.warning(
+                    f"failed to close video clip: {video_path}, error: {str(close_error)}"
+                )
+
+
+def _remove_invalid_video(video_path: str) -> None:
+    try:
+        os.remove(video_path)
+    except FileNotFoundError:
+        pass
+    except Exception as remove_error:
+        logger.warning(
+            f"failed to remove invalid video file: {video_path}, error: {str(remove_error)}"
+        )
+
+
+def save_video(
+    video_url: str,
+    save_dir: str = "",
+    video_aspect: VideoAspect | None = None,
+) -> str:
     if not save_dir:
         save_dir = utils.storage_dir("cache_videos")
 
@@ -615,10 +879,13 @@ def save_video(video_url: str, save_dir: str = "") -> str:
     video_id = f"vid-{url_hash}"
     video_path = f"{save_dir}/{video_id}.mp4"
 
-    # if video already exists, return the path
+    # Cached files were previously returned without being decoded again. A bad
+    # partial download could therefore poison every later task using the URL.
     if os.path.exists(video_path) and os.path.getsize(video_path) > 0:
-        logger.info(f"video already exists: {video_path}")
-        return video_path
+        if _validate_saved_video(video_path, video_aspect):
+            logger.info(f"video already exists: {video_path}")
+            return video_path
+        _remove_invalid_video(video_path)
 
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36"
@@ -637,29 +904,9 @@ def save_video(video_url: str, save_dir: str = "") -> str:
         )
 
     if os.path.exists(video_path) and os.path.getsize(video_path) > 0:
-        clip = None
-        try:
-            clip = VideoFileClip(video_path)
-            duration = clip.duration
-            fps = clip.fps
-            if duration > 0 and fps > 0:
-                return video_path
-        except Exception as e:
-            logger.warning(f"invalid video file: {video_path} => {str(e)}")
-            try:
-                os.remove(video_path)
-            except Exception as remove_error:
-                logger.warning(
-                    f"failed to remove invalid video file: {video_path}, error: {str(remove_error)}"
-                )
-        finally:
-            if clip is not None:
-                try:
-                    clip.close()
-                except Exception as close_error:
-                    logger.warning(
-                        f"failed to close video clip: {video_path}, error: {str(close_error)}"
-                    )
+        if _validate_saved_video(video_path, video_aspect):
+            return video_path
+        _remove_invalid_video(video_path)
     return ""
 
 
@@ -765,6 +1012,8 @@ def download_videos(
     audio_duration: float = 0.0,
     max_clip_duration: int = 5,
     match_script_order: bool = False,
+    visual_slots: list[VisualSlot] | None = None,
+    clip_speed: float = 1.0,
 ) -> List[str]:
     provider = "pexels"
     remote_search_videos = search_videos_pexels
@@ -803,6 +1052,8 @@ def download_videos(
             audio_duration=audio_duration,
             max_clip_duration=max_clip_duration,
             material_directory=material_directory,
+            visual_slots=visual_slots,
+            clip_speed=clip_speed,
         )
 
     valid_video_items = []
@@ -841,7 +1092,9 @@ def download_videos(
                 f"asset_id={source_info.get('asset_id') or 'unknown'}"
             )
             saved_video_path = save_video(
-                video_url=item.url, save_dir=material_directory
+                video_url=item.url,
+                save_dir=material_directory,
+                video_aspect=video_aspect,
             )
             if saved_video_path:
                 logger.info(f"video saved: {saved_video_path}")
@@ -876,6 +1129,218 @@ def download_videos(
     return video_paths
 
 
+def _build_script_order_term_plan(
+    term_count: int,
+    required_clip_count: int,
+) -> List[int]:
+    """Map timeline clip slots to search-term indexes without rewinding.
+
+    When a narration needs more clips than there are search terms, the old
+    round-robin downloader restarted at the opening term after reaching the
+    final term.  That made the second half of a video visually jump back to
+    the beginning of the script.  This plan spreads repeated terms across one
+    monotonic pass instead.
+
+    If there are fewer clip slots than terms, sample the full script range and
+    keep both the opening and final term represented.
+    """
+    if term_count <= 0 or required_clip_count <= 0:
+        return []
+    if required_clip_count == 1:
+        return [0]
+
+    if required_clip_count >= term_count:
+        return [
+            min(term_count - 1, (slot * term_count) // required_clip_count)
+            for slot in range(required_clip_count)
+        ]
+
+    return [
+        round(slot * (term_count - 1) / (required_clip_count - 1))
+        for slot in range(required_clip_count)
+    ]
+
+
+def _download_videos_by_script_order_smart(
+    *,
+    task_id: str,
+    search_terms: List[str],
+    visual_slots: list[VisualSlot],
+    search_videos,
+    video_aspect: VideoAspect,
+    max_clip_duration: int,
+    material_directory: str,
+    clip_speed: float,
+    twelvelabs_service,
+) -> List[str]:
+    """Select one globally best Pegasus-scored candidate for every visual slot."""
+    if len(search_terms) != len(visual_slots):
+        logger.warning(
+            "smart ordered material matching requires one query per visual slot: "
+            f"queries={len(search_terms)}, slots={len(visual_slots)}"
+        )
+        return []
+
+    settings = twelvelabs_service.candidate_selection_settings()
+    normalized_speed = utils.normalize_clip_speed(clip_speed)
+    used_asset_ids: set[str] = set()
+    used_urls: set[str] = set()
+    video_paths: list[str] = []
+    material_sources: list[dict[str, Any]] = []
+    total_candidates_analyzed = 0
+    total_source_seconds_analyzed = 0.0
+    segmentation_calls = 0
+
+    for slot, search_query in zip(visual_slots, search_terms):
+        if not slot.narration_text.strip():
+            raise SmartMaterialSelectionError(
+                f"Visual slot {slot.index} has no narration requirement"
+            )
+        if not slot.search_queries or search_query not in slot.search_queries:
+            raise SmartMaterialSelectionError(
+                f"Visual slot {slot.index} has an inconsistent search query mapping"
+            )
+
+        required_source_duration = max(
+            0.001,
+            float(slot.duration) * normalized_speed,
+        )
+        video_items = search_videos(
+            search_term=search_query,
+            minimum_duration=math.ceil(max(4.0, required_source_duration)),
+            video_aspect=video_aspect,
+        )
+        prepared = _prepare_twelvelabs_candidates(
+            video_items,
+            video_aspect=video_aspect,
+            required_source_duration=required_source_duration,
+            preferred_max_source_duration=settings["preferred_max_source_duration"],
+        )
+        candidates = []
+        for item in prepared:
+            source = item.source_info if isinstance(item.source_info, dict) else {}
+            asset_id = str(source.get("asset_id") or "")
+            if asset_id in used_asset_ids or item.url in used_urls:
+                continue
+            candidates.append(item)
+
+        narration_preview = re.sub(r"\s+", " ", slot.narration_text).strip()[:160]
+        logger.info(
+            "smart visual slot candidates: "
+            f"slot={slot.index}, narration={narration_preview!r}, "
+            f"query={search_query!r}, after_cheap_filters={len(candidates)}"
+        )
+        if not candidates:
+            _persist_material_sources(task_id, material_sources)
+            raise SmartMaterialSelectionError(
+                f"No valid Pexels candidate remained for visual slot {slot.index} "
+                "after metadata quality filters"
+            )
+
+        winner, stats = twelvelabs_service.select_best_candidate(
+            candidates=candidates,
+            slot_index=slot.index,
+            slot_duration=slot.duration,
+            narration_text=slot.narration_text,
+            search_query=search_query,
+            batch_size=settings["batch_size"],
+            max_candidates=settings["max_candidates"],
+            minimum_score=settings["minimum_score"],
+            strong_early_stop_score=settings["strong_early_stop_score"],
+            concurrency=settings["concurrency"],
+        )
+        total_candidates_analyzed += int(stats["api_candidates_analyzed"])
+        total_source_seconds_analyzed += float(stats["source_seconds_analyzed"])
+
+        if winner is None and not settings["fail_closed"]:
+            winner = candidates[0]
+            logger.warning(
+                "no TwelveLabs candidate passed; using explicit fail-open legacy "
+                f"fallback for slot={slot.index}"
+            )
+        if winner is None:
+            _persist_material_sources(task_id, material_sources)
+            api_failure_reason = stats.get("api_failure_reason")
+            if api_failure_reason:
+                raise SmartMaterialSelectionError(
+                    f"Visual slot {slot.index} could not be analyzed: "
+                    f"{api_failure_reason}"
+                )
+            raise SmartMaterialSelectionError(
+                f"No TwelveLabs candidate satisfied narration for visual slot "
+                f"{slot.index}; cross-segment fallback was not used"
+            )
+
+        source = winner.source_info if isinstance(winner.source_info, dict) else {}
+        asset_id = str(source.get("asset_id") or "")
+        segmentation_calls += 1
+        segment = twelvelabs_service.segment_winner(
+            video_url=winner.url,
+            narration_text=slot.narration_text,
+            slot_duration=slot.duration,
+            source_duration=float(winner.duration),
+            clip_speed=normalized_speed,
+        )
+        if segment is None and settings["fail_closed"]:
+            _persist_material_sources(task_id, material_sources)
+            raise SmartMaterialSelectionError(
+                f"TwelveLabs could not identify a valid temporal segment for visual "
+                f"slot {slot.index}"
+            )
+        if segment is None:
+            segment = {
+                "source_start_time": 0.0,
+                "source_end_time": min(
+                    float(winner.duration), required_source_duration
+                ),
+                "description": "explicit fail-open zero-start fallback",
+            }
+            logger.warning(
+                "winner segmentation unavailable; using explicit fail-open source "
+                f"start for slot={slot.index}, asset_id={asset_id or 'unknown'}"
+            )
+
+        winner.source_start_time = float(segment["source_start_time"])
+        winner.source_end_time = float(segment["source_end_time"])
+        source = dict(source)
+        source["slot_index"] = slot.index
+        source["temporal_segment"] = dict(segment)
+        winner.source_info = source
+        logger.info(
+            "smart visual winner: "
+            f"slot={slot.index}, asset_id={asset_id or 'unknown'}, "
+            f"score={float(winner.overall_score or 0):.4f}, "
+            f"source_start={winner.source_start_time:.3f}, "
+            f"source_end={winner.source_end_time:.3f}"
+        )
+
+        saved_video_path = save_video(
+            video_url=winner.url,
+            save_dir=material_directory,
+            video_aspect=video_aspect,
+        )
+        if not saved_video_path:
+            _persist_material_sources(task_id, material_sources)
+            raise SmartMaterialSelectionError(
+                f"The selected Pexels winner for visual slot {slot.index} could not "
+                "be downloaded"
+            )
+        video_paths.append(saved_video_path)
+        material_sources.append(_material_source_record(winner, saved_video_path))
+        used_asset_ids.add(asset_id)
+        used_urls.add(winner.url)
+
+    logger.info(
+        "TwelveLabs smart selection usage: "
+        f"candidates_analyzed={total_candidates_analyzed}, "
+        f"source_seconds_analyzed={total_source_seconds_analyzed:.3f}, "
+        f"segmentation_calls={segmentation_calls}"
+    )
+    logger.success(f"downloaded {len(video_paths)} smart ordered videos")
+    _persist_material_sources(task_id, material_sources)
+    return video_paths
+
+
 def _download_videos_by_script_order(
     task_id: str,
     search_terms: List[str],
@@ -884,17 +1349,44 @@ def _download_videos_by_script_order(
     audio_duration: float,
     max_clip_duration: int,
     material_directory: str,
+    visual_slots: list[VisualSlot] | None = None,
+    clip_speed: float = 1.0,
 ) -> List[str]:
     """
     按脚本文案顺序下载素材。
 
-    默认下载逻辑会把所有关键词的候选素材合并成一个大列表；如果第一个
-    关键词返回很多结果，最终下载时可能一直消耗这个关键词的素材，后续
-    脚本主题就排不上时间线。这里按关键词分组后轮询下载：
-    第 1 轮取每个关键词的第 1 个候选，第 2 轮取每个关键词的第 2 个候选。
-    这样在不重写视频合成引擎的前提下，尽量保证素材顺序贴近文案顺序。
+    默认下载逻辑会把所有关键词的候选素材合并成一个大列表；旧的顺序模式
+    则按轮次遍历全部关键词，素材不够时会从脚本开头重新开始。这里先根据
+    音频时长计算实际需要的镜头数，再把关键词只沿时间线向前分配。一个
+    关键词可以连续占据多个镜头，但已经进入后半段后不会再跳回开头。
+
+    顺序匹配是显式的质量模式：如果某个时间段没有足够的独立候选，宁可
+    让素材阶段失败，也不把另一个叙事段落的画面强行塞进该位置。
     """
     logger.info("downloading videos with script-order material matching")
+    # Imported lazily to avoid the module-level cycle: twelvelabs uses the API
+    # key rotator defined in this module.
+    from app.services import twelvelabs as twelvelabs_service
+
+    if visual_slots and twelvelabs_service.is_smart_visual_matching_enabled():
+        return _download_videos_by_script_order_smart(
+            task_id=task_id,
+            search_terms=search_terms,
+            visual_slots=visual_slots,
+            search_videos=search_videos,
+            video_aspect=video_aspect,
+            max_clip_duration=max_clip_duration,
+            material_directory=material_directory,
+            clip_speed=clip_speed,
+            twelvelabs_service=twelvelabs_service,
+        )
+
+    semantic_qa_enabled = twelvelabs_service.is_clip_qa_enabled()
+    minimum_candidate_duration = (
+        max(max_clip_duration, _MIN_SEMANTIC_QA_DURATION)
+        if semantic_qa_enabled
+        else max_clip_duration
+    )
     candidate_groups = []
     valid_video_urls = set()
     found_duration = 0.0
@@ -902,7 +1394,7 @@ def _download_videos_by_script_order(
     for search_term in search_terms:
         video_items = search_videos(
             search_term=search_term,
-            minimum_duration=max_clip_duration,
+            minimum_duration=minimum_candidate_duration,
             video_aspect=video_aspect,
         )
         logger.info(f"found {len(video_items)} videos for '{search_term}'")
@@ -915,40 +1407,103 @@ def _download_videos_by_script_order(
             valid_video_urls.add(item.url)
             found_duration += item.duration
 
-        if term_items:
-            candidate_groups.append((search_term, term_items))
+        candidate_groups.append((search_term, term_items))
 
     logger.info(
         f"found total ordered video candidates: {sum(len(items) for _, items in candidate_groups)}, "
         f"required duration: {audio_duration} seconds, found duration: {found_duration} seconds"
     )
 
+    required_clip_count = max(
+        1,
+        math.ceil(max(0.0, float(audio_duration)) / max_clip_duration),
+    )
+    term_plan = _build_script_order_term_plan(
+        term_count=len(candidate_groups),
+        required_clip_count=required_clip_count,
+    )
+    logger.info(
+        "ordered material timeline plan: "
+        f"clips={required_clip_count}, term_indexes={term_plan}"
+    )
+
+    required_by_term = [0] * len(candidate_groups)
+    for term_index in term_plan:
+        required_by_term[term_index] += 1
+
+    insufficient_terms = [
+        {
+            "term": candidate_groups[index][0],
+            "required": required,
+            "available": len(candidate_groups[index][1]),
+        }
+        for index, required in enumerate(required_by_term)
+        if len(candidate_groups[index][1]) < required
+    ]
+    if insufficient_terms:
+        logger.warning(
+            "script-order material coverage is incomplete; refusing unrelated "
+            f"fallback clips: {insufficient_terms}"
+        )
+        return []
+
     video_paths = []
     material_sources: list[dict[str, Any]] = []
+    candidate_offsets = [0] * len(candidate_groups)
     total_duration = 0.0
-    candidate_index = 0
-    while candidate_groups and total_duration <= audio_duration:
-        has_candidate = False
-        for search_term, term_items in candidate_groups:
-            if candidate_index >= len(term_items):
-                continue
 
-            has_candidate = True
-            item = term_items[candidate_index]
+    for term_index in term_plan:
+        search_term, term_items = candidate_groups[term_index]
+        saved_for_slot = False
+        while candidate_offsets[term_index] < len(term_items):
+            item = term_items[candidate_offsets[term_index]]
+            candidate_offsets[term_index] += 1
             try:
+                semantic_qa = None
+                if semantic_qa_enabled:
+                    semantic_qa = twelvelabs_service.evaluate_clip_match(
+                        video_url=item.url,
+                        visual_query=search_term,
+                    )
+                    if semantic_qa is None:
+                        if twelvelabs_service.clip_qa_fail_closed():
+                            logger.warning(
+                                "rejecting ordered candidate because semantic QA "
+                                f"is unavailable: term={search_term!r}"
+                            )
+                            continue
+                        logger.warning(
+                            "semantic QA unavailable; allowing candidate because "
+                            f"fail-closed is disabled: term={search_term!r}"
+                        )
+                    elif not semantic_qa.get("accepted", False):
+                        logger.info(
+                            "rejecting ordered candidate after semantic QA: "
+                            f"term={search_term!r}, score={semantic_qa.get('score')}, "
+                            f"reason={semantic_qa.get('reason')!r}"
+                        )
+                        continue
+
                 source_info = (
                     item.source_info if isinstance(item.source_info, dict) else {}
                 )
+                if semantic_qa is not None:
+                    source_info = dict(source_info)
+                    source_info["semantic_qa"] = semantic_qa
+                    item.source_info = source_info
                 logger.info(
                     f"downloading ordered {item.provider} video for {search_term!r}: "
                     f"asset_id={source_info.get('asset_id') or 'unknown'}"
                 )
                 saved_video_path = save_video(
-                    video_url=item.url, save_dir=material_directory
+                    video_url=item.url,
+                    save_dir=material_directory,
+                    video_aspect=video_aspect,
                 )
                 if saved_video_path:
                     logger.info(f"video saved: {saved_video_path}")
                     video_paths.append(saved_video_path)
+                    saved_for_slot = True
                     try:
                         material_sources.append(
                             _material_source_record(item, saved_video_path)
@@ -961,11 +1516,7 @@ def _download_videos_by_script_order(
                             f"detail={source_error}"
                         )
                     total_duration += min(max_clip_duration, item.duration)
-                    if total_duration > audio_duration:
-                        logger.info(
-                            f"total duration of downloaded videos: {total_duration} seconds, skip downloading more"
-                        )
-                        break
+                    break
             except Exception as e:
                 logger.error(
                     "failed to download ordered material video: "
@@ -973,11 +1524,18 @@ def _download_videos_by_script_order(
                     f"detail={_redact_request_error(e, item.url)}"
                 )
 
-        if not has_candidate:
-            break
-        candidate_index += 1
+        if not saved_for_slot:
+            logger.warning(
+                "script-order material slot has no valid candidate; refusing "
+                f"cross-segment fallback: term={search_term!r}"
+            )
+            _persist_material_sources(task_id, material_sources)
+            return []
 
-    logger.success(f"downloaded {len(video_paths)} ordered videos")
+    logger.success(
+        f"downloaded {len(video_paths)} ordered videos, "
+        f"planned duration: {total_duration} seconds"
+    )
     _persist_material_sources(task_id, material_sources)
     return video_paths
 

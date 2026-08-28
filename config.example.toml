@@ -68,16 +68,32 @@ pixabay_api_keys = []
 # Register at https://coverr.co/developers?ctx=header_navigation
 coverr_api_keys = []
 
-# Optional TwelveLabs integration for semantic material ranking and video QA.
+# Optional TwelveLabs integration for smart Pexels candidate and segment selection.
 # Install the optional dependency with: uv sync --extra twelvelabs
 # Create an API key at https://playground.twelvelabs.io/
 twelvelabs_api_keys = []
 # Reorder search terms using Marengo before downloading materials. This option
 # is ignored when match_materials_to_script is enabled.
 twelvelabs_rerank_terms = false
-# Optional model overrides. Uncomment only when a different model is required.
+# In ordered Pexels mode, score candidates against each exact narration slot with
+# Pegasus 1.5, select the globally best passing candidate, then segment the winner.
+twelvelabs_clip_qa = false
+# Evaluate complete batches of up to 5 concurrently; never inspect more than 15
+# candidates for one visual slot.
+twelvelabs_candidate_batch_size = 5
+twelvelabs_max_candidates_per_slot = 15
+twelvelabs_candidate_concurrency = 5
+# A candidate is accepted only when all semantic/action/visibility hard gates pass
+# and the application-owned weighted score reaches this threshold.
+twelvelabs_clip_qa_min_score = 0.70
+twelvelabs_strong_early_stop_score = 0.90
+# Prefer shorter stock clips first without discarding longer candidates.
+twelvelabs_preferred_max_source_duration = 30.0
+# Quality-first behavior: if Pegasus times out or returns malformed output, reject
+# the current slot instead of silently using an unverified or zero-start clip.
+twelvelabs_clip_qa_fail_closed = true
+# Marengo remains configurable for the separate legacy search-term reranker.
 # twelvelabs_marengo_model = "marengo3.0"
-# twelvelabs_pegasus_model = "pegasus1.5"
 
 # Match search terms and downloaded materials to the script narrative order.
 # 默认关闭，开启后会减少随机性，使素材顺序更贴近文案结构。

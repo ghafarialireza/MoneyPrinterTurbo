@@ -167,6 +167,115 @@ class TestScriptPromptOptions(unittest.TestCase):
         self.assertEqual(result, ["opening city", "middle office", "final sunset"])
         self.assertIn("chronological stock-video search terms", captured["prompt"])
         self.assertIn("same order as the script narration", captured["prompt"])
+        self.assertIn("concrete, camera-visible shot", captured["prompt"])
+        self.assertIn("return exactly 3 items", captured["prompt"])
+
+    def test_generate_ordered_terms_retries_wrong_timeline_count(self):
+        responses = iter(
+            [
+                '["opening city", "final sunset"]',
+                '["opening city", "middle office", "final sunset"]',
+            ]
+        )
+
+        with patch.object(
+            llm, "_generate_response", side_effect=lambda _: next(responses)
+        ):
+            result = llm.generate_terms(
+                video_subject="startup story",
+                video_script="First city. Then office. Finally sunset.",
+                amount=3,
+                match_script_order=True,
+            )
+
+        self.assertEqual(result, ["opening city", "middle office", "final sunset"])
+
+    def test_generate_ordered_terms_validates_count_after_regex_recovery(self):
+        responses = iter(
+            [
+                'Here are the terms: ["opening city", "final sunset"]',
+                'Result: ["opening city", "middle office", "final sunset"]',
+            ]
+        )
+
+        with patch.object(
+            llm, "_generate_response", side_effect=lambda _: next(responses)
+        ):
+            result = llm.generate_terms(
+                video_subject="startup story",
+                video_script="First city. Then office. Finally sunset.",
+                amount=3,
+                match_script_order=True,
+            )
+
+        self.assertEqual(result, ["opening city", "middle office", "final sunset"])
+
+    def test_generate_visual_slot_queries_uses_indexed_slot_narration(self):
+        captured = {}
+        slots = [
+            {
+                "slot_index": 1,
+                "start_time": 0.0,
+                "end_time": 4.0,
+                "narration_text": "Workers inspect the railway tracks.",
+            },
+            {
+                "slot_index": 5,
+                "start_time": 16.0,
+                "end_time": 20.0,
+                "narration_text": "Workers remove damaged wooden sleepers.",
+            },
+        ]
+
+        def fake_generate_response(prompt):
+            captured["prompt"] = prompt
+            # Deliberately return slot 5 first to prove association is index-based.
+            return (
+                '[{"slot_index": 5, "queries": ["workers replacing railway sleepers"]}, '
+                '{"slot_index": 1, "queries": ["workers inspecting railway tracks"]}]'
+            )
+
+        with patch.object(
+            llm,
+            "_generate_response",
+            side_effect=fake_generate_response,
+        ):
+            result = llm.generate_visual_slot_queries(
+                video_subject="railway maintenance",
+                visual_slots=slots,
+                queries_per_slot=1,
+            )
+
+        self.assertEqual(
+            result[5], ["workers replacing railway sleepers"]
+        )
+        self.assertEqual(result[1], ["workers inspecting railway tracks"])
+        self.assertIn("Workers inspect the railway tracks.", captured["prompt"])
+        self.assertIn(
+            "Workers remove damaged wooden sleepers.", captured["prompt"]
+        )
+        self.assertIn("Derive each query only from that slot's narration_text", captured["prompt"])
+
+    def test_generate_visual_slot_queries_supports_future_multiple_queries(self):
+        response = (
+            '[{"slot_index": 1, "queries": '
+            '["railway ballast closeup", "workers spreading track ballast"]}]'
+        )
+        with patch.object(llm, "_generate_response", return_value=response):
+            result = llm.generate_visual_slot_queries(
+                video_subject="railway ballast",
+                visual_slots=[
+                    {
+                        "slot_index": 1,
+                        "start_time": 0.0,
+                        "end_time": 4.0,
+                        "narration_text": "Workers spread ballast under the rails.",
+                    }
+                ],
+                queries_per_slot=2,
+            )
+
+        self.assertEqual(len(result[1]), 2)
 
     def test_generate_terms_returns_empty_list_on_provider_error(self):
         """
