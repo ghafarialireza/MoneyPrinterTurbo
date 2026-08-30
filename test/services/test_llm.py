@@ -266,6 +266,7 @@ class TestScriptPromptOptions(unittest.TestCase):
             "Derive each query only from that slot's visual_requirement",
             captured["prompt"],
         )
+        self.assertIn("stock-findable", captured["prompt"])
 
     def test_generate_visual_slot_queries_supports_future_multiple_queries(self):
         response = (
@@ -328,6 +329,7 @@ class TestScriptPromptOptions(unittest.TestCase):
         self.assertEqual(result[1], ["worker digging hole", "shovel in soil"])
         self.assertEqual(result[2], ["rain flooding field"])
         self.assertIn("Order each slot's queries as fallbacks", captured["prompt"])
+        self.assertIn("closest common, findable", captured["prompt"])
 
     def test_extra_phrasings_beyond_the_request_are_truncated(self):
         response = (
@@ -431,6 +433,7 @@ class TestScriptPromptOptions(unittest.TestCase):
         self.assertIn('1|1|"removes boards"', captured["prompt"])
         self.assertIn("SMALLEST number of spans", captured["prompt"])
         self.assertIn("Do not return timestamps", captured["prompt"])
+        self.assertIn("commonly-filmed", captured["prompt"])
 
     def test_semantic_grouping_malformed_json_fails_after_bounded_retry(self):
         """畸形 JSON 必须在有限次重试后失败，绝不能返回猜测出的分组。"""
@@ -2829,6 +2832,67 @@ class TestSemanticAdjudicationCache(unittest.TestCase):
         self.assertEqual(second["pexels:1"].decision, "REJECT")
         self.assertEqual(second["pexels:1"].missing_or_contradictory_facts, ["f1"])
 
+    def test_a_stray_fact_id_in_the_explanation_keeps_the_verified_verdict(self):
+        # The explanation is not evidence. decision and mandatory_fact_results are
+        # already cross-checked against the observed statuses, so an ID the
+        # adjudicator invented cannot change what was decided -- and discarding the
+        # record over it threw away a verified ACCEPT, which is enough to fail an
+        # entire beat.
+        spec = self._spec()
+        candidate = self._candidate("pexels:1")
+        payload = self._decision("pexels:1")
+        payload["missing_or_contradictory_facts"] = ["f9"]
+
+        verdicts, generate = self._adjudicate(
+            spec, [candidate], self._response(payload)
+        )
+
+        self.assertEqual(generate.call_count, 1)
+        self.assertEqual(verdicts["pexels:1"].decision, "ACCEPT")
+        self.assertEqual(verdicts["pexels:1"].missing_or_contradictory_facts, [])
+
+    def test_real_fact_ids_survive_while_unusable_entries_are_dropped(self):
+        spec = self._spec()
+        candidate = self._candidate(
+            "pexels:1",
+            status="NOT_OBSERVED",
+            evidence="Only a parked car is visible.",
+        )
+        payload = self._decision(
+            "pexels:1",
+            decision="REJECT",
+            status="NOT_OBSERVED",
+            reason="The defining installation is never shown.",
+        )
+        payload["missing_or_contradictory_facts"] = ["f1", "f9", "f1", 7, None]
+
+        verdicts, _ = self._adjudicate(spec, [candidate], self._response(payload))
+
+        self.assertEqual(verdicts["pexels:1"].decision, "REJECT")
+        self.assertEqual(verdicts["pexels:1"].missing_or_contradictory_facts, ["f1"])
+
+    def test_an_explanation_that_is_not_an_array_still_yields_a_verdict(self):
+        spec = self._spec()
+        candidate = self._candidate(
+            "pexels:1",
+            status="NOT_OBSERVED",
+            evidence="Only a parked car is visible.",
+        )
+        payload = self._decision(
+            "pexels:1",
+            decision="REJECT",
+            status="NOT_OBSERVED",
+            reason="The defining installation is never shown.",
+        )
+        # A bare string instead of an array is the common shape slip, and the
+        # rejection it explains is still fully supported by the fact evidence.
+        payload["missing_or_contradictory_facts"] = "f1"
+
+        verdicts, _ = self._adjudicate(spec, [candidate], self._response(payload))
+
+        self.assertEqual(verdicts["pexels:1"].decision, "REJECT")
+        self.assertEqual(verdicts["pexels:1"].missing_or_contradictory_facts, ["f1"])
+
     def test_only_the_uncached_candidates_are_sent_to_the_provider(self):
         spec = self._spec()
         cached = self._candidate("pexels:1")
@@ -3357,6 +3421,7 @@ class TestNarrationVisualRequirementRepair(unittest.TestCase):
         self.assertIn("It starts with a single drop of water.", captured["prompt"])
         self.assertIn("Add no fact the narration does not support", captured["prompt"])
         self.assertIn("must return an empty string", captured["prompt"])
+        self.assertIn("stock-findable", captured["prompt"])
 
     def test_provider_failure_reads_as_unavailable_not_as_nothing_visible(self):
         with patch.object(

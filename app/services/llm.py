@@ -1038,10 +1038,10 @@ def generate_visual_slot_queries(
         ""
         if queries_per_slot == 1
         else (
-            "\n8. Order each slot's queries as fallbacks for the same shot: the most "
-            "literal phrasing first, then progressively simpler or more generic "
-            "phrasings of the same visible subject and action. Fallbacks must differ "
-            "in wording, and none of them may describe a different scene."
+            "\n8. Order each slot's queries as fallbacks for the same shot: the "
+            "closest common, findable phrasing first, then progressively broader or "
+            "more generic phrasings of the same visible subject and action. Fallbacks "
+            "must differ in wording, and none of them may describe a different scene."
         )
     )
     prompt = f"""
@@ -1055,7 +1055,11 @@ Generate Pexels stock-video search queries for the indexed visual slots below.
 2. Each object must contain slot_index and exactly {queries_per_slot} queries.
 3. Derive each query only from that slot's visual_requirement. Never move an action,
    subject, or scene from one slot to another.
-4. Preserve the narration's main visible subject and action.
+4. Keep the requirement's core visible subject and action, but phrase each query
+   as the nearest common, stock-findable everyday scene; turn rare, poetic, or
+   figurative wording into an ordinary literal equivalent (for example "a seed
+   cracking open in the dark" -> "sprouting seedling"). Never drift to a
+   different or unrelated subject.
 5. Every query must describe a concrete, camera-visible shot suitable for stock footage.
 6. Avoid abstract concepts, emotions, metaphors, narration summaries, camera
    transitions, and editorial instructions.
@@ -1230,8 +1234,14 @@ be copied into the response.
 4. Attach abstract or non-visible wording to the nearest valid visible concept;
    never create a nonsense standalone visual for an abstract phrase.
 5. A multi-word unit is indivisible. Boundaries may occur only between unit IDs.
-6. visual_requirement must be concise, concrete, camera-visible, and must
-   preserve the real subject/action without adding facts.
+6. Express visual_requirement as the closest ordinary, commonly-filmed real-world
+   scene that stays faithful to the narration's meaning -- not a word-for-word
+   transcription of poetic, abstract, or figurative wording. Render metaphor or
+   rare imagery as the nearest plain scene a general viewer reads the same way
+   (for example "a seed cracks open in the dark" -> "a sprouting seedling
+   breaking through soil"). Keep it concise, concrete, and camera-visible; add no
+   specifics that contradict or narrow the meaning, and never invent unrelated
+   content.
 7. visual_requirement must name ONE continuous camera moment: one subject with at
    most one visible action or state. Never chain events with "and", "then", or a
    comma list, even when the span covers several sentences. One stock clip cannot
@@ -1389,7 +1399,9 @@ be copied into the response.
 
 ## Rules
 1. visual_requirement must be concrete and camera-visible: a subject, action,
-   object, location, environment, or state that a camera can record.
+   object, location, environment, or state that a camera can record. Prefer the
+   closest common, stock-findable everyday scene that matches the line's meaning
+   rather than rare or figurative wording.
 2. Add no fact the narration does not support. Resolve pronouns and elliptical
    lines from the context above instead of inventing a new subject.
 3. Never request on-screen text, captions, logos, brands, or named real people.
@@ -2532,11 +2544,15 @@ be easier to film and easier to find, without changing what the line says.
    place, or claim that the spoken text does not support.
 2. Choose the most ordinary camera-visible moment that still fits the line: one
    concrete subject performing one concrete visible action or in one visible state.
-3. Simpler and more common wins. Drop counts, named places, brands, on-screen text,
+3. Simpler and more common wins. The rejected requirement failed because no
+   published clip matched it, so move to a scene that is ordinarily filmed and
+   plentiful: when the exact thing is rare, show the common everyday category it
+   belongs to. Drop counts, named places, brands, on-screen text,
    specific weather, rare compound scenes, and any detail the spoken text does not
    state.
 4. Do not reuse the rejected requirement, and do not merely reorder its words or
-   swap synonyms; change which visible moment is shown.
+   swap synonyms; change which visible moment is shown. A near-synonym of a phrase
+   that already found nothing will find nothing again.
 5. Never describe abstract meaning, emotions, metaphors, camera moves, transitions,
    edits, or narration summaries.
 6. narration_basis must be an exact contiguous quote copied from that item's
@@ -2649,12 +2665,35 @@ def _validated_adjudication(
         result.status != "OBSERVED" for result in fact_results
     ):
         raise ValueError("adjudicator accepted a failed mandatory fact")
-    missing = item.get("missing_or_contradictory_facts")
-    if not isinstance(missing, list) or any(
-        not isinstance(fact_id, str) or fact_id not in mandatory_ids
-        for fact_id in missing
-    ):
-        raise ValueError("adjudication missing fact IDs are invalid")
+    # Explanatory field only. The verdict rests on decision and
+    # mandatory_fact_results, both cross-checked against source_statuses above, so
+    # nothing written here can change what was decided or smuggle an ACCEPT past a
+    # failed fact. An unknown, repeated or non-string entry therefore means the
+    # adjudicator wrote a sloppy explanation, not that its evidence is wrong --
+    # and discarding the whole record over it threw away decisions that had already
+    # passed every evidence check, which is enough to fail an entire beat. Unusable
+    # entries are dropped and the verified decision is kept.
+    raw_missing = item.get("missing_or_contradictory_facts")
+    if isinstance(raw_missing, str):
+        listed_facts: list[object] = [raw_missing]
+    elif isinstance(raw_missing, list):
+        listed_facts = list(raw_missing)
+    else:
+        listed_facts = []
+    missing = [
+        fact_id
+        for fact_id in dict.fromkeys(
+            entry for entry in listed_facts if isinstance(entry, str)
+        )
+        if fact_id in mandatory_ids
+    ]
+    ignored_fact_count = len(listed_facts) - len(missing)
+    if ignored_fact_count > 0:
+        logger.debug(
+            "semantic adjudication explanation listed unusable fact IDs: "
+            f"candidate={candidate_id} decision={decision} "
+            f"ignored={ignored_fact_count}"
+        )
     reason = _bounded_structured_text(item.get("reason"), "adjudication reason")
     if _TIMESTAMP_EVIDENCE_RE.search(reason):
         raise ValueError("adjudication reason invented or repeated a timestamp")
@@ -2662,7 +2701,7 @@ def _validated_adjudication(
         candidate_id=candidate_id,
         decision=decision,
         mandatory_fact_results=fact_results,
-        missing_or_contradictory_facts=list(dict.fromkeys(missing)),
+        missing_or_contradictory_facts=missing,
         reason=reason,
     )
 
