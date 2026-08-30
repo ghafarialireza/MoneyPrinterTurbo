@@ -39,6 +39,10 @@ streamlit.log
 .coverage
 coverage.xml
 htmlcov/
+# Tool caches. Untracked and unignored until now, so a stray "git add ." would
+# have committed ~30 hashed cache files nobody can read or review.
+.pytest_cache/
+.ruff_cache/
 .codegraph
 /docs/superpowers
 .understand-anything

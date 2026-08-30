@@ -1,6 +1,19 @@
 # Semantic Stage S5 — Variable-duration `RenderSegment` + renderer integration
 
-Status: review complete, implementation not started.
+> **Historical record. Do not read this as current documentation.**
+>
+> This is the review and plan as written on 2026-08-23, kept unedited because it
+> records why the decisions below were taken. Everything it plans has since been
+> built, and several of its statements are now false: variable-duration
+> `RenderSegment` rendering is wired and authoritative, and Coverr — which this
+> document still inventories as a live provider — was removed in full as a paid API,
+> leaving `pexels -> pixabay`. The status line and file counts below describe a
+> working tree that no longer exists.
+>
+> For the pipeline as it is now, see [`semantic-pipeline.md`](semantic-pipeline.md).
+> Where the two disagree, that document is current and this one is history.
+
+Status *as of 2026-08-23*: review complete, implementation not started.
 Branch: `feat/visual-quality-pipeline` (uncommitted, 15 modified files, 0 untracked).
 Reviewed against working tree on 2026-08-23.
 
