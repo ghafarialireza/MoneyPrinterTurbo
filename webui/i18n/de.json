@@ -293,9 +293,6 @@
     "Runtime Configuration Busy": "Ein Videoauftrag verwendet gerade die Diensteinstellungen. Versuchen Sie es nach Abschluss erneut.",
     "LLM Connection Test Succeeded": "Verbindung erfolgreich: {provider} / {model} ({elapsed} s)",
     "LLM Connection Test Failed": "Verbindung fehlgeschlagen: {error}",
-    "Video Source Settings": "**Videoquellen-Einstellungen**",
-    "Coverr": "Coverr",
-    "Coverr API Key": "Coverr API-Schlüssel ([API-Schlüssel holen](https://coverr.co/developers?ctx=header_navigation))",
-    "Please Enter the Coverr API Key": "Bitte geben Sie den **Coverr API-Schlüssel** ein"
+    "Video Source Settings": "**Videoquellen-Einstellungen**"
   }
 }

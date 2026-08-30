@@ -139,6 +139,12 @@ VisualBeatDurationPolicy = Literal[
     # provider, phrasing, or rewritten requirement, so this beat absorbed its
     # window. The narration timeline is unchanged; only the cut is gone.
     "unfillable_beat_merged",
+    # The same rescue, but across a group boundary: the unfillable beat was the
+    # only shot of its own group, so the neighbour that absorbed it describes an
+    # adjacent moment of the narration rather than the same one. Recorded
+    # separately because the covering clip was approved for a requirement further
+    # from the absorbed window than a same-group merge implies.
+    "unfillable_beat_cross_group_merged",
 ]
 
 # A beat shorter than this reads as punctuation rather than as a scene of its own.

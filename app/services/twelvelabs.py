@@ -73,6 +73,12 @@ DEFAULT_CLIP_QA_MIN_SCORE = 0.70
 DEFAULT_CANDIDATE_BATCH_SIZE = 5
 DEFAULT_MAX_CANDIDATES_PER_SLOT = 15
 DEFAULT_STRONG_EARLY_STOP_SCORE = 0.90
+# Footage that never comes near the gate is not footage described badly, it is a
+# catalog that does not hold this concept. Below this fraction of the gate counts
+# as unrelated rather than "close but short".
+_UNRELATED_FOOTAGE_SCORE_RATIO = 0.6
+# Never conclude that from one or two clips: a thin sample is noise.
+_MIN_UNRELATED_FOOTAGE_EVIDENCE = 3
 DEFAULT_PREFERRED_MAX_SOURCE_DURATION = 30.0
 DEFAULT_CANDIDATE_CONCURRENCY = 5
 EVALUATION_SCHEMA_VERSION = "smart-stock-evidence-v3"
@@ -736,6 +742,79 @@ def _candidate_is_accepted(
     )
 
 
+_API_FAILURE_REASON_PREFIXES = (
+    "TwelveLabs quota",
+    "TwelveLabs authentication",
+    "TwelveLabs API error",
+    "TwelveLabs API unavailable",
+    "malformed TwelveLabs",
+)
+
+
+def _analysis_api_failure_reason(
+    evaluated: Sequence[tuple[int, Any, dict[str, Any]]],
+) -> str | None:
+    """The first provider-side analysis failure among these results, if any."""
+    for _, _, result in evaluated:
+        reason = str(result.get("reason") or "")
+        if reason.startswith(_API_FAILURE_REASON_PREFIXES):
+            return reason
+    return None
+
+
+def _best_overall_score(
+    evaluated: Sequence[tuple[int, Any, dict[str, Any]]],
+) -> float:
+    """Highest score observed so far, reading an unusable score as no score.
+
+    This feeds a stats field and a log line on every selection, including the
+    successful ones, so it must not be the thing that raises. It uses the same
+    coercion as the rank gate: a score that is not a real number in [0, 1] is
+    treated as absent rather than trusted or fatal, which keeps this function
+    and ``_candidate_is_rank_eligible`` reading the same evidence the same way.
+    """
+    scores = [
+        score
+        for score in (
+            _score_component(result.get("overall_score")) for _, _, result in evaluated
+        )
+        if score is not None
+    ]
+    return max(scores, default=0.0)
+
+
+def _footage_is_unrelated(
+    evaluated: Sequence[tuple[int, Any, dict[str, Any]]],
+    minimum_score: float,
+) -> bool:
+    """True when everything analyzed so far missed the gate by a wide margin.
+
+    A stock search returns one relevance-ranked list, so the pages after the ones
+    already seen are by construction no more relevant. When the best of a decent
+    sample is not merely short of the gate but nowhere near it, and nothing
+    reached adjudication at all, the catalog does not hold this concept: further
+    pages, and further rewordings of the same idea, buy the same pool again. Only
+    a different concept can change the outcome, which is the rung above this one.
+
+    A provider-side analysis failure is never read this way. Zero scores there
+    mean the observation never happened, not that the footage was wrong, and
+    treating the two alike is how a quota error gets misreported as a semantic
+    result.
+    """
+    if len(evaluated) < _MIN_UNRELATED_FOOTAGE_EVIDENCE:
+        return False
+    if _analysis_api_failure_reason(evaluated) is not None:
+        return False
+    for _, _, result in evaluated:
+        if result.get("accepted") is True:
+            return False
+        if result.get("eligible_for_adjudication") is True:
+            return False
+    return _best_overall_score(evaluated) < minimum_score * (
+        _UNRELATED_FOOTAGE_SCORE_RATIO
+    )
+
+
 def _candidate_prompt(requirement_spec: VisualRequirementSpec) -> str:
     return f"""
 You are a strict visual-evidence observer, not a relevance judge.
@@ -1297,6 +1376,7 @@ def select_best_candidate(
     adjudication_calls = 0
     candidates_adjudicated = 0
     adjudication_failures = 0
+    unrelated_footage = False
 
     for batch_start in range(0, len(bounded_candidates), batch_size):
         batch = bounded_candidates[batch_start : batch_start + batch_size]
@@ -1414,22 +1494,22 @@ def select_best_candidate(
             )
             if float(best_so_far[2]["overall_score"]) >= early_stop:
                 break
+        elif _footage_is_unrelated(evaluated, threshold):
+            # Nothing on offer is even close, so the remaining pages of this same
+            # ranked list cannot rescue the query. Stopping here is what keeps a
+            # concept the catalog does not carry from consuming the whole budget.
+            unrelated_footage = True
+            logger.info(
+                "TwelveLabs stopping early on unrelated footage: "
+                f"slot={slot_index}, query={search_query!r}, "
+                f"analyzed={len(evaluated)}, "
+                f"best_score={_best_overall_score(evaluated):.4f}, "
+                f"gate={threshold:.2f}"
+            )
+            break
 
     accepted = [item for item in evaluated if item[2].get("accepted") is True]
-    api_failure_reason = None
-    for _, _, result in evaluated:
-        reason = str(result.get("reason") or "")
-        if reason.startswith(
-            (
-                "TwelveLabs quota",
-                "TwelveLabs authentication",
-                "TwelveLabs API error",
-                "TwelveLabs API unavailable",
-                "malformed TwelveLabs",
-            )
-        ):
-            api_failure_reason = reason
-            break
+    api_failure_reason = _analysis_api_failure_reason(evaluated)
     winner: MaterialInfo | None = None
     winner_result: dict[str, Any] | None = None
     if accepted:
@@ -1504,6 +1584,10 @@ def select_best_candidate(
             and result["critical_gate"].get("decision") == "UNCERTAIN"
         ),
         "early_stopped": len(evaluated) < len(bounded_candidates),
+        # Reported so the caller can stop rewording a concept this catalog does
+        # not hold, instead of buying the same pool under another phrasing.
+        "unrelated_footage": unrelated_footage,
+        "best_overall_score": round(_best_overall_score(evaluated), 4),
         "winner_evaluation": winner_result,
         "api_failure_reason": api_failure_reason,
         "candidate_evaluations": candidate_evaluations,

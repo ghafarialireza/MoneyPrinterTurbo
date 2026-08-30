@@ -27,7 +27,6 @@ moonshot_api_key = ""
 deepseek_api_key = ""
 pexels_api_keys = []
 pixabay_api_keys = []
-coverr_api_keys = []
 oneapi_api_key = ""
 oneapi_base_url = ""
 oneapi_model_name = ""

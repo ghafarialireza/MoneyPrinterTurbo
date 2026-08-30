@@ -2527,8 +2527,9 @@ def get_video_materials(
             # Computed in the script stage so verification uses the checklist
             # this run was planned and persisted with.
             requirement_specs=visual_requirement_specs or None,
-            # Filled only if an unfillable beat had to be absorbed by a sibling
-            # shot, in which case the renderer must use the rewritten timeline.
+            # Filled only if an unfillable beat had to be absorbed by a
+            # neighbouring shot, in which case the renderer must use the rewritten
+            # timeline.
             merged_beats_out=merged_beats_out,
         )
         if not downloaded_videos:
@@ -3367,9 +3368,10 @@ def _run_pipeline(
 
     # 5. Get video materials
     # Selection is allowed to rewrite the beat timeline: when no provider,
-    # phrasing, or rewritten requirement can fill a beat, a sibling shot of the
-    # same semantic group absorbs its window. The narration timing never moves,
-    # so this list is either empty or a shorter timeline covering the same span.
+    # phrasing, or rewritten requirement can fill a beat, the shot beside it absorbs
+    # its window — a sibling of the same semantic group where one exists, otherwise
+    # the shot of the adjacent group. The narration timing never moves, so this list
+    # is either empty or a shorter timeline covering the same span.
     merged_visual_beats: list[VisualBeat] = []
     try:
         downloaded_videos = get_video_materials(

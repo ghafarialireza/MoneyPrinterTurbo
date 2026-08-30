@@ -182,13 +182,12 @@ class TestMaterialTlsVerification(unittest.TestCase):
 
     def test_remote_searches_only_return_requested_orientation(self):
         """
-        三个素材源都必须只返回目标方向的素材，避免竖屏任务混入横屏素材后
+        两个素材源都必须只返回目标方向的素材，避免竖屏任务混入横屏素材后
         通过 letterbox 产生明显黑边。Pexels 使用远端参数并在本地校验，
-        Pixabay 和 Coverr 使用响应尺寸做本地过滤。
+        Pixabay 使用响应尺寸做本地过滤。
         """
         config.app["pexels_api_keys"] = ["pexels-key"]
         config.app["pixabay_api_keys"] = ["pixabay-key"]
-        config.app["coverr_api_keys"] = ["coverr-key"]
         config.proxy.clear()
 
         pexels_response = SimpleNamespace(
@@ -252,32 +251,6 @@ class TestMaterialTlsVerification(unittest.TestCase):
                 ]
             },
         )
-        coverr_response = SimpleNamespace(
-            json=lambda: {
-                "hits": [
-                    {
-                        "id": "landscape",
-                        "duration": 8,
-                        "max_width": 1920,
-                        "max_height": 1080,
-                        "urls": {"mp4_download": "https://example.com/landscape.mp4"},
-                    },
-                    {
-                        "id": "portrait",
-                        "duration": 8,
-                        "max_width": 1080,
-                        "max_height": 1920,
-                        "urls": {"mp4_download": "https://example.com/portrait.mp4"},
-                    },
-                    {
-                        "id": "unknown",
-                        "duration": 8,
-                        "urls": {"mp4_download": "https://example.com/unknown.mp4"},
-                    },
-                ]
-            }
-        )
-
         with patch(
             "app.services.material.requests.get",
             return_value=pexels_response,
@@ -297,22 +270,9 @@ class TestMaterialTlsVerification(unittest.TestCase):
                 minimum_duration=1,
                 video_aspect=material.VideoAspect.portrait,
             )
-        with patch(
-            "app.services.material.requests.get",
-            return_value=coverr_response,
-        ) as get:
-            coverr_results = material.search_videos_coverr(
-                "city",
-                minimum_duration=1,
-                video_aspect=material.VideoAspect.portrait,
-            )
-            coverr_url = get.call_args.args[0]
-
         self.assertIn("/v1/videos/search?", pexels_url)
         self.assertIn("orientation=portrait", pexels_url)
-        self.assertIn("page_size=20", coverr_url)
-        self.assertIn("filter=is_vertical%3Atrue", coverr_url)
-        for results in (pexels_results, pixabay_results, coverr_results):
+        for results in (pexels_results, pixabay_results):
             self.assertEqual(
                 [item.url for item in results],
                 ["https://example.com/portrait.mp4"],
@@ -364,45 +324,12 @@ class TestMaterialTlsVerification(unittest.TestCase):
             )
         )
 
-    def test_coverr_passes_orientation_filter_to_remote_search(self):
-        """Coverr 横竖屏搜索应在服务端筛选，方形素材继续使用本地尺寸校验。"""
-        config.app["coverr_api_keys"] = ["coverr-key"]
-        config.proxy.clear()
-        fake_response = SimpleNamespace(json=lambda: {"hits": []})
-        cases = (
-            (material.VideoAspect.portrait, "filter=is_vertical%3Atrue"),
-            (material.VideoAspect.landscape, "filter=is_vertical%3Afalse"),
-            (material.VideoAspect.square, None),
-        )
-
-        for aspect, expected_filter in cases:
-            with (
-                self.subTest(aspect=aspect),
-                patch(
-                    "app.services.material.requests.get",
-                    return_value=fake_response,
-                ) as get,
-            ):
-                material.search_videos_coverr(
-                    "city",
-                    minimum_duration=1,
-                    video_aspect=aspect,
-                )
-                request_url = get.call_args.args[0]
-
-            self.assertIn("page_size=20", request_url)
-            if expected_filter:
-                self.assertIn(expected_filter, request_url)
-            else:
-                self.assertNotIn("filter=", request_url)
-
     def test_square_search_preserves_crop_compatible_materials(self):
         """
-        Pixabay 和 Coverr 很少提供原生方形视频。方形输出必须继续接受可裁剪的
-        横屏素材，否则选择这两个来源时会在搜索阶段直接得到空列表。
+        Pixabay 很少提供原生方形视频。方形输出必须继续接受可裁剪的
+        横屏素材，否则选择该来源时会在搜索阶段直接得到空列表。
         """
         config.app["pixabay_api_keys"] = ["pixabay-key"]
-        config.app["coverr_api_keys"] = ["coverr-key"]
         config.proxy.clear()
         pixabay_response = SimpleNamespace(
             status_code=200,
@@ -424,22 +351,6 @@ class TestMaterialTlsVerification(unittest.TestCase):
                 ]
             },
         )
-        coverr_response = SimpleNamespace(
-            json=lambda: {
-                "hits": [
-                    {
-                        "id": "landscape",
-                        "duration": 8,
-                        "max_width": 1920,
-                        "max_height": 1080,
-                        "urls": {
-                            "mp4_download": "https://example.com/coverr-landscape.mp4"
-                        },
-                    }
-                ]
-            }
-        )
-
         with patch(
             "app.services.material.requests.get",
             return_value=pixabay_response,
@@ -449,23 +360,10 @@ class TestMaterialTlsVerification(unittest.TestCase):
                 minimum_duration=1,
                 video_aspect=material.VideoAspect.square,
             )
-        with patch(
-            "app.services.material.requests.get",
-            return_value=coverr_response,
-        ):
-            coverr_results = material.search_videos_coverr(
-                "city",
-                minimum_duration=1,
-                video_aspect=material.VideoAspect.square,
-            )
 
         self.assertEqual(
             [item.url for item in pixabay_results],
             ["https://example.com/pixabay-landscape.mp4"],
-        )
-        self.assertEqual(
-            [item.url for item in coverr_results],
-            ["https://example.com/coverr-landscape.mp4"],
         )
 
     def test_search_pixabay_does_not_log_api_key(self):
@@ -1063,282 +961,6 @@ class TestMaterialTlsVerification(unittest.TestCase):
 
         self.assertEqual(result, ["/tmp/a1.mp4"])
         self.assertTrue(warning.called)
-
-
-class TestCoverrProvider(unittest.TestCase):
-    """
-    Coverr 视频素材源(spec: 2026-06-09-coverr-video-provider-design.md)。
-    全部用 unittest.mock 替换 requests，确保 CI 不依赖真实网络和真实 API key。
-    """
-
-    def setUp(self):
-        self.original_app_config = dict(config.app)
-        self.original_proxy_config = dict(config.proxy)
-
-    def tearDown(self):
-        config.app.clear()
-        config.app.update(self.original_app_config)
-        config.proxy.clear()
-        config.proxy.update(self.original_proxy_config)
-
-    # ---------------- Tests for search_videos_coverr ----------------
-
-    def test_search_coverr_uses_mp4_download_url(self):
-        """
-        search_videos_coverr 应把每个 hit 转成 MaterialInfo，并把 urls.mp4_download
-        直接作为 MaterialInfo.url。
-        按 Coverr 官方文档 (api.coverr.co/docs/videos/#download-a-video),
-        GET mp4_download 本身就被 Coverr 计入下载统计,无需额外 PATCH ping。
-        同时验证 Authorization header 使用 Bearer scheme。
-        """
-        config.app["coverr_api_keys"] = ["coverr-key"]
-        config.app.pop("tls_verify", None)
-        config.proxy.clear()
-
-        fake_response = SimpleNamespace(
-            json=lambda: {
-                "page": 0,
-                "pages": 50,
-                "page_size": 20,
-                "total": 1,
-                "hits": [
-                    {
-                        "id": "S1YbPl1NfI",
-                        "duration": 11.625,
-                        "aspect_ratio": "16:9",
-                        "canonical_url": "https://coverr.co/videos/example?token=drop",
-                        "creator": {
-                            "id": "creator-1",
-                            "name": "Coverr Creator",
-                            "profile_url": "https://coverr.co/creators/example?key=drop",
-                        },
-                        "max_width": 3840,
-                        "max_height": 2160,
-                        "urls": {
-                            "mp4": "https://storage.coverr.co/videos/abc?token=xyz",
-                            "mp4_preview": "https://storage.coverr.co/videos/abc/preview?token=xyz",
-                            "mp4_download": "https://storage.coverr.co/videos/abc/download?token=xyz",
-                        },
-                    }
-                ],
-            }
-        )
-
-        with patch(
-            "app.services.material.requests.get", return_value=fake_response
-        ) as get:
-            results = material.search_videos_coverr(
-                "nature",
-                minimum_duration=5,
-                video_aspect=material.VideoAspect.landscape,
-            )
-
-        self.assertEqual(len(results), 1)
-        item = results[0]
-        self.assertEqual(item.provider, "coverr")
-        self.assertEqual(item.duration, 11)
-        # url 字段就是 mp4_download URL,不再做 coverr://id|url 编码
-        self.assertEqual(
-            item.url, "https://storage.coverr.co/videos/abc/download?token=xyz"
-        )
-        self.assertEqual(item.source_info["asset_id"], "S1YbPl1NfI")
-        self.assertEqual(
-            item.source_info["source_page"],
-            "https://coverr.co/videos/example",
-        )
-        self.assertEqual(
-            item.source_info["creator"]["profile_page"],
-            "https://coverr.co/creators/example",
-        )
-        # Bearer auth + TLS verify on by default
-        self.assertEqual(
-            get.call_args.kwargs["headers"]["Authorization"], "Bearer coverr-key"
-        )
-        self.assertTrue(get.call_args.kwargs["verify"])
-
-    def test_search_coverr_uses_tls_verification_by_default(self):
-        """与 pexels/pixabay 一致:未显式配置时 TLS 校验默认开启。"""
-        config.app["coverr_api_keys"] = ["coverr-key"]
-        config.app.pop("tls_verify", None)
-        config.proxy.clear()
-
-        fake_response = SimpleNamespace(json=lambda: {"hits": []})
-
-        with patch(
-            "app.services.material.requests.get", return_value=fake_response
-        ) as get:
-            material.search_videos_coverr("nature", minimum_duration=1)
-
-        self.assertTrue(get.call_args.kwargs["verify"])
-
-    def test_search_coverr_allows_explicit_tls_disable_for_proxy(self):
-        """企业自签证书代理场景必须能显式关闭 TLS 校验。"""
-        config.app["coverr_api_keys"] = ["coverr-key"]
-        config.app["tls_verify"] = False
-        config.proxy.clear()
-
-        fake_response = SimpleNamespace(json=lambda: {"hits": []})
-
-        with patch(
-            "app.services.material.requests.get", return_value=fake_response
-        ) as get:
-            material.search_videos_coverr("nature", minimum_duration=1)
-
-        self.assertFalse(get.call_args.kwargs["verify"])
-
-    def test_search_coverr_filters_by_min_duration_and_accepts_string(self):
-        """
-        Coverr duration 字段在不同响应里可能是 number 或 string,
-        两种格式都要接受;低于 minimum_duration 的应被过滤。
-        """
-        config.app["coverr_api_keys"] = ["coverr-key"]
-        config.app.pop("tls_verify", None)
-        config.proxy.clear()
-
-        fake_response = SimpleNamespace(
-            json=lambda: {
-                "hits": [
-                    {
-                        "id": "shortvid",
-                        "duration": 3,  # below minimum
-                        "urls": {"mp4_download": "https://example.com/a.mp4"},
-                    },
-                    {
-                        "id": "stringdur",
-                        "duration": "10.500000",  # string accepted
-                        "max_width": 1080,
-                        "max_height": 1920,
-                        "urls": {"mp4_download": "https://example.com/b.mp4"},
-                    },
-                ]
-            }
-        )
-
-        with patch("app.services.material.requests.get", return_value=fake_response):
-            results = material.search_videos_coverr("x", minimum_duration=5)
-
-        self.assertEqual(len(results), 1)
-        self.assertEqual(results[0].duration, 10)
-        self.assertEqual(results[0].url, "https://example.com/b.mp4")
-
-    def test_search_coverr_skips_invalid_items(self):
-        """缺 id 或缺 urls.mp4_download 的条目应被跳过,不应抛异常。"""
-        config.app["coverr_api_keys"] = ["coverr-key"]
-        config.app.pop("tls_verify", None)
-        config.proxy.clear()
-
-        fake_response = SimpleNamespace(
-            json=lambda: {
-                "hits": [
-                    {  # missing urls.mp4_download
-                        "id": "no-download",
-                        "duration": 10,
-                        "urls": {"mp4_preview": "https://example.com/preview.mp4"},
-                    },
-                    {  # missing id
-                        "duration": 10,
-                        "urls": {"mp4_download": "https://example.com/x.mp4"},
-                    },
-                    {  # valid baseline
-                        "id": "good",
-                        "duration": 10,
-                        "max_width": 1080,
-                        "max_height": 1920,
-                        "urls": {"mp4_download": "https://example.com/good.mp4"},
-                    },
-                ]
-            }
-        )
-
-        with patch("app.services.material.requests.get", return_value=fake_response):
-            results = material.search_videos_coverr("x", minimum_duration=1)
-
-        self.assertEqual(len(results), 1)
-        self.assertEqual(results[0].url, "https://example.com/good.mp4")
-
-    def test_search_coverr_returns_empty_on_failure(self):
-        """
-        响应结构异常 / 网络异常时,函数必须返回 [] 而不是抛异常,
-        与 pexels/pixabay 行为保持一致。
-        """
-        config.app["coverr_api_keys"] = ["coverr-key"]
-        config.app.pop("tls_verify", None)
-        config.proxy.clear()
-
-        # Subtest A: malformed response (no "hits" key)
-        with self.subTest("malformed response"):
-            fake_response = SimpleNamespace(json=lambda: {"error": "rate limited"})
-            with patch(
-                "app.services.material.requests.get", return_value=fake_response
-            ):
-                results = material.search_videos_coverr("x", minimum_duration=1)
-            self.assertEqual(results, [])
-
-        # Subtest B: network exception bubbles up from requests.get
-        with self.subTest("network exception"):
-            with patch(
-                "app.services.material.requests.get",
-                side_effect=requests.ConnectionError("boom"),
-            ):
-                results = material.search_videos_coverr("x", minimum_duration=1)
-            self.assertEqual(results, [])
-
-    # ---------------- Tests for download_videos coverr branch ----------------
-
-    def test_download_videos_passes_mp4_download_url_to_save_video(self):
-        """
-        在 source="coverr" 时:
-          1. dispatch 到 search_videos_coverr
-          2. coverr item 走通用下载路径:save_video 收到的就是 mp4_download URL
-             (不再有 coverr://id|url 编码,也不再调用 PATCH ping)
-          3. 返回保存路径
-        """
-        config.app["coverr_api_keys"] = ["coverr-key"]
-        config.app.pop("tls_verify", None)
-        config.app.pop("material_directory", None)
-        config.proxy.clear()
-
-        fake_item = material.MaterialInfo()
-        fake_item.provider = "coverr"
-        fake_item.url = "https://storage.coverr.co/videos/abc/download?token=xyz"
-        fake_item.duration = 10
-
-        with (
-            patch(
-                "app.services.material.search_videos_coverr",
-                return_value=[fake_item],
-            ) as search,
-            patch(
-                "app.services.material.save_video",
-                return_value="/tmp/coverr-saved.mp4",
-            ) as save,
-            patch(
-                "app.services.material.material_cache.load_material_search_cache",
-                return_value=None,
-            ),
-            patch(
-                "app.services.material.material_cache.save_material_search_cache",
-            ),
-        ):
-            result = material.download_videos(
-                task_id="t-coverr",
-                search_terms=["nature"],
-                source="coverr",
-                audio_duration=5,
-                max_clip_duration=5,
-            )
-
-        # 1. dispatch
-        self.assertEqual(search.call_count, 1)
-
-        # 2. save_video 收到的就是 mp4_download URL,原样传入
-        save_url = save.call_args.kwargs.get("video_url") or save.call_args.args[0]
-        self.assertEqual(
-            save_url, "https://storage.coverr.co/videos/abc/download?token=xyz"
-        )
-
-        # 3. 返回值正确
-        self.assertEqual(result, ["/tmp/coverr-saved.mp4"])
 
 
 if __name__ == "__main__":

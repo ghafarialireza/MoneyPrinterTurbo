@@ -241,59 +241,6 @@ class TestMaterialSearchCache(unittest.TestCase):
         self.assertNotIn("private search term", raw_payload)
         self.assertNotIn("token=drop", raw_payload)
 
-    def test_coverr_signed_urls_are_never_cached(self):
-        """Coverr 下载地址包含签名 JWT，不能进入可长期保留的磁盘缓存。"""
-        item = self._item(
-            "https://storage.coverr.co/video/download?token=signed-jwt"
-        )
-        item.provider = "coverr"
-        item.source_info["provider"] = "coverr"
-
-        saved = material_cache.save_material_search_cache(
-            provider="coverr",
-            search_term="nature",
-            minimum_duration=5,
-            video_aspect=VideoAspect.portrait,
-            items=[item],
-        )
-
-        self.assertFalse(saved)
-        self.assertEqual(list(Path(self.temp_dir.name).glob("*.json")), [])
-
-    def test_coverr_cache_load_removes_legacy_signed_url(self):
-        """访问 Coverr 时应清理旧版本可能留下的签名下载地址缓存。"""
-        cache_path = material_cache._cache_path(
-            provider="coverr",
-            search_term="nature",
-            minimum_duration=5,
-            video_aspect=VideoAspect.portrait,
-        )
-        cache_path.write_text(
-            json.dumps(
-                {
-                    "version": 1,
-                    "items": [
-                        {
-                            "provider": "coverr",
-                            "url": "https://storage.coverr.co/video?token=signed-jwt",
-                            "duration": 12,
-                        }
-                    ],
-                }
-            ),
-            encoding="utf-8",
-        )
-
-        loaded = material_cache.load_material_search_cache(
-            provider="coverr",
-            search_term="nature",
-            minimum_duration=5,
-            video_aspect=VideoAspect.portrait,
-        )
-
-        self.assertIsNone(loaded)
-        self.assertFalse(cache_path.exists())
-
     def test_version_one_cache_is_invalidated(self):
         """旧缓存缺少来源信息，升级后必须重新查询而不能生成残缺任务记录。"""
         cache_path = self._cache_path()

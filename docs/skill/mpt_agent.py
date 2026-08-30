@@ -25,7 +25,7 @@ PROJECT_ARCHIVE_URL = (
 DEFAULT_ROOT = Path.home() / "MoneyPrinterTurbo"
 DEFAULT_VOICE_NAME = "zh-CN-XiaoxiaoNeural-Female"
 NEEDS_INPUT_EXIT_CODE = 10
-SUPPORTED_SOURCES = {"pexels", "pixabay", "coverr", "local"}
+SUPPORTED_SOURCES = {"pexels", "pixabay", "local"}
 PEXELS_API_KEY_URL = "https://www.pexels.com/api/"
 PEXELS_VALIDATION_URL = "https://api.pexels.com/v1/collections?per_page=1"
 PEXELS_API_KEY_HELP_URL = (

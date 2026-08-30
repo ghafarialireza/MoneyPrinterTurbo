@@ -53,7 +53,7 @@ tls_verify = true
 # Video Materials / 视频素材
 # -----------------------------------------------------------------------------
 
-# Available values: "pexels", "pixabay", "coverr", "loomloom", "local".
+# Available values: "pexels", "pixabay", "loomloom", "local".
 # "loomloom" is a paid Shengsuan Cloud source and requires explicit
 # confirmation in the WebUI before each generation request.
 video_source = "pexels"
@@ -67,9 +67,6 @@ pexels_api_keys = []
 
 # Register at https://pixabay.com/api/docs/
 pixabay_api_keys = []
-
-# Register at https://coverr.co/developers?ctx=header_navigation
-coverr_api_keys = []
 
 # Optional TwelveLabs integration for smart Pexels candidate and segment selection.
 # Install the optional dependency with: uv sync --extra twelvelabs
@@ -105,7 +102,7 @@ match_materials_to_script = false
 # Smart visual matching, per beat, when a provider returns nothing usable:
 # first try the alternative phrasings the script stage generated for that beat on
 # the same provider, then move on to the next searchable provider
-# (pexels -> pixabay -> coverr, providers without an API key are skipped).
+# (pexels -> pixabay, providers without an API key are skipped).
 # Set the cascade to false to stay on the selected provider only, and set the
 # variant count to 1 to spend exactly one query per provider. Each extra phrasing
 # costs one stock search plus one more round of candidate analysis.
@@ -123,15 +120,21 @@ smart_material_requirement_rewrite = true
 # runs at most two rounds — its planned requirement and the rewritten one — so its
 # worst case is twice this number.
 # smart_material_max_analyzed_candidates_per_round = 75
-# Last resort before the video fails: let the neighbouring shot of the same
-# semantic group absorb the window of a beat nothing could fill. Sibling shots
-# share one visual requirement, so the neighbour's clip was already approved for
-# what the open beat wanted and is simply cut wider — no extra analysis unless the
-# clip is too short to cover both. The narration timing never moves; only a cut is
-# lost. Leave it unset to allow a third of the beats, or set 0 to fail the video on
-# the first unfillable beat instead. A value above a third is honored as written:
-# it trades visual variety for finishing the video.
+# Last resort before the video fails: let a neighbouring shot absorb the window of
+# a beat nothing could fill. The neighbour's clip has already been approved for the
+# adjacent stretch of the same narration, so it is simply cut wider — no extra
+# analysis unless the clip is too short to cover both. The narration timing never
+# moves; only a cut is lost. Leave it unset to allow a third of the beats, or set 0
+# to fail the video on the first unfillable beat instead. A value above a third is
+# honored as written: it trades visual variety for finishing the video.
 # smart_material_max_merged_beats = 4
+# Whether that rescue may cross a semantic group boundary. A shot of the open beat's
+# own group is always preferred, but most spans now produce a single beat, so a beat
+# that fails is usually the only shot of its group and has no such sibling — which
+# used to fail the whole video. With this on, the shot beside it takes the window
+# instead, and the beat is recorded with the cross-group duration policy so the
+# weaker rescue stays visible. Set false to fail the video in that case.
+# smart_material_cross_group_merge = true
 # Spend ceiling, in analyzed candidates, for one whole video. The per-round number
 # above bounds one beat; this bounds the run, which matters because a beat that
 # cannot be filled no longer stops the video — it falls down the recovery ladder,
@@ -391,7 +394,7 @@ compute_type = "int8"
 # =============================================================================
 
 [proxy]
-# Optional proxy used by Pexels, Pixabay, Coverr, and material downloads.
+# Optional proxy used by Pexels, Pixabay, and material downloads.
 # Format: "http://<username>:<password>@<proxy>:<port>"
 # Documentation: https://requests.readthedocs.io/en/latest/user/advanced/#proxies
 # http = "http://127.0.0.1:3128"

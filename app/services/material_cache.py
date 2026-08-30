@@ -206,25 +206,6 @@ def load_material_search_cache(
     ``None`` 表示缓存未命中，需要请求远端 API；空列表不作为有效缓存返回，
     避免网络错误或上游异常被误缓存后持续阻断后续任务。
     """
-    if str(provider).strip().lower() == "coverr":
-        # Coverr 的下载地址包含绑定 API Key 的签名 JWT。它只用于当前请求，
-        # 不能进入磁盘缓存；查询相同条件时顺带删除旧版本可能留下的缓存。
-        try:
-            _remove_invalid_cache(
-                _cache_path(
-                    provider=provider,
-                    search_term=search_term,
-                    minimum_duration=minimum_duration,
-                    video_aspect=video_aspect,
-                )
-            )
-        except Exception as exc:
-            logger.warning(
-                "failed to remove disabled Coverr material search cache: "
-                f"error={type(exc).__name__}, detail={exc}"
-            )
-        return None
-
     try:
         cache_path = _cache_path(
             provider=provider,
@@ -366,9 +347,6 @@ def save_material_search_cache(
     ``os.replace`` 发布，可以保证读进程只会看到完整旧文件或完整新文件；
     即使两个写进程同时完成，最终内容也都是同一缓存键对应的合法结果。
     """
-    if str(provider).strip().lower() == "coverr":
-        return False
-
     temp_path = None
     try:
         serialized_items = []

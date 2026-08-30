@@ -130,7 +130,7 @@ Thanks to [Kimi](https://platform.kimi.ai?track_id=track-f6b0a640d35c41deb03b247
 - [x] Supports **Edge TTS**, **Azure Speech**, **SiliconFlow**, **Google Gemini**, **Xiaomi MiMo**, **ElevenLabs**, and **Chatterbox** speech synthesis with real-time previews
 - [x] Supports **subtitle generation** with configurable fonts, position, color, size, outline, and background styles
 - [x] Supports random or custom **background music** with adjustable volume
-- [x] Supports your own **local assets** and free-to-use HD footage from **Pexels**, **Pixabay**, and **Coverr**
+- [x] Supports your own **local assets** and free-to-use HD footage from **Pexels** and **Pixabay**
 - [x] Supports leading model providers including **Kimi / Moonshot AI**, **OpenAI**, **Google Gemini**, **DeepSeek**, **Alibaba Cloud Qwen**, **Microsoft Azure OpenAI**, **ByteDance VolcEngine Ark**, **xAI Grok**, **MiniMax**, and **Xiaomi MiMo**, plus unified gateways, aggregators, and local runtimes such as **Cloudflare AI Gateway**, **Alibaba ModelScope**, **AIHubMix**, **AIML API**, **EvoLink**, **Ollama**, **OneAPI**, **LiteLLM**, **Groq**, and **Pollinations AI**
 - [x] Supports one-click **cross-platform publishing** to **TikTok**, **Instagram**, and **YouTube Shorts** after video generation
 

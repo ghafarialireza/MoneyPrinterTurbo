@@ -40,9 +40,8 @@ _MIN_SEMANTIC_QA_DURATION = 4
 _STOCK_VIDEO_PROVIDER_API_KEYS: dict[str, str] = {
     "pexels": "pexels_api_keys",
     "pixabay": "pixabay_api_keys",
-    "coverr": "coverr_api_keys",
 }
-_SMART_PROVIDER_CASCADE_ORDER: tuple[str, ...] = ("pexels", "pixabay", "coverr")
+_SMART_PROVIDER_CASCADE_ORDER: tuple[str, ...] = ("pexels", "pixabay")
 # A beat that finds nothing usable is far more often phrased badly than absent
 # from the catalog, so the alternative phrasings the script stage already
 # generated are tried on the current provider before the next provider is asked.
@@ -686,8 +685,8 @@ def _matches_video_aspect(
     """
     判断远端素材是否与目标画面方向一致。
 
-    Pexels、Pixabay 和 Coverr 的响应字段并不统一，因此先使用宽高做可靠判断；
-    Coverr 部分历史响应缺少尺寸时，再使用明确的 ``is_vertical`` 布尔值兜底。
+    Pexels 和 Pixabay 的响应字段并不统一，因此先使用宽高做可靠判断；
+    部分历史响应缺少尺寸时，再使用明确的 ``is_vertical`` 布尔值兜底。
     无法确认方向的素材直接跳过，避免竖屏任务混入横屏素材并在成片中产生黑边。
     """
     aspect = VideoAspect(video_aspect)
@@ -804,7 +803,7 @@ def _filter_materials_by_aspect(
     """
     aspect = VideoAspect(video_aspect)
     if aspect == VideoAspect.square:
-        # Pixabay 和 Coverr 很少提供原生方形素材。方形输出沿用既有行为，
+        # Pixabay 很少提供原生方形素材。方形输出沿用既有行为，
         # 接受可用候选并交给视频合成阶段裁剪，避免升级后 1:1 任务无素材。
         return list(items)
 
@@ -1107,7 +1106,7 @@ def search_videos_pixabay(
             logger.error(
                 "pixabay search was blocked by a Cloudflare challenge: "
                 f"status={status_code}, cf_ray={cf_ray or 'unknown'}. "
-                "Check the server network or proxy, or use Pexels/Coverr instead."
+                "Check the server network or proxy, or use Pexels instead."
             )
             return []
 
@@ -1202,147 +1201,6 @@ def search_videos_pixabay(
         logger.error(
             "pixabay search request failed: "
             f"error={type(e).__name__}, detail={error_message}"
-        )
-
-    return []
-
-
-def search_videos_coverr(
-    search_term: str,
-    minimum_duration: int,
-    video_aspect: VideoAspect = VideoAspect.portrait,
-) -> List[MaterialInfo]:
-    """
-    Coverr (https://coverr.co) - free HD/4K stock videos,
-    subject to Coverr license terms (https://coverr.co/license).
-
-    Coverr API notes (based on official docs at api.coverr.co/docs/):
-      - 鉴权: Authorization: Bearer <api_key>
-      - 搜索端点: GET /videos?query=...,响应结构 {"hits": [...], ...}
-      - 加 ?urls=true 在搜索响应里直接返回 mp4 直链
-      - URL 是 signed JWT(绑定 API key,无过期时间)
-      - Coverr 支持通过 filter=is_vertical:true/false 筛选横竖屏素材；
-        响应返回后仍根据 max_width/max_height 或 is_vertical 做本地校验
-      - duration 字段同时存在 number 和 string 两种形态,本函数都接受
-
-    本函数使用 urls.mp4_download 字段作为下载地址 —— 按 Coverr 官方文档
-    (https://api.coverr.co/docs/videos/#download-a-video) 的说法,
-    GET 这个 URL 本身就被 Coverr 当作一次合法的 download 事件计入统计,
-    无需再调用 PATCH /videos/:id/stats/downloads。
-    """
-    aspect = VideoAspect(video_aspect)
-    api_key = get_api_key("coverr_api_keys")
-    if not api_key:
-        logger.warning(
-            "skipping coverr search because no coverr_api_keys entry is configured"
-        )
-        return []
-    headers = {"Authorization": f"Bearer {api_key}"}
-    params = {
-        "query": search_term,
-        "page_size": 20,
-        "urls": "true",
-        "sort": "popular",
-    }
-    # 服务端方向筛选可以直接从完整搜索结果中返回目标素材，避免先取热门结果再
-    # 本地过滤导致竖屏候选为空。方形素材没有对应布尔条件，继续依赖本地宽高校验。
-    if aspect == VideoAspect.portrait:
-        params["filter"] = "is_vertical:true"
-    elif aspect == VideoAspect.landscape:
-        params["filter"] = "is_vertical:false"
-    query_url = f"https://api.coverr.co/videos?{urlencode(params)}"
-    logger.info(f"searching videos on coverr: term={search_term!r}")
-
-    try:
-        r = requests.get(
-            query_url,
-            headers=headers,
-            proxies=config.proxy,
-            verify=_get_tls_verify(),
-            timeout=(30, 60),
-        )
-        response = r.json()
-        video_items: List[MaterialInfo] = []
-
-        if not isinstance(response, dict) or "hits" not in response:
-            # Naming the shape is what makes this actionable. Every coverr call in
-            # task 3f0f2b07 logged the bare "unsupported response" message, which
-            # cannot distinguish a rejected key from a changed API, so the whole
-            # provider stayed broken across runs. Only the status code and the
-            # top-level key names are logged; response values never are, because a
-            # rejected-auth body can echo the credential back.
-            logger.error(
-                "coverr video search returned an unsupported response: "
-                f"status={r.status_code}, "
-                f"type={type(response).__name__}, "
-                f"keys={sorted(response)[:6] if isinstance(response, dict) else 'n/a'}"
-            )
-            return video_items
-
-        for v in response["hits"]:
-            # duration 在不同响应里可能是 number(11.625) 或 string("10.500000")
-            try:
-                duration = int(float(v.get("duration") or 0))
-            except (TypeError, ValueError):
-                continue
-            if duration < minimum_duration:
-                continue
-
-            video_id = v.get("id")
-            mp4_download_url = (v.get("urls") or {}).get("mp4_download")
-            if not video_id or not mp4_download_url:
-                continue
-            if aspect != VideoAspect.square and not _matches_video_aspect(
-                v.get("max_width"),
-                v.get("max_height"),
-                aspect,
-                is_vertical=v.get("is_vertical"),
-            ):
-                continue
-
-            try:
-                source_width = int(float(v.get("max_width")))
-                source_height = int(float(v.get("max_height")))
-            except (TypeError, ValueError):
-                source_width = None
-                source_height = None
-
-            item = MaterialInfo()
-            item.provider = "coverr"
-            item.url = mp4_download_url
-            item.duration = duration
-            item.provider_asset_id = str(video_id)
-            item.preview_url = _safe_public_url(
-                v.get("poster") or v.get("thumbnail")
-            )
-            item.width = source_width
-            item.height = source_height
-            item.orientation = _orientation_from_dimensions(item.width, item.height)
-            item.rendition_id = "mp4_download"
-            item.search_query = search_term
-            item.query_attempt = 1
-            item.source_page_url = _safe_public_url(
-                v.get("canonical_url") or v.get("url")
-            )
-            item.source_info = {
-                "provider": "coverr",
-                "search_term": search_term,
-                "asset_id": str(video_id),
-                "provider_asset_id": str(video_id),
-                "source_page": item.source_page_url,
-                "creator": _creator_info(v.get("creator") or v.get("author")),
-                "rendition": {
-                    "id": "mp4_download",
-                    "width": source_width,
-                    "height": source_height,
-                },
-            }
-            video_items.append(item)
-        return video_items
-    except Exception as e:
-        logger.error(
-            "coverr video search failed: "
-            f"error={type(e).__name__}, detail={_redact_request_error(e, api_key)}"
         )
 
     return []
@@ -1467,7 +1325,7 @@ def _search_videos_with_cache(
             return material_cache.load_material_search_cache(**cache_args)
         except Exception as exc:
             # 缓存是可选优化，任何缓存实现异常都必须按未命中处理，不能阻断
-            # Pexels、Pixabay 或 Coverr 的正常远端搜索。
+            # Pexels 或 Pixabay 的正常远端搜索。
             logger.warning(
                 "material search cache read failed, continue with remote search: "
                 f"provider={provider}, error={type(exc).__name__}, detail={exc}"
@@ -1596,6 +1454,32 @@ def is_requirement_rewrite_enabled() -> bool:
     return bool(value)
 
 
+def is_cross_group_merge_enabled() -> bool:
+    """Allow the merge rescue to cross a semantic group boundary.
+
+    The merge rung was written when a span reliably split into several shots, so
+    an unfillable beat almost always had a sibling of its own group beside it.
+    Since the span grouper began emitting one single-event requirement per span,
+    most spans are short enough to be a single beat — so most beats are the only
+    shot of their group, no same-group neighbour exists, and the rescue that was
+    meant to be the last rung before failure could not fire at all. A measured
+    render lost its whole video to exactly that: the beat that failed was solo.
+
+    Crossing the boundary is sound because the boundary is not a subject change.
+    Spans are consecutive slices of one narration, so the neighbouring span
+    describes the adjacent moment of the same story, and the absorbed window is
+    covered by a clip that was verified against a requirement one moment away
+    rather than the same moment. That is a visibly weaker rescue than a same-group
+    merge, which is why a same-group neighbour is always preferred, the merged
+    beat records a distinct duration policy, and this is switchable: turning it off
+    restores failing the video whenever the unfillable beat is solo.
+    """
+    value = config.app.get("smart_material_cross_group_merge", True)
+    if isinstance(value, str):
+        return value.strip().lower() not in ("0", "false", "no", "off")
+    return bool(value)
+
+
 def analysis_budget_per_selection_round(candidate_limit: int) -> int:
     """How many stock candidates one selection round may pay to analyze.
 
@@ -1706,15 +1590,17 @@ def _effective_round_budget(
 
 
 def max_merged_beats_per_video(beat_count: int) -> int:
-    """How many unfillable beats may be absorbed by a sibling before the video fails.
+    """How many unfillable beats a neighbour may absorb before the video fails.
 
     Merging is the last rung of the per-beat failure ladder: when no provider,
-    phrasing, or rewritten requirement can fill a beat, a sibling shot of the same
-    semantic group takes over its window. That costs nothing at the video model and
-    keeps the narration timeline intact, but every merge removes a cut, so a video
-    that merged most of its beats is no longer the edit that was planned. The
-    default therefore allows a third of the beats — enough to survive a handful of
-    unlucky requirements, not enough to quietly collapse a 14-shot edit into three.
+    phrasing, or rewritten requirement can fill a beat, a neighbouring shot takes
+    over its window — a sibling of the same semantic group where one exists, and
+    otherwise the shot of the adjacent group beside it. That costs nothing at the
+    video model and keeps the narration timeline intact, but every merge removes a
+    cut, so a video that merged most of its beats is no longer the edit that was
+    planned. The default therefore allows a third of the beats — enough to survive a
+    handful of unlucky requirements, not enough to quietly collapse a 14-shot edit
+    into three.
 
     An absent setting means that default, an explicit ``0`` disables merging and
     restores the previous behavior of failing the video on the first unfillable
@@ -1803,8 +1689,6 @@ def smart_provider_chain(source: str) -> list[str]:
 def _remote_search_function(provider: str) -> Callable[..., List[MaterialInfo]]:
     if provider == "pixabay":
         return search_videos_pixabay
-    if provider == "coverr":
-        return search_videos_coverr
     return search_videos_pexels
 
 
@@ -1992,6 +1876,10 @@ class _SmartProviderAttempt:
     source_seconds_analyzed: float = 0.0
     segmentation_calls: int = 0
     had_candidates: bool = False
+    # The provider's own relevance ranking put nothing near the gate. Rewording
+    # the same concept re-searches the same catalog and buys the same pool, so
+    # the caller stops spending phrasings here and escalates instead.
+    unrelated_footage: bool = False
     # Assets this attempt already paid a verdict for. The next phrasing of the
     # same item must not buy the same verdict twice.
     evaluated_identities: list[tuple[str, str]] = dataclass_field(default_factory=list)
@@ -2235,6 +2123,7 @@ def _attempt_smart_provider_selection(
         )
     attempt.candidates_analyzed = int(stats["api_candidates_analyzed"])
     attempt.source_seconds_analyzed = float(stats["source_seconds_analyzed"])
+    attempt.unrelated_footage = bool(stats.get("unrelated_footage"))
     run["candidate_evaluations"] = stats.get("candidate_evaluations", [])
     # Only the candidates that actually reached a verdict are reported back. The
     # tail this attempt never looked at stays available to the next phrasing,
@@ -2437,6 +2326,21 @@ def _select_smart_item_winner(
                 # candidate, so neither another phrasing nor another provider
                 # can improve the result.
                 provider_settled = True
+                break
+            if attempt.unrelated_footage:
+                # This catalog's own ranking says it holds nothing close. Another
+                # phrasing of the same concept re-searches the same catalog and
+                # buys the same pool, so the remaining phrasings are skipped and
+                # the next provider -- a genuinely different catalog -- gets its
+                # turn instead. The requirement rewrite above still runs, and it
+                # is the rung that can actually change the concept.
+                logger.warning(
+                    "stock provider footage was uniformly unrelated; skipping the "
+                    "remaining phrasings on this provider: "
+                    f"{item_log_name}={visual_item.index}, "
+                    f"provider={provider_name}, query={item_query!r}, "
+                    f"skipped_phrasings={len(item_queries) - query_position - 1}"
+                )
                 break
             if query_position + 1 < len(item_queries):
                 logger.warning(
@@ -2702,7 +2606,7 @@ def _download_smart_winner(
     own source window, so segmentation stays winner-only.
 
     ``visual_item`` is the item the window is being cut for, which is not always
-    the item the analysis was bought for: a merged beat reuses a sibling's already
+    the item the analysis was bought for: a merged beat reuses a neighbour's already
     approved asset and asks only for a longer window out of it.
     """
     result = _SmartDownloadResult()
@@ -2817,7 +2721,7 @@ class _SmartItemOutcome:
     meant the first unfillable item had to fail the whole video: there was nowhere
     to record "this one is still open" and nothing left to reconsider. Keeping one
     outcome per item instead lets an unfillable item stay open long enough for a
-    sibling shot to absorb its window.
+    neighbouring shot to absorb its window.
     """
 
     visual_item: OrderedVisualItem
@@ -2843,7 +2747,7 @@ def _records_from_outcomes(
 ) -> list[dict[str, Any]]:
     """Persisted source records for the items that actually reached the timeline.
 
-    An item that is still open, or that a sibling absorbed, contributes no clip and
+    An item that is still open, or that a neighbour absorbed, contributes no clip and
     therefore no record — so ``material_sources`` stays one record per rendered
     beat even when the timeline no longer matches the plan.
     """
@@ -2876,20 +2780,29 @@ def _beats_are_adjacent(earlier: VisualBeat, later: VisualBeat) -> bool:
     )
 
 
-def _has_mergeable_sibling(beats: Sequence[VisualBeat], position: int) -> bool:
+def _has_mergeable_neighbour(beats: Sequence[VisualBeat], position: int) -> bool:
     """Whether the beat at ``position`` could ever be absorbed by a neighbour.
 
     This reads the planned timeline only, so it costs nothing and is allowed to be
-    optimistic: the sibling it finds may itself turn out to be unfillable. Its job
+    optimistic: the neighbour it finds may itself turn out to be unfillable. Its job
     is to stop a run from paying for every remaining beat when the beat that just
-    failed is the only shot of its group and could never have been rescued.
+    failed could never have been rescued.
+
+    A same-group neighbour always qualifies. A neighbour from the adjacent group
+    qualifies only while cross-group merging is enabled, and that is what keeps a
+    beat which is the only shot of its own group from failing the whole video —
+    the common shape now that most spans produce a single beat. The two are
+    deliberately checked with the same adjacency rule, so this stays a pure
+    timeline read that agrees with what ``_adjacent_merge_survivors`` will later
+    accept.
     """
     beat = beats[position]
+    cross_group = is_cross_group_merge_enabled()
     for other_position in (position - 1, position + 1):
         if not 0 <= other_position < len(beats):
             continue
         other = beats[other_position]
-        if other.semantic_group_id != beat.semantic_group_id:
+        if other.semantic_group_id != beat.semantic_group_id and not cross_group:
             continue
         if _beats_are_adjacent(other, beat) or _beats_are_adjacent(beat, other):
             return True
@@ -2914,6 +2827,14 @@ def _merged_visual_beat(survivor: VisualBeat, absorbed: VisualBeat) -> VisualBea
     alternative to inheriting is another paid selection round for a beat whose own
     requirement has already been established as unfillable, or failing the video
     over one shot.
+
+    The duration policy distinguishes the two strengths of that rescue. Absorbing
+    a shot of the survivor's own semantic group means the covering clip was
+    verified against a requirement written for the same span; absorbing a beat
+    from a neighbouring group means it was verified against the adjacent moment of
+    the narration instead. Both are honest, one is weaker, and a report reading
+    the timeline afterwards can tell them apart without consulting the merge
+    records.
     """
     first, second = (
         (survivor, absorbed)
@@ -2943,7 +2864,18 @@ def _merged_visual_beat(survivor: VisualBeat, absorbed: VisualBeat) -> VisualBea
         ),
         start_unit=min(start_units) if start_units else None,
         end_unit_exclusive=max(end_units) if end_units else None,
-        duration_policy="unfillable_beat_merged",
+        duration_policy=(
+            "unfillable_beat_cross_group_merged"
+            if (
+                survivor.semantic_group_id != absorbed.semantic_group_id
+                # A survivor can absorb on both sides, so the policy names the
+                # weakest claim any of those absorptions made. Without this, a
+                # same-group merge landing after a cross-group one would upgrade a
+                # beat that is still covering a neighbouring group's window.
+                or survivor.duration_policy == "unfillable_beat_cross_group_merged"
+            )
+            else "unfillable_beat_merged"
+        ),
         rapid_cut=(
             duration < VISUAL_BEAT_RAPID_CUT_SECONDS - _MERGE_TIME_TOLERANCE_SECONDS
         ),
@@ -2995,17 +2927,32 @@ def _adjacent_merge_survivors(
     outcomes: Sequence[_SmartItemOutcome],
     position: int,
 ) -> list[_SmartItemOutcome]:
-    """Filled same-group neighbours that touch the open beat, previous side first.
+    """Filled neighbours that touch the open beat, previous side first.
 
     Only the nearest neighbour on each side is considered, and an already absorbed
     outcome is looked straight through, so a run of consecutive open beats can
     still collapse into one survivor: the first merge extends that survivor's
     window until it reaches the next open beat.
+
+    The order is load-bearing rather than incidental. The caller ranks the two
+    sides by the room left in their assets and only leaves this order when one
+    side is roomier by a margin that could change a cut, so a previous-side
+    neighbour absorbs whenever the two sides are effectively equal.
+
+    Same-group neighbours are returned alone whenever any exists, and neighbours
+    from an adjacent group are offered only when none does. That ordering is the
+    whole safety of cross-group merging: the caller picks the survivor with the
+    most room left in its asset, so without this separation a cross-group clip with
+    a long asset could outbid a same-group clip that describes the very same
+    moment. Cross-group neighbours are skipped entirely while the feature is off,
+    which restores the previous behaviour exactly.
     """
     beat = outcomes[position].beat
     if beat is None:
         return []
-    survivors: list[_SmartItemOutcome] = []
+    same_group: list[_SmartItemOutcome] = []
+    cross_group: list[_SmartItemOutcome] = []
+    allow_cross_group = is_cross_group_merge_enabled()
     for step in (-1, 1):
         other_position = position + step
         while 0 <= other_position < len(outcomes):
@@ -3017,16 +2964,66 @@ def _adjacent_merge_survivors(
             if (
                 other.filled
                 and other_beat is not None
-                and other_beat.semantic_group_id == beat.semantic_group_id
                 and (
                     _beats_are_adjacent(other_beat, beat)
                     if step < 0
                     else _beats_are_adjacent(beat, other_beat)
                 )
             ):
-                survivors.append(other)
+                if other_beat.semantic_group_id == beat.semantic_group_id:
+                    same_group.append(other)
+                elif allow_cross_group:
+                    cross_group.append(other)
             break
-    return survivors
+    return same_group or cross_group
+
+
+def _pick_merge_survivor(
+    survivors: Sequence[_SmartItemOutcome],
+    open_beat: VisualBeat,
+    normalized_speed: float,
+) -> _SmartItemOutcome:
+    """Choose which bordering shot absorbs the open beat's window.
+
+    ``survivors`` arrives previous side first and holds at most two candidates.
+    The survivor is the one with the most room left in its asset, because that is
+    the clip that can be cut wider to cover the combined window without being
+    re-selected — but "most room" only decides when the difference is real. Each
+    side's merged window is the same length, yet one is measured as this beat's end
+    minus the previous beat's start and the other as the next beat's end minus this
+    beat's start, so the two headrooms routinely differ by a rounding error of about
+    1e-15 seconds. Comparing them raw let that noise pick the survivor, and the
+    later shot won every genuinely tied contest. So the previous side is kept unless
+    a challenger is roomier by more than _MERGE_TIME_TOLERANCE_SECONDS — a
+    microsecond of extra footage cannot change a cut, and preferring the previous
+    side keeps the rewritten timeline in index order, since a survivor keeps its own
+    index and absorbing forwards is what leaves the indexes ascending.
+
+    A candidate that has lost its approved clip scores -inf, so it loses to any real
+    neighbour and is only ever returned when it is the sole survivor — where the
+    caller turns it into the same refusal it would have raised anyway.
+    """
+
+    def _headroom(candidate: _SmartItemOutcome) -> float:
+        candidate_beat = candidate.beat
+        candidate_winner = candidate.winner
+        if candidate_beat is None or candidate_winner is None:
+            return float("-inf")
+        merged = _merged_visual_beat(candidate_beat, open_beat)
+        needed = required_source_duration_for_timeline(
+            merged.duration,
+            normalized_speed,
+        )
+        return float(candidate_winner.duration) - needed
+
+    survivor = survivors[0]
+    survivor_headroom = _headroom(survivor)
+    for challenger in survivors[1:]:
+        challenger_headroom = _headroom(challenger)
+        if challenger_headroom > survivor_headroom + _MERGE_TIME_TOLERANCE_SECONDS:
+            survivor = challenger
+            survivor_headroom = challenger_headroom
+    return survivor
 
 
 def _restamp_merged_source(
@@ -3071,15 +3068,20 @@ def _merge_unfillable_beats(
     item_name: str,
     item_log_name: str,
 ) -> _MergeResolution:
-    """Let a sibling shot absorb the window of a beat nothing could fill.
+    """Let a neighbouring shot absorb the window of a beat nothing could fill.
 
     This is the last rung before the video fails, and it is deliberately the
-    cheapest one: sibling shots of a semantic group share a requirement, so the
-    neighbour's clip was already approved for exactly the thing the open beat was
-    asking for. Extending that clip's source window therefore buys no analysis and
-    no tokens — only a new window out of footage that already passed. A fresh
-    selection round is run only when the neighbour's asset is simply too short to
-    cover both beats.
+    cheapest one: a neighbour's clip has already been verified against a
+    requirement drawn from the adjacent stretch of the same narration, so
+    extending that clip's source window buys no analysis and no tokens — only a
+    new window out of footage that already passed. A fresh selection round is run
+    only when the neighbour's asset is simply too short to cover both beats.
+
+    A sibling shot of the open beat's own semantic group is always preferred,
+    because it was written for the same moment. A neighbour from the adjacent group
+    is accepted only when no such sibling exists, which is the ordinary case now
+    that most spans yield a single beat, and is the difference between one weaker
+    cut and no video at all.
 
     ``video_budget_exhausted`` marks the video as out of analysis money. It only
     disables that fresh selection round; the free window extension is unaffected,
@@ -3103,8 +3105,8 @@ def _merge_unfillable_beats(
                 }
             )
             result.failures.append(
-                f"{item_name} {beat.index} could not be absorbed by a sibling "
-                f"shot: {reason}"
+                f"{item_name} {beat.index} could not be absorbed by a "
+                f"neighbouring shot: {reason}"
             )
 
         if result.merged >= merge_ceiling:
@@ -3123,26 +3125,11 @@ def _merge_unfillable_beats(
         if not survivors:
             _refuse(
                 "MERGE_NEIGHBOUR_UNAVAILABLE",
-                "no filled shot of the same semantic group borders it",
+                "no filled shot borders it in the rewritten timeline",
             )
             continue
 
-        # Both sides can qualify. The one with more room left in its asset is the
-        # one that can cover the combined window without being re-selected, and
-        # max() keeps the first of equals, which is the previous beat.
-        def _headroom(candidate: _SmartItemOutcome) -> float:
-            candidate_beat = candidate.beat
-            candidate_winner = candidate.winner
-            if candidate_beat is None or candidate_winner is None:
-                return float("-inf")
-            merged = _merged_visual_beat(candidate_beat, beat)
-            needed = required_source_duration_for_timeline(
-                merged.duration,
-                normalized_speed,
-            )
-            return float(candidate_winner.duration) - needed
-
-        survivor = max(survivors, key=_headroom)
+        survivor = _pick_merge_survivor(survivors, beat, normalized_speed)
         survivor_beat = survivor.beat
         survivor_winner = survivor.winner
         if survivor_beat is None or survivor_winner is None:
@@ -3248,10 +3235,16 @@ def _merge_unfillable_beats(
         survivor.absorbed_indexes = [*survivor.absorbed_indexes, beat.index]
         outcome.absorbed_by = merged_beat.index
         result.merged += 1
+        merge_scope = (
+            "same_semantic_group"
+            if survivor_beat.semantic_group_id == beat.semantic_group_id
+            else "adjacent_semantic_group"
+        )
         logger.warning(
-            "no material could fill a visual beat, so a sibling shot absorbed its "
-            f"window: {item_log_name}={beat.index}, "
-            f"merged_into={merged_beat.index}, fill={merge_fill}, "
+            "no material could fill a visual beat, so a neighbouring shot absorbed "
+            f"its window: {item_log_name}={beat.index}, "
+            f"merged_into={merged_beat.index}, scope={merge_scope}, "
+            f"fill={merge_fill}, "
             f"merged_duration={required_target_duration:.3f}s"
         )
         merge_record = {
@@ -3262,6 +3255,11 @@ def _merge_unfillable_beats(
             "merged_into_visual_item_index": merged_beat.index,
             "merged_target_duration": round(required_target_duration, 3),
             "merge_fill": merge_fill,
+            # Which shot absorbed it: one written for the same span, or the
+            # narration's next moment. Recorded on every merge rather than only the
+            # crossing ones so a report can count the two strengths of rescue
+            # without inferring anything from an absent key.
+            "merge_scope": merge_scope,
             "reason": "; ".join(outcome.failures)[:240],
         }
         # Shots of one split span carry requirements of their own, so the clip now
@@ -3313,10 +3311,10 @@ def _reselect_for_merged_beat(
 ) -> _MergeReselection:
     """Search once for a clip long enough to cover a merged window.
 
-    Only reached when the sibling's approved asset is shorter than the combined
-    beats need. The requirement is unchanged — it is the group's own, which both
-    beats already shared — so this is one ordinary selection round asking for a
-    longer clip, not a new reading of the narration.
+    Only reached when the survivor's approved asset is shorter than the combined
+    beats need. The requirement is unchanged — it is the survivor's own, the one its
+    existing clip was already approved for — so this is one ordinary selection round
+    asking for a longer clip, not a new reading of the narration.
     """
     result = _MergeReselection(requirement=merged_beat.visual_requirement)
     requirement_spec = resolved_specs.get(
@@ -3420,7 +3418,7 @@ def _download_videos_by_script_order_smart(
     """Select one best candidate for each generic ordered slot or beat.
 
     ``merged_beats_out`` is how a rewritten timeline gets back to the caller. It is
-    filled only when an unfillable beat was absorbed by a sibling shot, because
+    filled only when an unfillable beat was absorbed by a neighbouring shot, because
     that is the only case where the beats the renderer must use are no longer the
     beats that were passed in. Left empty, the caller's own timeline still holds.
     """
@@ -3721,7 +3719,7 @@ def _download_videos_by_script_order_smart(
             """Keep this item open for a merge, or report that the video is lost.
 
             An item stays open only while a merge could still rescue it: within the
-            merge ceiling, and with a sibling shot bordering it in the planned
+            merge ceiling, and with a filled shot bordering it in the planned
             timeline. Otherwise the run stops here rather than paying full price for
             every remaining item of a video that is already lost.
             """
@@ -3732,11 +3730,11 @@ def _download_videos_by_script_order_smart(
             if (
                 merge_beats
                 and open_items <= merge_ceiling
-                and _has_mergeable_sibling(merge_beats, item_position)
+                and _has_mergeable_neighbour(merge_beats, item_position)
             ):
                 logger.warning(
                     "no material could fill a visual item; leaving it open for a "
-                    f"sibling shot to absorb: {item_log_name}={visual_item.index}, "
+                    f"neighbouring shot to absorb: {item_log_name}={visual_item.index}, "
                     f"open={open_items}, ceiling={merge_ceiling}"
                 )
                 return True
@@ -3789,7 +3787,7 @@ def _download_videos_by_script_order_smart(
 
         if not download.video_path or download.winner is None:
             # A verified item whose every approved candidate failed to transfer is
-            # just as open as one nothing could verify, and a sibling can absorb it
+            # just as open as one nothing could verify, and a neighbour can absorb it
             # on the same terms.
             _leave_open(download.failures)
             continue

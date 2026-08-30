@@ -291,9 +291,6 @@
     "LLM Connection Test Succeeded": "Koneksi berhasil: {provider} / {model} ({elapsed} dtk)",
     "LLM Connection Test Failed": "Koneksi gagal: {error}",
     "Video Source Settings": "**Pengaturan Sumber Video**",
-    "Coverr": "Coverr",
-    "Coverr API Key": "Kunci API Coverr ([Dapatkan Kunci API](https://coverr.co/developers?ctx=header_navigation))",
-    "Please Enter the Coverr API Key": "Silakan Masukkan **Kunci API Coverr**",
     "Video Encoder": "Encoder Video",
     "Default Video Encoder": "Default (Direkomendasikan)",
     "Video Encoder Help": "Opsi lanjutan. Default mengikuti kebijakan encoder stabil aplikasi, saat ini libx264. Jika encoder perangkat keras tidak tersedia, aplikasi otomatis kembali ke libx264."

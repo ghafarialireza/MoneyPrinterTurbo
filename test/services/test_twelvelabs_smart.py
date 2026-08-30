@@ -477,6 +477,115 @@ class TestSmartTwelveLabsSelection(unittest.TestCase):
         self.assertEqual(stats["critical_gate_rejections"], 5)
         self.assertFalse(stats["early_stopped"])
 
+    def test_uniformly_unrelated_footage_stops_before_the_next_batch(self):
+        # The beat-level waste came from grinding through every page of a catalog
+        # that never held the concept. One ranked list peaking far below the gate
+        # is enough evidence: the pages behind it are ranked lower still.
+        candidates = [_candidate(index) for index in range(1, 11)]
+
+        with patch.object(
+            twelvelabs,
+            "evaluate_candidate",
+            side_effect=lambda **kwargs: _evaluation(0.2, accepted=False),
+        ) as analyze:
+            winner, stats = twelvelabs.select_best_candidate(
+                candidates=candidates,
+                slot_index=1,
+                slot_duration=4,
+                narration_text="narration",
+                search_query="query",
+                requirement_spec=_requirement_spec("narration"),
+                batch_size=5,
+                max_candidates=15,
+                minimum_score=0.7,
+                concurrency=5,
+            )
+
+        self.assertIsNone(winner)
+        self.assertEqual(analyze.call_count, 5)
+        self.assertTrue(stats["unrelated_footage"])
+        self.assertTrue(stats["early_stopped"])
+        self.assertEqual(stats["best_overall_score"], 0.2)
+        self.adjudicator.assert_not_called()
+
+    def test_footage_short_of_the_gate_but_close_is_still_explored(self):
+        # "Unrelated" has to mean nowhere near, not merely short. Footage this
+        # close is a wording problem, and a later page or phrasing can still win.
+        candidates = [_candidate(index) for index in range(1, 11)]
+
+        with patch.object(
+            twelvelabs,
+            "evaluate_candidate",
+            side_effect=lambda **kwargs: _evaluation(0.6, accepted=False),
+        ) as analyze:
+            _, stats = twelvelabs.select_best_candidate(
+                candidates=candidates,
+                slot_index=1,
+                slot_duration=4,
+                narration_text="narration",
+                search_query="query",
+                requirement_spec=_requirement_spec("narration"),
+                batch_size=5,
+                max_candidates=15,
+                minimum_score=0.7,
+                concurrency=5,
+            )
+
+        self.assertEqual(analyze.call_count, 10)
+        self.assertFalse(stats["unrelated_footage"])
+
+    def test_a_thin_sample_is_never_called_unrelated(self):
+        candidates = [_candidate(index) for index in range(1, 3)]
+
+        with patch.object(
+            twelvelabs,
+            "evaluate_candidate",
+            side_effect=lambda **kwargs: _evaluation(0.1, accepted=False),
+        ) as analyze:
+            _, stats = twelvelabs.select_best_candidate(
+                candidates=candidates,
+                slot_index=1,
+                slot_duration=4,
+                narration_text="narration",
+                search_query="query",
+                requirement_spec=_requirement_spec("narration"),
+                batch_size=5,
+                max_candidates=15,
+                minimum_score=0.7,
+                concurrency=5,
+            )
+
+        self.assertEqual(analyze.call_count, 2)
+        self.assertFalse(stats["unrelated_footage"])
+
+    def test_a_provider_failure_is_never_reported_as_unrelated_footage(self):
+        # Zero scores from a quota error mean the observation never happened.
+        # Reading that as "the catalog lacks this concept" would retire a
+        # perfectly findable requirement on the strength of a billing problem.
+        candidates = [_candidate(index) for index in range(1, 11)]
+
+        def evaluate(**kwargs):
+            result = _evaluation(0.0, accepted=False)
+            result["reason"] = "TwelveLabs quota exceeded"
+            return result
+
+        with patch.object(twelvelabs, "evaluate_candidate", side_effect=evaluate):
+            _, stats = twelvelabs.select_best_candidate(
+                candidates=candidates,
+                slot_index=1,
+                slot_duration=4,
+                narration_text="narration",
+                search_query="query",
+                requirement_spec=_requirement_spec("narration"),
+                batch_size=5,
+                max_candidates=15,
+                minimum_score=0.7,
+                concurrency=5,
+            )
+
+        self.assertFalse(stats["unrelated_footage"])
+        self.assertEqual(stats["api_failure_reason"], "TwelveLabs quota exceeded")
+
     def test_strong_first_batch_evaluates_all_five_then_stops(self):
         candidates = [_candidate(index) for index in range(1, 11)]
         scores = {str(index): 0.75 for index in range(1, 11)}
@@ -2034,7 +2143,6 @@ class TestSmartProviderCascade(unittest.TestCase):
         keys = {
             "pexels_api_keys": ["pexels-key"],
             "pixabay_api_keys": ["pixabay-key"],
-            "coverr_api_keys": ["coverr-key"],
             "smart_material_provider_cascade": True,
         }
         keys.update(overrides)
@@ -2044,22 +2152,21 @@ class TestSmartProviderCascade(unittest.TestCase):
         with patch.dict(config.app, self._keys()):
             self.assertEqual(
                 material.smart_provider_chain("pixabay"),
-                ["pixabay", "pexels", "coverr"],
+                ["pixabay", "pexels"],
             )
             self.assertEqual(
                 material.smart_provider_chain("pexels"),
-                ["pexels", "pixabay", "coverr"],
+                ["pexels", "pixabay"],
             )
-            self.assertEqual(
-                material.smart_provider_chain("coverr"),
-                ["coverr", "pexels", "pixabay"],
-            )
+            # Coverr was retired as a paid provider and is no longer a
+            # searchable stock source, so it never enters the cascade.
+            self.assertEqual(material.smart_provider_chain("coverr"), [])
 
     def test_providers_without_an_api_key_are_skipped(self):
         with patch.dict(config.app, self._keys(pixabay_api_keys=[])):
             self.assertFalse(material.provider_has_api_key("pixabay"))
             self.assertEqual(
-                material.smart_provider_chain("pexels"), ["pexels", "coverr"]
+                material.smart_provider_chain("pexels"), ["pexels"]
             )
 
     def test_cascade_without_any_key_keeps_the_selected_provider(self):
@@ -2070,10 +2177,9 @@ class TestSmartProviderCascade(unittest.TestCase):
             self._keys(
                 pexels_api_keys=[],
                 pixabay_api_keys=[],
-                coverr_api_keys=[],
             ),
         ):
-            self.assertEqual(material.smart_provider_chain("coverr"), ["coverr"])
+            self.assertEqual(material.smart_provider_chain("pexels"), ["pexels"])
 
     def test_cascade_can_be_disabled_to_pin_the_selected_provider(self):
         with patch.dict(
@@ -2083,11 +2189,12 @@ class TestSmartProviderCascade(unittest.TestCase):
             self.assertEqual(material.smart_provider_chain("pexels"), ["pexels"])
 
     def test_only_searchable_stock_providers_support_smart_matching(self):
-        for provider in ("pexels", "Pixabay", " coverr "):
+        for provider in ("pexels", "Pixabay"):
             self.assertTrue(material.supports_smart_visual_matching(provider))
-        for provider in ("", "local", "generated", None):
+        for provider in ("", "local", "generated", None, "coverr", " coverr "):
             self.assertFalse(material.supports_smart_visual_matching(provider))
         self.assertEqual(material.smart_provider_chain("local"), [])
+        self.assertEqual(material.smart_provider_chain("coverr"), [])
 
     def test_the_query_variant_cap_reads_as_a_positive_whole_number(self):
         # Both halves of the retry read this knob: the script stage decides how
@@ -3036,6 +3143,104 @@ class TestPerProviderQueryVariants(unittest.TestCase):
         )
         self.assertNotIn("query=", str(failure.exception))
         self.assertIn("provider=pexels:", str(failure.exception))
+
+    def test_uniformly_unrelated_footage_skips_this_provider_remaining_phrasings(self):
+        # Rewording is the right rung when a catalog holds the concept and the
+        # phrasing missed it. When the catalog's own ranking puts nothing close,
+        # every rewording re-searches that same catalog and buys a pool that
+        # overlaps almost completely -- which is how one beat burned ninety
+        # analyses. A different catalog is different evidence, so the cascade
+        # still moves on.
+        beat = self._beat_with_phrasings(
+            "worker digging hole",
+            "shovel breaking dry soil",
+            "hands moving wet earth",
+        )
+        searched: list[tuple[str, str]] = []
+
+        def provider_search(provider):
+            def search(**kwargs):
+                searched.append((provider, kwargs["search_term"]))
+                return [self._candidate_for(provider, kwargs["search_term"])]
+
+            return search
+
+        def select_best(**kwargs):
+            candidates = kwargs["candidates"]
+            if candidates[0].provider == "pexels":
+                return None, {
+                    **self._stats(candidates),
+                    "unrelated_footage": True,
+                }
+            candidates[0].overall_score = 0.93
+            return candidates[0], self._stats(candidates)
+
+        service = self._service(select_best)
+        paths, persist = self._select(
+            beat,
+            [
+                ("pexels", provider_search("pexels")),
+                ("pixabay", provider_search("pixabay")),
+            ],
+            service,
+        )
+
+        self.assertEqual(paths, ["D:/task/beat.mp4"])
+        self.assertEqual(
+            searched,
+            [
+                ("pexels", beat.search_queries[0]),
+                ("pixabay", beat.search_queries[0]),
+            ],
+        )
+        self.assertEqual(
+            persist.call_args.kwargs["material_sources"][0]["provider"], "pixabay"
+        )
+
+    def test_both_catalogs_unrelated_fails_after_one_phrasing_each(self):
+        # The ceiling for a concept neither catalog carries: two searches out of a
+        # possible six, and a failure that still names the phrasing it judged so
+        # the operator can tell an empty catalog from a bad wording.
+        beat = self._beat_with_phrasings(
+            "worker digging hole",
+            "shovel breaking dry soil",
+            "hands moving wet earth",
+        )
+        searched: list[tuple[str, str]] = []
+
+        def provider_search(provider):
+            def search(**kwargs):
+                searched.append((provider, kwargs["search_term"]))
+                return [self._candidate_for(provider, kwargs["search_term"])]
+
+            return search
+
+        def select_best(**kwargs):
+            candidates = kwargs["candidates"]
+            return None, {**self._stats(candidates), "unrelated_footage": True}
+
+        service = self._service(select_best)
+        with self.assertRaises(material.SmartMaterialSelectionError) as failure:
+            self._select(
+                beat,
+                [
+                    ("pexels", provider_search("pexels")),
+                    ("pixabay", provider_search("pixabay")),
+                ],
+                service,
+            )
+
+        self.assertEqual(
+            searched,
+            [
+                ("pexels", beat.search_queries[0]),
+                ("pixabay", beat.search_queries[0]),
+            ],
+        )
+        self.assertIn("provider=pexels", str(failure.exception))
+        self.assertIn("provider=pixabay", str(failure.exception))
+        self.assertIn(f"query={beat.search_queries[0]!r}", str(failure.exception))
+        self.assertNotIn(beat.search_queries[1], str(failure.exception))
 
 
 class TestApprovedAlternatePromotion(unittest.TestCase):
@@ -4105,15 +4310,18 @@ class TestPerRoundAnalysisBudget(unittest.TestCase):
 
 
 class TestUnfillableBeatMerge(unittest.TestCase):
-    """A beat nothing could fill is absorbed by a sibling shot of its own group.
+    """A beat nothing could fill is absorbed by the shot beside it.
 
     This is the last rung before the video fails, and its entire justification is
-    cost: shots of one semantic group share a requirement, so the neighbour's clip
-    was already approved for exactly what the open beat was asking for. These tests
-    hold that line. A merge normally buys one segmentation call and nothing else,
-    the timeline it leaves behind still covers the narration without a seam, and a
-    video no merge could rescue stops paying immediately instead of analyzing every
-    beat that is left.
+    cost: the neighbour's clip has already been approved for the adjacent stretch
+    of the same narration, so it is cut wider rather than replaced. A sibling of the
+    open beat's own semantic group is the strongest form of that, because the two
+    share a requirement; the shot of the next group is the weaker form, taken only
+    when no sibling exists. These tests hold both lines. A merge normally buys one
+    segmentation call and nothing else, it never reaches across a group boundary
+    while a sibling is available, the timeline it leaves behind still covers the
+    narration without a seam, and a video no merge could rescue stops paying
+    immediately instead of analyzing every beat that is left.
     """
 
     GROUP_REQUIREMENT = "Coffee beans drying in sunlight"
@@ -4147,16 +4355,20 @@ class TestUnfillableBeatMerge(unittest.TestCase):
         candidate.source_info.update({"provider": "pexels", "asset_id": asset_id})
         return candidate
 
-    def _beats(self, count, *, group_ids=None, duration=2.8):
+    def _beats(self, count, *, group_ids=None, requirements=None, duration=2.8):
         # Siblings of one semantic group share the requirement by construction in
-        # S4, which is the only reason a neighbour's approved clip can stand in.
+        # S4, which is why a sibling's approved clip can stand in unchanged. Shots
+        # of different groups do not, so ``requirements`` lets a test give the
+        # neighbouring group its own requirement and keep the cross-group cases
+        # honest about what the covering clip was actually approved for.
         group_ids = list(group_ids or [1] * count)
+        requirements = list(requirements or [self.GROUP_REQUIREMENT] * count)
         return [
             _visual_beat(
                 index=position,
                 semantic_group_id=group_ids[position - 1],
                 duration=duration,
-                requirement=self.GROUP_REQUIREMENT,
+                requirement=requirements[position - 1],
                 query=f"beans query {position}",
             )
             for position in range(1, count + 1)
@@ -4168,6 +4380,7 @@ class TestUnfillableBeatMerge(unittest.TestCase):
         beats,
         approved_queries,
         merge_ceiling=1,
+        cross_group_merge=True,
         durations=None,
         undownloadable=(),
         segment_failures_after=None,
@@ -4270,6 +4483,7 @@ class TestUnfillableBeatMerge(unittest.TestCase):
                 config.app,
                 {
                     "smart_material_max_merged_beats": merge_ceiling,
+                    "smart_material_cross_group_merge": cross_group_merge,
                     "smart_material_requirement_rewrite": False,
                     # Pinned so a local config cannot decide how much this run may
                     # analyze before the merge is even reached.
@@ -4379,6 +4593,7 @@ class TestUnfillableBeatMerge(unittest.TestCase):
                     "merged_into_visual_item_index": 1,
                     "merged_target_duration": 5.6,
                     "merge_fill": "neighbour_window_extended",
+                    "merge_scope": "same_semantic_group",
                     "reason": outcome.merges[0]["reason"],
                 }
             ],
@@ -4464,16 +4679,172 @@ class TestUnfillableBeatMerge(unittest.TestCase):
         # failed run can be diagnosed from script.json.
         self.assertEqual([record["visual_beat_index"] for record in outcome.records], [2])
 
-    def test_a_beat_with_no_sibling_of_its_own_group_is_not_kept_open(self):
+    def test_a_lone_shot_of_its_group_is_absorbed_by_the_shot_beside_it(self):
+        # The shape that made this rung necessary. Once the span grouper began
+        # emitting one single-event requirement per span, most spans became a single
+        # beat, so a beat that fails is usually the only shot of its group -- and the
+        # same-group rule meant the merge could not fire at all and the whole video
+        # was lost. A measured render died exactly here.
+        beats = self._beats(
+            3,
+            group_ids=[1, 2, 3],
+            requirements=[
+                "Coffee cherries being picked by hand",
+                self.GROUP_REQUIREMENT,
+                "Roasted beans pouring into a grinder",
+            ],
+        )
+        outcome = self._run(
+            beats=beats,
+            approved_queries={"beans query 1", "beans query 3"},
+        )
+
+        self.assertIsNone(outcome.error)
+        self.assertEqual(
+            outcome.paths, ["D:/task/beans-query-1.mp4", "D:/task/beans-query-3.mp4"]
+        )
+        self.assertEqual(len(outcome.merged), 2)
+        merged = outcome.merged[0]
+        self.assertEqual(merged.index, 1)
+        self.assertAlmostEqual(merged.start_time, 0.0)
+        self.assertAlmostEqual(merged.end_time, 5.6)
+        # The weaker rescue is labelled as such: the covering clip was verified
+        # against the adjacent moment of the narration, not this one.
+        self.assertEqual(merged.duration_policy, "unfillable_beat_cross_group_merged")
+        self.assertEqual(merged.semantic_group_id, 1)
+        self.assertEqual(merged.source_narration_slot_indexes, [1, 2])
+        # Still the cheapest rung: one clip per surviving beat, no analysis bought
+        # for the window that was absorbed.
+        self.assertEqual(outcome.service.select_best_candidate.call_count, 3)
+        self.assertEqual(
+            outcome.saved,
+            [
+                "https://videos.example/beans-query-1.mp4",
+                "https://videos.example/beans-query-3.mp4",
+            ],
+        )
+        self.assertEqual(outcome.merges[0]["merge_scope"], "adjacent_semantic_group")
+        self.assertEqual(outcome.merges[0]["merged_into_visual_item_index"], 1)
+        self.assertEqual(outcome.merges[0]["visual_requirement"], self.GROUP_REQUIREMENT)
+        # A report reading this run must not mistake the rescue for an approval of
+        # the requirement that went unfilled.
+        self.assertEqual(
+            outcome.merges[0]["merged_into_visual_requirement"],
+            "Coffee cherries being picked by hand",
+        )
+
+    def test_a_sibling_of_the_same_group_outranks_a_roomier_shot_of_the_next_group(self):
+        # Both sides border the open beat, and the survivor is otherwise chosen by
+        # how much room its asset has left -- so a long cross-group clip would win on
+        # headroom alone. The sibling was written for this very moment, so it has to
+        # win regardless.
+        beats = self._beats(3, group_ids=[1, 1, 2])
+        outcome = self._run(
+            beats=beats,
+            approved_queries={"beans query 1", "beans query 3"},
+            durations={"beans query 1": 12.0, "beans query 3": 20.0},
+        )
+
+        self.assertIsNone(outcome.error)
+        self.assertEqual(outcome.merges[0]["merged_into_visual_item_index"], 1)
+        self.assertEqual(outcome.merges[0]["merge_scope"], "same_semantic_group")
+        self.assertEqual(outcome.merged[0].duration_policy, "unfillable_beat_merged")
+        self.assertAlmostEqual(outcome.merged[0].end_time, 5.6)
+
+    def test_two_equally_roomy_neighbours_hand_the_window_to_the_previous_shot(self):
+        # Both neighbours are filled, both border the open beat, and both assets are
+        # the same length, so nothing real separates them. Their merged windows are
+        # the same length too -- but each is measured from a different pair of
+        # timeline stamps, so the two headrooms differ by a rounding error of roughly
+        # 1e-15 seconds. Ranking them raw let that noise choose, and the later shot
+        # won every time. The previous shot has to win: a survivor keeps its own
+        # index, so absorbing forwards keeps the rewritten timeline in index order.
+        outcome = self._run(
+            beats=self._beats(3),
+            approved_queries={"beans query 1", "beans query 3"},
+        )
+
+        self.assertIsNone(outcome.error)
+        self.assertEqual(outcome.merges[0]["merged_into_visual_item_index"], 1)
+        self.assertEqual([beat.index for beat in outcome.merged], [1, 3])
+        self.assertAlmostEqual(outcome.merged[0].start_time, 0.0)
+        self.assertAlmostEqual(outcome.merged[0].end_time, 5.6)
+        self.assertAlmostEqual(outcome.merged[1].start_time, 5.6)
+
+    def test_a_clearly_roomier_next_shot_absorbs_rather_than_the_previous_one(self):
+        # The tolerance that keeps rounding noise out of that choice must not harden
+        # into "always the previous shot". Both sides can cover the combined window
+        # here, but the previous asset would have only a fraction of a second to
+        # spare while the next one has plenty, and room left over is exactly what
+        # decides whether a later merge on that same survivor stays free.
+        outcome = self._run(
+            beats=self._beats(3),
+            approved_queries={"beans query 1", "beans query 3"},
+            durations={"beans query 1": 6.0, "beans query 3": 20.0},
+        )
+
+        self.assertIsNone(outcome.error)
+        self.assertEqual(outcome.merges[0]["merged_into_visual_item_index"], 3)
+        self.assertEqual(outcome.merges[0]["merge_fill"], "neighbour_window_extended")
+        self.assertEqual([beat.index for beat in outcome.merged], [1, 3])
+        # The previous shot keeps its own window untouched.
+        self.assertAlmostEqual(outcome.merged[0].end_time, 2.8)
+        self.assertEqual(outcome.merged[0].duration_policy, "semantic_original")
+        self.assertAlmostEqual(outcome.merged[1].start_time, 2.8)
+        self.assertAlmostEqual(outcome.merged[1].end_time, 8.4)
+
+    def test_a_survivor_that_crossed_a_boundary_keeps_saying_so(self):
+        # A survivor can absorb on both sides. The policy names the weakest claim any
+        # of those absorptions made, so a later same-group merge cannot quietly
+        # upgrade a beat that is already covering a neighbouring group's window.
+        beats = self._beats(3, group_ids=[2, 1, 1])
+        outcome = self._run(
+            beats=beats,
+            approved_queries={"beans query 2"},
+            merge_ceiling=2,
+        )
+
+        self.assertIsNone(outcome.error)
+        self.assertEqual(outcome.paths, ["D:/task/beans-query-2.mp4"])
+        self.assertEqual(len(outcome.merged), 1)
+        self.assertAlmostEqual(outcome.merged[0].duration, 8.4)
+        self.assertEqual(
+            [run["merge_scope"] for run in outcome.merges],
+            ["adjacent_semantic_group", "same_semantic_group"],
+        )
+        self.assertEqual(
+            outcome.merged[0].duration_policy, "unfillable_beat_cross_group_merged"
+        )
+
+    def test_a_beat_that_nothing_borders_is_refused_rather_than_guessed_at(self):
+        outcome = self._run(
+            beats=self._beats(2),
+            approved_queries=set(),
+            merge_ceiling=2,
+        )
+
+        self.assertIsNotNone(outcome.error)
+        # Both beats stayed open in the hope of a merge, and neither can rescue the
+        # other: a merge needs footage that already passed, not another open window.
+        self.assertIn("MERGE_NEIGHBOUR_UNAVAILABLE", outcome.decisions)
+        self.assertIn(
+            "no filled shot borders it in the rewritten timeline", str(outcome.error)
+        )
+        self.assertEqual(outcome.merged, [])
+        self.assertEqual(outcome.merges, [])
+        self.assertEqual(outcome.records, [])
+
+    def test_switching_off_the_cross_group_rescue_fails_the_video_instead(self):
         outcome = self._run(
             beats=self._beats(3, group_ids=[1, 2, 3]),
             approved_queries={"beans query 1", "beans query 3"},
             merge_ceiling=1,
+            cross_group_merge=False,
         )
 
         self.assertIsNotNone(outcome.error)
-        # Only a sibling of the same group shares the requirement, so a lone shot
-        # can never be absorbed and the run must not pay for beat 3 to find out.
+        # With the rescue off, a lone shot can never be absorbed, so the run must
+        # stop at the beat that failed rather than pay for beat 3 to find out.
         self.assertEqual(outcome.searches, ["beans query 1", "beans query 2"])
         self.assertEqual(outcome.merged, [])
         self.assertEqual(outcome.merges, [])
@@ -4518,7 +4889,7 @@ class TestUnfillableBeatMerge(unittest.TestCase):
         )
 
         self.assertIsNotNone(outcome.error)
-        self.assertIn("could not be absorbed by a sibling shot", str(outcome.error))
+        self.assertIn("could not be absorbed by a neighbouring shot", str(outcome.error))
         self.assertIn("MERGE_SEGMENTATION_FAILED", outcome.decisions)
         self.assertEqual(outcome.merged, [])
         self.assertEqual(outcome.merges, [])

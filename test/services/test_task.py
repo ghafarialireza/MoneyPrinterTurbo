@@ -3338,7 +3338,7 @@ class TestTaskService(unittest.TestCase):
                 playback_speed=1.0,
                 visual_beat_index=2,
                 semantic_group_id=2,
-                provider="coverr",
+                provider="pexels",
             ),
         ]
 

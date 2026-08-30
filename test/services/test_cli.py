@@ -112,10 +112,10 @@ class TestCli(unittest.TestCase):
         params = cli.build_video_params(args)
         self.assertFalse(params.subtitle_enabled)
 
-    def test_coverr_video_source_accepted(self):
-        args = cli.parse_args(["--video-subject", "test", "--video-source", "coverr"])
-        params = cli.build_video_params(args)
-        self.assertEqual(params.video_source, "coverr")
+    def test_coverr_video_source_rejected(self):
+        # Coverr was retired as a paid provider; the CLI must no longer accept it.
+        with self.assertRaises(SystemExit):
+            cli.parse_args(["--video-subject", "test", "--video-source", "coverr"])
 
     def test_build_video_params_with_script_video_and_audio_options(self):
         args = cli.parse_args(

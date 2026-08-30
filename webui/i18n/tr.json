@@ -291,9 +291,6 @@
     "Video Source Settings": "**Video Kaynağı Ayarları**",
     "Custom Audio File": "Özel Ses Dosyası",
     "Custom audio will be used directly. TTS synthesis will be skipped for this task.": "Yüklenen seslendirme doğrudan kullanılacak; otomatik seslendirme oluşturulmayacak.",
-    "Coverr": "Coverr",
-    "Coverr API Key": "Coverr API Anahtarı ([API Anahtarı Al](https://coverr.co/developers?ctx=header_navigation))",
-    "Please Enter the Coverr API Key": "Lütfen **Coverr API Anahtarını** girin",
     "Video Encoder": "Video Kodlayıcı",
     "Default Video Encoder": "Varsayılan (Önerilen)",
     "Video Encoder Help": "Gelişmiş seçenek. Varsayılan, uygulamanın kararlı kodlayıcı politikasını izler; şu anda libx264 kullanılır. Donanım kodlayıcı kullanılamıyorsa uygulama otomatik olarak libx264'e döner."

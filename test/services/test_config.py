@@ -40,7 +40,6 @@ class TestConfigPersistence:
         assert app_config["video_source"] in {
             "pexels",
             "pixabay",
-            "coverr",
             "loomloom",
             "local",
         }
