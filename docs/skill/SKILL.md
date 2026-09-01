@@ -24,7 +24,7 @@ The user only needs to provide a video topic or script. Complete installation, c
 
 ## Defaults
 
-Unless the user requests otherwise, generate one Chinese `9:16` portrait video with Pexels footage, the default Chinese Edge TTS voice, subtitles, and background music. Install MoneyPrinterTurbo under the user's home directory.
+Unless the user requests otherwise, generate one Chinese `9:16` portrait video with Pinterest footage, the default Chinese Edge TTS voice, subtitles, and background music. Install MoneyPrinterTurbo under the user's home directory. Pinterest is the default material source and needs no API key, so a first run only requires an LLM credential.
 
 ## Execution
 
@@ -99,7 +99,7 @@ Summary: Chinese portrait video with voice-over, subtitles, and background music
 
 ### Exit code 10: request credentials once
 
-`MPT_NEEDS_INPUT` includes only the required fields, recommended LLM providers and signup links, custom OpenAI-compatible requirements, and the Pexels signup link. Ask only for the listed values and do not request credentials already found in `config.toml`.
+`MPT_NEEDS_INPUT` includes only the required fields, recommended LLM providers and signup links, custom OpenAI-compatible requirements, and — only when a keyed material source such as Pexels or Pixabay was explicitly selected — that provider's signup link. Ask only for the listed values and do not request credentials already found in `config.toml`.
 
 After the user responds, rerun the same foreground command with only the required environment variables:
 
@@ -111,6 +111,8 @@ MPT_LLM_MODEL_NAME
 MPT_PEXELS_API_KEY
 ```
 
+`MPT_PEXELS_API_KEY` is only ever requested when `--video-source pexels` was passed. The default Pinterest source takes no key and is never listed here.
+
 ### Exit code 1: repair or report
 
 Use `MPT_ERROR` and `LOG_FILE` to repair a recoverable problem and retry once. Ask the user only if the repair requires a new API key. If the retry fails, report the failed stage, a short error, and the log path.
@@ -119,7 +121,7 @@ A terminal-tool path validation error is not a video-generation failure because 
 
 ## Configuration and Background Fallback
 
-The helper may read the complete local `config.toml` to reuse existing settings, but it must never print its contents. It reuses a working LLM provider automatically and validates configured Pexels keys through the authenticated My Collections endpoint before generation.
+The helper may read the complete local `config.toml` to reuse existing settings, but it must never print its contents. It reuses a working LLM provider automatically and, whenever Pexels keys are configured, validates them through the authenticated My Collections endpoint before generation, because Pexels stays in the provider cascade even when Pinterest leads it. Keys the API refuses are dropped; keys that are merely rate limited or could not be checked are kept. A refused Pexels key only stops the run when `--video-source pexels` was passed.
 
 Use background mode only if the agent platform cannot wait for a foreground process. Wait for the platform's process-completion notification without polling, then read `latest-result.json` once.
 

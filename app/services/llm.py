@@ -2695,8 +2695,21 @@ def _validated_adjudication(
             f"ignored={ignored_fact_count}"
         )
     reason = _bounded_structured_text(item.get("reason"), "adjudication reason")
+    # Same principle as the fact list above, applied to the field the comment was
+    # written about. A timestamp here is a style violation: this pipeline forbids
+    # invented time references because a fabricated "at 0:04" reads as evidence.
+    # But the reason is prose, the regex also matches ordinary phrasings such as
+    # "for the first 3 seconds", and raising discarded a decision whose fact
+    # statuses had all just been cross-checked against the supplied evidence --
+    # failing a beat over the wording of an explanation that cannot affect the
+    # verdict. The offending text is removed and the verdict is kept.
     if _TIMESTAMP_EVIDENCE_RE.search(reason):
-        raise ValueError("adjudication reason invented or repeated a timestamp")
+        stripped = _TIMESTAMP_EVIDENCE_RE.sub("[time removed]", reason).strip()
+        logger.debug(
+            "semantic adjudication reason cited a timestamp, removing it: "
+            f"candidate={candidate_id} decision={decision}"
+        )
+        reason = stripped or "adjudication reason withheld: it cited a timestamp"
     return SemanticAdjudication(
         candidate_id=candidate_id,
         decision=decision,
@@ -2964,32 +2977,68 @@ Candidates:
         )
         if parsed is None:
             return {}
-        if not isinstance(parsed, dict) or set(parsed) != {"decisions"}:
+        if not isinstance(parsed, dict) or "decisions" not in parsed:
             raise ValueError("semantic adjudication root is invalid")
         raw_decisions = parsed.get("decisions")
-        if not isinstance(raw_decisions, list) or len(raw_decisions) != len(pending):
-            raise ValueError("semantic adjudication count is invalid")
+        if not isinstance(raw_decisions, list):
+            raise ValueError("semantic adjudication decisions is not an array")
         pending_ids = {candidate["candidate_id"] for candidate in pending}
         fresh: dict[str, SemanticAdjudication] = {}
+        # Validate one record at a time and keep the ones that pass. Every
+        # candidate here has already survived the critical evidence gate, and this
+        # is the last stage before a beat is either filled or abandoned, so the
+        # unit of failure matters more than anywhere else in the pipeline: raising
+        # out of this loop returned {} for the whole batch, the caller read the
+        # empty dict as "adjudication unavailable" and marked all five UNCERTAIN,
+        # and one badly-written record therefore cost up to five verified
+        # candidates and the search phrasing behind them. Each record is checked
+        # against source_statuses independently, so one bad record says nothing
+        # about its siblings. Records that are unusable, unrequested or repeated
+        # are dropped, and the candidates left without a verdict fail closed at the
+        # caller, which is where a missing verdict is supposed to be handled.
+        discarded_items = 0
         for item in raw_decisions:
-            adjudication = _validated_adjudication(
-                item,
-                mandatory_ids=mandatory_ids,
-                source_statuses=source_statuses,
-            )
+            try:
+                adjudication = _validated_adjudication(
+                    item,
+                    mandatory_ids=mandatory_ids,
+                    source_statuses=source_statuses,
+                )
+            except Exception as exc:
+                discarded_items += 1
+                logger.warning(
+                    "discarding one unusable semantic adjudication record, "
+                    "keeping the rest of the batch: "
+                    f"error={type(exc).__name__}: {exc}"
+                )
+                continue
             if (
                 adjudication.candidate_id not in pending_ids
                 or adjudication.candidate_id in fresh
             ):
-                raise ValueError("semantic adjudication candidate id is invalid")
+                discarded_items += 1
+                logger.warning(
+                    "discarding a semantic adjudication record for an unrequested "
+                    "or repeated candidate: "
+                    f"candidate={adjudication.candidate_id}"
+                )
+                continue
             fresh[adjudication.candidate_id] = adjudication
         results.update(fresh)
-        if set(results) != set(source_statuses):
-            raise ValueError("semantic adjudication is incomplete")
-        # Written only after the whole response validated, so a partly malformed
-        # batch never leaves a verdict behind for the next run to trust. Persisting
-        # is a saving, not a result, so a failure here must never discard verdicts
-        # the caller already paid for.
+        unjudged = sorted(set(source_statuses) - set(results))
+        if unjudged or discarded_items:
+            logger.warning(
+                "semantic adjudication did not judge every candidate: "
+                f"requested={len(source_statuses)}, judged={len(results)}, "
+                f"discarded_records={discarded_items}, unjudged={unjudged}"
+            )
+        # Persist only the verdicts that validated. The batch used to be persisted
+        # all-or-nothing, which was the right rule while one bad record voided the
+        # whole batch; now that records stand alone, each stored verdict is one that
+        # passed the same evidence cross-check a cached verdict is re-checked
+        # against when it is read back, so storing it cannot smuggle anything past
+        # a later run. Persisting is a saving, not a result, so a failure here must
+        # never discard verdicts the caller already paid for.
         try:
             for candidate_id, adjudication in fresh.items():
                 digest = cache_digests.get(candidate_id)

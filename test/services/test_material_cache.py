@@ -130,6 +130,75 @@ class TestMaterialSearchCache(unittest.TestCase):
         self.assertIsNone(loaded)
         self.assertFalse(cache_path.exists())
 
+    def test_a_provider_with_short_lived_urls_gets_a_shorter_window(self):
+        """
+        Freshness belongs to the provider, because what expires is the URL.
+
+        Pinterest serves pin videos from a CDN that signs short-lived links, so a
+        day-old entry is a list of addresses that no longer resolve. The search
+        would report a hit, every download would fail, and the beat would spend
+        its analysis budget on candidates it can never fetch.
+        """
+        self.assertEqual(
+            material_cache.material_search_cache_ttl_seconds("pinterest"),
+            15 * 60,
+        )
+        for provider in ("PINTEREST", " Pinterest "):
+            self.assertEqual(
+                material_cache.material_search_cache_ttl_seconds(provider),
+                15 * 60,
+            )
+        for provider in ("pexels", "pixabay", "unknown", "", None):
+            self.assertEqual(
+                material_cache.material_search_cache_ttl_seconds(provider),
+                material_cache.MATERIAL_SEARCH_CACHE_TTL_SECONDS,
+            )
+
+    def test_the_provider_window_is_enforced_when_the_entry_is_read(self):
+        """
+        Reading applies the current window, not the one in force at write time.
+
+        Shortening a window is a correctness fix, so it has to reach entries that
+        were already written. An hour-old Pinterest entry is expired; the same age
+        is still fresh for a provider with stable URLs.
+        """
+        now = 2_000_000_000.0
+        hour_old = now - 60 * 60
+
+        for provider, expect_hit in (("pinterest", False), ("pixabay", True)):
+            with self.subTest(provider=provider):
+                material_cache.save_material_search_cache(
+                    provider=provider,
+                    search_term="nature",
+                    minimum_duration=5,
+                    video_aspect=VideoAspect.portrait,
+                    items=[self._item()],
+                )
+                cache_path = material_cache._cache_path(
+                    provider=provider,
+                    search_term="nature",
+                    minimum_duration=5,
+                    video_aspect=VideoAspect.portrait,
+                )
+                os.utime(cache_path, (hour_old, hour_old))
+
+                loaded = material_cache.load_material_search_cache(
+                    provider=provider,
+                    search_term="nature",
+                    minimum_duration=5,
+                    video_aspect=VideoAspect.portrait,
+                    now=now,
+                )
+
+                if expect_hit:
+                    self.assertIsNotNone(loaded)
+                    self.assertTrue(cache_path.exists())
+                else:
+                    self.assertIsNone(loaded)
+                    # Removed on read, so the shared cleanup pass can keep using
+                    # the default window without knowing about any provider.
+                    self.assertFalse(cache_path.exists())
+
     def test_future_dated_cache_is_removed_and_treated_as_miss(self):
         """系统时间异常时不能让未来时间戳绕过 24 小时有效期。"""
         material_cache.save_material_search_cache(

@@ -3056,14 +3056,23 @@ class TestSemanticAdjudicationCache(unittest.TestCase):
         self.assertEqual(generate.call_count, 1)
         self.assertEqual(verdicts["pexels:1"].decision, "ACCEPT")
 
-    def test_a_malformed_batch_leaves_no_verdict_behind(self):
+    def test_one_tampered_record_does_not_void_its_verified_siblings(self):
         spec = self._spec()
         good = self._candidate("pexels:1")
         bad = self._candidate(
             "pexels:2", evidence="A second angle on the same fitting."
         )
-        # One valid decision and one that tampers with the supplied status. The whole
-        # response is refused, so neither may be stored.
+        # One valid decision and one that tampers with the supplied status. Only the
+        # tampered record is refused. Every candidate that reaches adjudication has
+        # already passed the whole critical evidence gate, so voiding the batch over
+        # a sibling was the most expensive possible response to a clerical error --
+        # and an unjustified one, because each record is cross-checked against its
+        # OWN candidate's supplied statuses. What makes keeping pexels:1 safe is
+        # not trust: an ACCEPT is only permitted when every mandatory fact was
+        # already OBSERVED in the evidence the video model supplied, so the worst a
+        # confused adjudicator can do here is accept a candidate whose own evidence
+        # says it qualifies. pexels:2 simply gets no verdict, and a candidate with
+        # no verdict fails closed at the caller.
         response = self._response(
             self._decision("pexels:1"),
             self._decision("pexels:2", status="NOT_OBSERVED"),
@@ -3071,8 +3080,67 @@ class TestSemanticAdjudicationCache(unittest.TestCase):
 
         verdicts, _ = self._adjudicate(spec, [good, bad], response)
 
-        self.assertEqual(verdicts, {})
-        self.assertEqual(sorted(self.cache_dir.iterdir()), [])
+        self.assertEqual(sorted(verdicts), ["pexels:1"])
+        self.assertEqual(verdicts["pexels:1"].decision, "ACCEPT")
+        self.assertEqual(
+            sorted(path.name for path in self.cache_dir.iterdir()),
+            [f"{self._digest(spec, good)}.json"],
+        )
+
+    def test_an_unparseable_record_does_not_void_its_verified_siblings(self):
+        # The same rule for the other shape of bad record: not tampering with
+        # evidence, just not being a record at all. A model that emits one item of
+        # the wrong type says nothing about the items it got right.
+        spec = self._spec()
+        good = self._candidate("pexels:1")
+        other = self._candidate(
+            "pexels:2", evidence="A second angle on the same fitting."
+        )
+        response = json.dumps(
+            {"decisions": [self._decision("pexels:1"), "not a decision object"]}
+        )
+
+        verdicts, _ = self._adjudicate(spec, [good, other], response)
+
+        self.assertEqual(sorted(verdicts), ["pexels:1"])
+        self.assertEqual(verdicts["pexels:1"].decision, "ACCEPT")
+
+    def test_a_timestamp_in_the_reason_does_not_void_the_verdict(self):
+        # reason is prose, and the timestamp rule exists so that an invented "at
+        # 0:04" cannot read as evidence. The verdict rests on decision and on fact
+        # statuses that were both cross-checked above, so a timestamp in the
+        # explanation is a style violation and nothing more. Raising on it failed
+        # beats over wording, and the regex also matches ordinary English such as
+        # "for the first 3 seconds". The citation is removed; the verdict stands.
+        spec = self._spec()
+        candidate = self._candidate("pexels:1")
+        response = self._response(
+            self._decision(
+                "pexels:1",
+                reason="The fitting is visible for the first 3 seconds of the shot.",
+            )
+        )
+
+        verdicts, _ = self._adjudicate(spec, [candidate], response)
+
+        self.assertEqual(verdicts["pexels:1"].decision, "ACCEPT")
+        self.assertNotIn("3 seconds", verdicts["pexels:1"].reason)
+        self.assertIn("[time removed]", verdicts["pexels:1"].reason)
+
+    def test_a_verdict_for_a_candidate_nobody_asked_about_is_ignored(self):
+        # An unrequested id used to void the batch. It cannot be applied to
+        # anything, so there is nothing to do with it but drop it -- and dropping it
+        # must not cost the candidates that were asked about.
+        spec = self._spec()
+        candidate = self._candidate("pexels:1")
+        response = self._response(
+            self._decision("pexels:1"),
+            self._decision("pexels:99"),
+        )
+
+        verdicts, _ = self._adjudicate(spec, [candidate], response)
+
+        self.assertEqual(sorted(verdicts), ["pexels:1"])
 
     def test_a_verdict_survives_a_cache_that_cannot_be_written(self):
         spec = self._spec()

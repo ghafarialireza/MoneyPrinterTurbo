@@ -26,8 +26,10 @@ clip that passes on evidence is used, and the exact in-clip window that passes i
 what the renderer cuts. Everything else in the project — script generation, TTS,
 subtitles, music, upload — is upstream's and is untouched by this work.
 
-The legacy path is still present and still supported. It runs whenever smart
-matching is off, keys are missing, or the source is not a searchable provider.
+The legacy path is still present and still supported. It runs whenever smart matching
+is off, the source is not a searchable provider, or no searchable provider is ready.
+That last case is now harder to reach than it was: Pinterest needs no credential, so a
+run with no stock API keys at all still has a provider to search.
 
 ## The data chain
 
@@ -240,12 +242,39 @@ they are config-file settings by design.
 
 ## Providers
 
-Two searchable stock providers remain: Pexels, then Pixabay.
-`_STOCK_VIDEO_PROVIDER_API_KEYS` maps each to its config key and
+Three searchable video providers remain, in this order: Pinterest, then Pexels, then
+Pixabay. `_STOCK_VIDEO_PROVIDER_API_KEYS` maps each to its config key and
 `_SMART_PROVIDER_CASCADE_ORDER` fixes the order. These two constants in
 `app/services/material.py` are the single source of truth — a future provider change
 happens there and nowhere else, and `smart_provider_chain` and
 `provider_has_api_key` read from them.
+
+Pinterest leads and is the default source. It needs no credential, so its entry in
+`_STOCK_VIDEO_PROVIDER_API_KEYS` is `None` rather than a config key name, and
+`provider_has_api_key` answers membership and key presence as two separate questions:
+collapsing them would read "keyless" as "unconfigured" and drop Pinterest out of every
+chain. Because it is always ready, a task with no stock credentials at all now falls
+through to it instead of stopping.
+
+`app/services/pinterest.py` implements the search directly against the public web
+search resource, through `config.proxy` and `_get_tls_verify()` like every other
+provider call. Three properties of the source shape that module. Pin video URLs are
+signed and short-lived, so `material_cache` gives Pinterest a 15-minute cache window
+instead of the shared 24-hour one — a day-old entry would be a list of links that no
+longer resolve, and the beat would spend its budget on candidates it cannot fetch.
+Only some pins carry a direct MP4; HLS-only pins are rejected at search time because
+`save_video` is a plain GET and cannot assemble a playlist. And a pin's duration is
+reported in milliseconds, read as milliseconds unconditionally rather than guessed at
+from magnitude, because over-reporting a source duration is the one error this
+timeline cannot absorb.
+
+Renditions from Pinterest are handed to the same `_select_best_video_rendition` that
+ranks Pexels renditions, so the 720-pixel short-edge floor and the orientation gate
+cannot drift apart per provider. What Pinterest gives up in exchange for needing no
+key is licensing and cleanliness: pins are user-uploaded reposts, not licensed stock,
+and are far more likely to carry watermarks, burnt-in captions or app chrome. Nothing
+in the pipeline screens for that — the TwelveLabs gate judges content, not
+cleanliness.
 
 Coverr was removed in full because it is a paid API. Two guards remain on purpose:
 the CLI rejects `--video-source coverr`, and `smart_provider_chain("coverr")` returns
@@ -268,7 +297,7 @@ Every key below is read by the code and documented in `config.example.toml`.
 
 | Key | Meaning |
 | --- | --- |
-| `pexels_api_keys`, `pixabay_api_keys` | stock provider credentials |
+| `pexels_api_keys`, `pixabay_api_keys` | stock provider credentials (Pinterest needs none) |
 | `twelvelabs_api_keys` | vision analysis credentials |
 | `twelvelabs_clip_qa` | master switch for candidate verification |
 | `twelvelabs_clip_qa_fail_closed` | unverifiable footage fails instead of passing |

@@ -25,7 +25,7 @@ from app.models.schema import (
     VisualSlot,
     VISUAL_BEAT_RAPID_CUT_SECONDS,
 )
-from app.services import llm, material_cache, task_artifacts
+from app.services import llm, material_cache, pinterest, task_artifacts
 from app.utils import utils
 
 # Thread-safe counter for API key rotation
@@ -37,11 +37,24 @@ _MIN_SEMANTIC_QA_DURATION = 4
 # Searchable stock-video providers, in cascade order, with their config keys.
 # Smart matching walks this chain so a weak result from the preferred provider
 # can still be replaced by a stronger one instead of failing the whole task.
-_STOCK_VIDEO_PROVIDER_API_KEYS: dict[str, str] = {
+#
+# ``None`` marks a provider that needs no credential. Pinterest reads a public
+# web search resource, so there is no key to configure and nothing to rotate.
+# That is why membership and key lookup have to be two separate questions here:
+# an unknown provider and a keyless provider both produce no config key, and
+# collapsing them would drop Pinterest out of every chain it belongs in.
+_STOCK_VIDEO_PROVIDER_API_KEYS: dict[str, str | None] = {
+    "pinterest": None,
     "pexels": "pexels_api_keys",
     "pixabay": "pixabay_api_keys",
 }
-_SMART_PROVIDER_CASCADE_ORDER: tuple[str, ...] = ("pexels", "pixabay")
+_SMART_PROVIDER_CASCADE_ORDER: tuple[str, ...] = ("pinterest", "pexels", "pixabay")
+# Pinterest pages 25 pins at a time, and only some of them carry a progressive
+# MP4 at a usable size, so three pages are needed to reach a candidate count
+# comparable to one Pexels or Pixabay request. Each page is one HTTP call and
+# paging stops as soon as the limit is reached or the results run out.
+_PINTEREST_SEARCH_RESULT_LIMIT = 50
+_PINTEREST_SEARCH_MAX_PAGES = 3
 # A beat that finds nothing usable is far more often phrased badly than absent
 # from the catalog, so the alternative phrasings the script stage already
 # generated are tried on the current provider before the next provider is asked.
@@ -984,6 +997,125 @@ def _select_best_video_rendition(
     return max(ranked, key=lambda candidate: candidate[0])[1]
 
 
+def search_videos_pinterest(
+    search_term: str,
+    minimum_duration: int,
+    video_aspect: VideoAspect = VideoAspect.portrait,
+) -> List[MaterialInfo]:
+    """Search Pinterest video pins, ranked by the same gates as Pexels.
+
+    Pinterest needs no API key, so this is the one provider that is always
+    reachable. Everything that makes it usable as stock footage is enforced
+    here: ``_select_best_video_rendition`` applies the identical orientation and
+    short-edge gates the licensed providers get, and a pin whose duration cannot
+    be established is dropped rather than guessed at, because the render timeline
+    sizes a beat's window from that number.
+
+    Returning an empty list for a failure matches the interface every provider in
+    this module already has — which is exactly why the failure is logged at error
+    level with its actionable cause. The search cache refuses to store empty
+    results for the same reason, so a rate limit costs one query rather than a
+    day of falsely remembered emptiness.
+    """
+    aspect = VideoAspect(video_aspect)
+    logger.info(
+        f"searching videos on pinterest: term={search_term!r}, "
+        f"proxy_enabled={bool(config.proxy)}"
+    )
+
+    try:
+        records = pinterest.search_video_pins(
+            search_term,
+            limit=_PINTEREST_SEARCH_RESULT_LIMIT,
+            max_pages=_PINTEREST_SEARCH_MAX_PAGES,
+            proxies=config.proxy,
+            verify=_get_tls_verify(),
+        )
+    except pinterest.PinterestSearchError as exc:
+        # Pinterest is an undocumented public endpoint, so a block or a rate
+        # limit is a normal operating condition rather than an exception worth
+        # a traceback. It must still never be mistaken for an absent concept.
+        logger.error(
+            f"pinterest video search could not be completed: detail={exc}. "
+            "Smart matching continues with the next provider in the cascade."
+        )
+        return []
+    except Exception as e:
+        logger.error(
+            "pinterest video search failed: "
+            f"error={type(e).__name__}, detail={_redact_request_error(e)}"
+        )
+        return []
+
+    video_items: List[MaterialInfo] = []
+    skipped_short = 0
+    skipped_unknown_duration = 0
+    skipped_rendition = 0
+
+    for record in records:
+        duration = record.get("duration")
+        if duration is None:
+            skipped_unknown_duration += 1
+            continue
+        # Floor rather than round: a source may never be reported as longer than
+        # it is, or a beat can win a clip that cannot cover its own window.
+        duration_seconds = int(math.floor(float(duration)))
+        if duration_seconds < minimum_duration:
+            skipped_short += 1
+            continue
+
+        video = _select_best_video_rendition(record.get("renditions"), aspect)
+        if video is None:
+            skipped_rendition += 1
+            continue
+
+        w = int(video["width"])
+        h = int(video["height"])
+        provider_asset_id = record.get("pin_id")
+        source_page_url = _safe_public_url(record.get("pin_url"))
+        item = MaterialInfo()
+        item.provider = "pinterest"
+        item.url = video["link"]
+        item.duration = duration_seconds
+        item.provider_asset_id = provider_asset_id
+        item.preview_url = _safe_public_url(record.get("poster"))
+        item.width = w
+        item.height = h
+        item.orientation = _orientation_from_dimensions(w, h)
+        item.rendition_id = (
+            str(video.get("id")) if video.get("id") is not None else None
+        )
+        item.search_query = search_term
+        item.query_attempt = 1
+        item.source_page_url = source_page_url
+        item.source_info = {
+            "provider": "pinterest",
+            "search_term": search_term,
+            "asset_id": provider_asset_id,
+            "provider_asset_id": provider_asset_id,
+            "source_page": source_page_url,
+            "creator": _creator_info(record.get("creator")),
+            "rendition": {
+                "id": item.rendition_id,
+                "width": w,
+                "height": h,
+            },
+        }
+        video_items.append(item)
+
+    if records and not video_items:
+        # Worth its own line: an empty result after a successful search means the
+        # pins existed but none survived the quality gates, which is a different
+        # problem from Pinterest having nothing for the concept.
+        logger.info(
+            "pinterest returned pins but none passed the material gates: "
+            f"term={search_term!r}, pins={len(records)}, "
+            f"too_short={skipped_short}, unknown_duration={skipped_unknown_duration}, "
+            f"wrong_shape_or_resolution={skipped_rendition}"
+        )
+    return video_items
+
+
 def search_videos_pexels(
     search_term: str,
     minimum_duration: int,
@@ -1395,10 +1527,21 @@ def _search_videos_with_cache(
 
 
 def provider_has_api_key(provider: str) -> bool:
-    """Report whether a searchable stock provider has at least one API key set."""
-    cfg_key = _STOCK_VIDEO_PROVIDER_API_KEYS.get(str(provider or "").strip().lower())
-    if not cfg_key:
+    """Report whether a searchable stock provider is ready to be queried.
+
+    A provider is ready when it needs no credential or when at least one key is
+    configured for it. Those two cases have to be answered by one predicate,
+    because the cascade uses this to decide what to skip: treating a keyless
+    provider as unconfigured would silently remove Pinterest from every chain,
+    and treating an unknown provider as keyless would send searches to a provider
+    this module cannot query at all.
+    """
+    normalized = str(provider or "").strip().lower()
+    if normalized not in _STOCK_VIDEO_PROVIDER_API_KEYS:
         return False
+    cfg_key = _STOCK_VIDEO_PROVIDER_API_KEYS[normalized]
+    if cfg_key is None:
+        return True
     api_keys = config.app.get(cfg_key)
     if isinstance(api_keys, str):
         return bool(api_keys.strip())
@@ -1665,10 +1808,16 @@ def smart_provider_chain(source: str) -> list[str]:
     """Ordered providers smart matching may try for one visual beat.
 
     The provider the user picked always goes first, so a working configuration
-    keeps its current behavior. The remaining searchable providers follow in a
-    fixed order and are only reached when the earlier ones produce no candidate
-    that passes the semantic gates. Providers without a configured API key are
-    skipped instead of raising mid-timeline.
+    keeps its current behavior. The remaining searchable providers follow in the
+    fixed cascade order and are only reached when the earlier ones produce no
+    candidate that passes the semantic gates. Providers that are not ready to be
+    queried are skipped instead of raising mid-timeline.
+
+    Because Pinterest needs no credential it is always ready, so an unconfigured
+    task now falls through to it rather than stopping. The fallback below is
+    still load-bearing for the one case it cannot cover: with the cascade turned
+    off there is nothing to fall through to, and the user has to see the
+    actionable key error for the provider they actually selected.
     """
     primary = str(source or "").strip().lower()
     if primary not in _STOCK_VIDEO_PROVIDER_API_KEYS:
@@ -1681,12 +1830,14 @@ def smart_provider_chain(source: str) -> list[str]:
             if provider != primary
         )
     usable = [provider for provider in ordered if provider_has_api_key(provider)]
-    # With no key configured anywhere, keep the user's own provider so the
-    # existing actionable "api key is not set" guidance is what they see.
     return usable or [primary]
 
 
 def _remote_search_function(provider: str) -> Callable[..., List[MaterialInfo]]:
+    # Resolved through the module globals on every call so a test double patched
+    # onto one of these names is the function the cascade actually uses.
+    if provider == "pinterest":
+        return search_videos_pinterest
     if provider == "pixabay":
         return search_videos_pixabay
     return search_videos_pexels

@@ -69,7 +69,10 @@ class TestTaskArtifacts(unittest.TestCase):
 
         self.assertEqual(payload["params"]["video_subject"], "test subject")
         self.assertEqual(payload["params"]["video_terms"], ["city", "night"])
-        self.assertEqual(payload["params"]["video_source"], "pexels")
+        # The schema default leads the provider cascade, and it is the value an
+        # API caller who omits the field gets, so it belongs in the manifest a
+        # rerun is reconstructed from.
+        self.assertEqual(payload["params"]["video_source"], "pinterest")
 
     def test_patch_missing_script_is_non_blocking(self):
         """独立调用素材下载时没有任务清单，应静默跳过而不是创建残缺 JSON。"""

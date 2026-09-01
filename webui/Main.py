@@ -47,6 +47,7 @@ from app.services import (
     cache_manager,
     llm,
     loomloom,
+    material,
     twelvelabs,
     video,
     voice,
@@ -1029,7 +1030,7 @@ def _apply_pending_task_restore():
     )
 
     # 视频设置。素材上传控件不能由服务端写入，因此本地素材需要用户重新选择。
-    video_source = params.get("video_source") or "pexels"
+    video_source = params.get("video_source") or "pinterest"
     _set_stable_widget_value("video_source_select", video_source)
     _set_stable_widget_value(
         "video_concat_mode_select", params.get("video_concat_mode") or "random"
@@ -2967,13 +2968,14 @@ def _render_video_settings(panel, params):
                 (tr("Random"), "random"),
             ]
             video_sources = [
+                (tr("Pinterest"), "pinterest"),
                 (tr("Pexels"), "pexels"),
                 (tr("Pixabay"), "pixabay"),
                 (tr("Shengsuan Cloud AI Video"), "loomloom"),
                 (tr("Local file"), "local"),
             ]
 
-            saved_video_source_name = config.app.get("video_source", "pexels")
+            saved_video_source_name = config.app.get("video_source", "pinterest")
 
             params.video_source = stable_selectbox(
                 tr("Video Source"),
@@ -3028,7 +3030,11 @@ def _render_video_settings(panel, params):
                 params.match_materials_to_script,
             )
 
-            if params.video_source == "pexels":
+            # Shown for every provider smart matching can search. The panel used
+            # to be gated on Pexels alone, which hid the clip QA switch and its
+            # key field the moment another searchable provider was selected even
+            # though the selection path still honours both.
+            if material.supports_smart_visual_matching(params.video_source):
                 st.markdown(f"##### {tr('Smart TwelveLabs Visual Matching')}")
                 twelvelabs_enabled = st.checkbox(
                     tr("Enable Smart TwelveLabs Visual Matching"),
@@ -4765,6 +4771,7 @@ def _render_generation_controls(
             st.stop()
 
         if params.video_source not in [
+            "pinterest",
             "pexels",
             "pixabay",
             "loomloom",
@@ -4781,8 +4788,13 @@ def _render_generation_controls(
             st.error(tr("Please Enter the Pexels API Key"))
             st.stop()
 
+        # Asked of every provider that smart matching can search, not of Pexels
+        # alone. The clip QA gate runs inside the shared selection path, so it is
+        # reached whichever stock provider leads the cascade; keying this check to
+        # one provider name meant a Pinterest task with clip QA enabled started
+        # and then failed on the first candidate for a missing credential.
         if (
-            params.video_source == "pexels"
+            material.supports_smart_visual_matching(params.video_source)
             and params.match_materials_to_script
             and config.app.get("twelvelabs_clip_qa", False)
             and not config.app.get("twelvelabs_api_keys", "")
@@ -4954,11 +4966,13 @@ def _render_generation_controls(
         ):
             # 当用户没有重新上传文件时，复用最近一次已经保存到磁盘的本地素材列表。
             params.video_materials = []
-            for material in st.session_state["local_video_materials"]:
+            # 这里不能把循环变量命名为 material：本函数还要调用 app.services.material
+            # 模块，同名局部变量会让模块引用变成未赋值的局部变量。
+            for saved_material in st.session_state["local_video_materials"]:
                 m = MaterialInfo()
-                m.provider = material.get("provider", "local")
-                m.url = material.get("url", "")
-                m.duration = material.get("duration", 0)
+                m.provider = saved_material.get("provider", "local")
+                m.url = saved_material.get("url", "")
+                m.duration = saved_material.get("duration", 0)
                 if m.url:
                     params.video_materials.append(m)
 

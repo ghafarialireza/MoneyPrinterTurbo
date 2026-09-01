@@ -66,9 +66,20 @@ from app.utils import utils
 DEFAULT_MARENGO_MODEL = "marengo3.0"
 DEFAULT_PEGASUS_MODEL = "pegasus1.5"
 MINIMUM_SDK_VERSION = Version("1.3.0")
-# Pegasus requires max_tokens in [512, 98304]; 512 is plenty for a one-line QA.
+# Pegasus requires max_tokens in [512, 98304]. 2048 is plenty for a one-line QA
+# answer or a short list of time ranges.
 _PEGASUS_MIN_MAX_TOKENS = 2048
 _PEGASUS_TEMPORAL_MIN_MAX_TOKENS = 2048
+# The candidate evidence schema is a different scale of answer entirely: fourteen
+# required fields, six of them string arrays, plus observed_actions (objects with
+# six fields including free-text evidence) and critical_fact_evidence (one object
+# with its own evidence string per mandatory fact). A single busy scene fills that
+# well past 2048 output tokens, and the moment it does, finish_reason becomes
+# "length", the truncated JSON cannot be parsed and the candidate is discarded
+# without ever receiving a verdict. max_tokens is a ceiling and not a reservation,
+# so raising it costs nothing for the answers that already fit; it only stops the
+# long ones from being thrown away.
+_PEGASUS_CANDIDATE_MAX_TOKENS = 16384
 DEFAULT_CLIP_QA_MIN_SCORE = 0.70
 DEFAULT_CANDIDATE_BATCH_SIZE = 5
 DEFAULT_MAX_CANDIDATES_PER_SLOT = 15
@@ -748,6 +759,15 @@ _API_FAILURE_REASON_PREFIXES = (
     "TwelveLabs API error",
     "TwelveLabs API unavailable",
     "malformed TwelveLabs",
+    # "truncated" belongs here for the same reason "malformed" does, and it is
+    # listed explicitly because splitting the two reason strings apart silently
+    # dropped truncation out of this tuple: it had been matching as "malformed".
+    # A truncated answer is the strongest possible case of an observation that
+    # never happened -- the model was still writing when the budget ran out -- so
+    # counting its zero score as evidence about the footage is precisely the
+    # confusion _footage_is_unrelated documents as forbidden, and it would abandon
+    # a search phrasing on the strength of analyses that were never finished.
+    "truncated TwelveLabs",
 )
 
 
@@ -907,12 +927,21 @@ def _build_critical_gate(
     )
 
 
-def _parse_candidate_response(
+def _parse_candidate_payload(
     response: Any,
     minimum_score: float,
     requirement_spec: VisualRequirementSpec,
-) -> dict[str, Any] | None:
-    """Validate evidence-first structured JSON and compute deterministic gates."""
+) -> tuple[dict[str, Any] | None, str]:
+    """Validate evidence-first structured JSON and compute deterministic gates.
+
+    Returns the result and, when there is none, the name of the rule that
+    discarded it. Every rejection here throws away an analysis that was already
+    paid for, so "the response was malformed" on its own is not a usable report:
+    it names the outcome and hides which of two dozen checks produced it, which
+    is exactly how a token-budget bug survived unnoticed behind the same word.
+    The caller puts this rule name in the log and in the persisted run, so the
+    next unexplained discard can be counted and attributed instead of guessed at.
+    """
     if isinstance(response, dict):
         payload = response
     elif isinstance(response, str) and response.strip():
@@ -922,19 +951,32 @@ def _parse_candidate_response(
         except (TypeError, ValueError, json.JSONDecodeError):
             match = re.search(r"\{.*\}", value, re.DOTALL)
             if not match:
-                return None
+                return None, "response contained no JSON object"
             try:
                 payload = json.loads(match.group())
             except (TypeError, ValueError, json.JSONDecodeError):
-                return None
+                return None, "response was not parseable JSON"
     else:
-        return None
+        return None, "response was empty or not text"
     if not isinstance(payload, dict):
-        return None
+        return None, "response JSON was not an object"
 
     expected_fields = set(_candidate_response_schema(requirement_spec)["required"])
-    if set(payload) != expected_fields:
-        return None
+    absent_fields = expected_fields - set(payload)
+    if absent_fields:
+        return None, f"missing required fields: {','.join(sorted(absent_fields))}"
+    # Extra keys used to be fatal, by the same equality check that catches absent
+    # ones. Absent is fatal because the evidence it carried is genuinely not there;
+    # extra is not, because every field this function reads is read by name and an
+    # unrequested sibling changes none of them. Discarding a complete, correct
+    # observation over one surplus key spends a candidate, and on a beat with three
+    # phrasings it can spend the phrasing too.
+    surplus_fields = set(payload) - expected_fields
+    if surplus_fields:
+        logger.debug(
+            "TwelveLabs candidate response carried unrequested fields, ignoring them: "
+            f"fields={','.join(sorted(surplus_fields))}"
+        )
     string_lists: dict[str, list[str]] = {}
     for field in (
         "observed_subjects",
@@ -946,12 +988,12 @@ def _parse_candidate_response(
     ):
         parsed_list = _bounded_observation_strings(payload.get(field), field)
         if parsed_list is None:
-            return None
+            return None, f"{field} was not a bounded array of strings"
         string_lists[field] = parsed_list
 
     raw_actions = payload.get("observed_actions")
     if not isinstance(raw_actions, list) or len(raw_actions) > 30:
-        return None
+        return None, "observed_actions was not an array of at most 30 items"
     observed_actions: list[ObservedAction] = []
     action_fields = {
         "actor",
@@ -963,27 +1005,27 @@ def _parse_candidate_response(
     }
     for raw_action in raw_actions:
         if not isinstance(raw_action, dict) or set(raw_action) != action_fields:
-            return None
+            return None, "an observed_actions item did not carry exactly its fields"
         directness = raw_action.get("directness")
         if directness not in {
             "DIRECTLY_OBSERVED",
             "PARTIALLY_OBSERVED",
             "INFERRED",
         }:
-            return None
+            return None, f"observed_actions directness was not a known value: {directness!r}"
         cleaned_fields = {
             field: _clean_text(raw_action.get(field), 500)
             for field in action_fields - {"directness"}
         }
         if any(not value for value in cleaned_fields.values()):
-            return None
+            return None, "an observed_actions item left a required field empty"
         observed_actions.append(
             ObservedAction(directness=directness, **cleaned_fields)
         )
 
     raw_evidence = payload.get("critical_fact_evidence")
     if not isinstance(raw_evidence, list):
-        return None
+        return None, "critical_fact_evidence was not an array"
     known_fact_ids = {fact.id for fact in requirement_spec.critical_visual_facts}
     evidence_by_id: dict[str, CriticalFactEvidence] = {}
     for item in raw_evidence:
@@ -992,80 +1034,90 @@ def _parse_candidate_response(
             "status",
             "evidence",
         }:
-            return None
+            return None, (
+                "a critical_fact_evidence item did not carry exactly "
+                "fact_id, status and evidence"
+            )
         fact_id = item.get("fact_id")
         status = item.get("status")
         evidence = _clean_text(item.get("evidence"), 500)
-        if (
-            fact_id not in known_fact_ids
-            or fact_id in evidence_by_id
-            or status not in _CRITICAL_FACT_STATUSES
-            or not evidence
-        ):
-            return None
+        if fact_id not in known_fact_ids:
+            return None, f"critical_fact_evidence named an unknown fact_id: {fact_id!r}"
+        if fact_id in evidence_by_id:
+            return None, f"critical_fact_evidence repeated fact_id: {fact_id!r}"
+        if status not in _CRITICAL_FACT_STATUSES:
+            return None, f"critical_fact_evidence status was not a known value: {status!r}"
+        if not evidence:
+            return None, f"critical_fact_evidence gave no evidence text for {fact_id!r}"
         evidence_by_id[fact_id] = CriticalFactEvidence(
             fact_id=fact_id,
             status=status,
             evidence=evidence,
         )
     if set(evidence_by_id) != known_fact_ids:
-        return None
+        unjudged = ",".join(sorted(known_fact_ids - set(evidence_by_id)))
+        return None, f"critical_fact_evidence skipped facts: {unjudged}"
 
-    missing = _bounded_observation_strings(
-        payload.get("missing_required_facts"), "missing_required_facts"
-    )
-    contradictory = _bounded_observation_strings(
-        payload.get("contradictory_facts"), "contradictory_facts"
-    )
-    uncertainty = _bounded_observation_strings(
-        payload.get("uncertainty"), "uncertainty"
-    )
-    if missing is None or contradictory is None or uncertainty is None:
-        return None
+    # missing_required_facts, contradictory_facts and uncertainty are asked for in
+    # the schema and are then DERIVED here rather than read, because every one of
+    # them is a pure function of critical_fact_evidence, which has just been
+    # validated fact by fact. This used to be a three-way equality check against
+    # the model's own lists, which is a cross-check with no information in it: it
+    # could only ever catch the model restating its own evidence inconsistently,
+    # and the penalty for that clerical slip was discarding an entire billed
+    # analysis whose evidence was intact. Worse, the check was asymmetric --
+    # missing was compared against mandatory facts only while contradictory and
+    # uncertainty were compared against all facts -- so a non-mandatory fact
+    # reported as NOT_OBSERVED and listed by the model was fatal on one line and
+    # ignored on the next. Deriving cannot change any verdict that previously
+    # survived, because equality with the derived sets was the condition for
+    # surviving; it only stops the slip from costing a candidate.
     mandatory_ids = {
         fact.id for fact in requirement_spec.critical_visual_facts if fact.mandatory
     }
-    expected_missing = {
+    fact_order = [fact.id for fact in requirement_spec.critical_visual_facts]
+    missing = [
         fact_id
-        for fact_id in mandatory_ids
-        if evidence_by_id[fact_id].status == "NOT_OBSERVED"
-    }
-    expected_contradictory = {
+        for fact_id in fact_order
+        if fact_id in mandatory_ids and evidence_by_id[fact_id].status == "NOT_OBSERVED"
+    ]
+    contradictory = [
         fact_id
-        for fact_id, evidence in evidence_by_id.items()
-        if evidence.status == "CONTRADICTED"
-    }
-    expected_uncertainty = {
-        fact_id
-        for fact_id, evidence in evidence_by_id.items()
-        if evidence.status == "UNCERTAIN"
-    }
-    if (
-        set(missing) != expected_missing
-        or set(contradictory) != expected_contradictory
-        or set(uncertainty) != expected_uncertainty
-        or len(missing) != len(set(missing))
-        or len(contradictory) != len(set(contradictory))
-        or len(uncertainty) != len(set(uncertainty))
+        for fact_id in fact_order
+        if evidence_by_id[fact_id].status == "CONTRADICTED"
+    ]
+    uncertainty = [
+        fact_id for fact_id in fact_order if evidence_by_id[fact_id].status == "UNCERTAIN"
+    ]
+    for field, derived in (
+        ("missing_required_facts", missing),
+        ("contradictory_facts", contradictory),
+        ("uncertainty", uncertainty),
     ):
-        return None
+        reported = payload.get(field)
+        if isinstance(reported, list) and set(map(str, reported)) != set(derived):
+            logger.debug(
+                "TwelveLabs candidate response restated its own evidence "
+                f"inconsistently, using the derived value: field={field} "
+                f"reported={reported} derived={derived}"
+            )
 
     raw_scores = payload.get("scores")
     raw_flags = payload.get("quality_flags")
     if not isinstance(raw_scores, dict) or set(raw_scores) != set(
         _CANDIDATE_SCORE_WEIGHTS
     ):
-        return None
+        return None, "scores did not carry exactly the four scored dimensions"
     if not isinstance(raw_flags, dict) or set(raw_flags) != set(_QUALITY_FLAG_NAMES):
-        return None
+        return None, "quality_flags did not carry exactly the four flags"
     scores: dict[str, float] = {}
     for field in _CANDIDATE_SCORE_WEIGHTS:
         score = _score_component(raw_scores.get(field))
         if score is None:
-            return None
+            return None, f"score {field} was not a number between 0 and 1"
         scores[field] = round(score, 4)
     if any(not isinstance(raw_flags.get(field), bool) for field in _QUALITY_FLAG_NAMES):
-        return None
+        return None, "a quality_flags value was not a boolean"
     quality_flags = {field: raw_flags[field] for field in _QUALITY_FLAG_NAMES}
     overall_score = round(
         sum(
@@ -1113,6 +1165,20 @@ def _parse_candidate_response(
     result["eligible_for_adjudication"] = _candidate_is_rank_eligible(
         result, minimum_score
     )
+    return result, ""
+
+
+def _parse_candidate_response(
+    response: Any,
+    minimum_score: float,
+    requirement_spec: VisualRequirementSpec,
+) -> dict[str, Any] | None:
+    """Validate a candidate response, discarding the reason it was rejected.
+
+    Callers that report the failure to a human or to a run manifest should use
+    _parse_candidate_payload directly and log the rule name it returns.
+    """
+    result, _ = _parse_candidate_payload(response, minimum_score, requirement_spec)
     return result
 
 
@@ -1201,7 +1267,7 @@ def _sync_candidate_analysis(
                 type="json_schema",
                 json_schema=response_schema,
             ),
-            max_tokens=_PEGASUS_MIN_MAX_TOKENS,
+            max_tokens=_PEGASUS_CANDIDATE_MAX_TOKENS,
         )
 
     try:
@@ -1302,22 +1368,47 @@ def evaluate_candidate(
                 requirement_spec=requirement_spec,
             )
 
-        if getattr(response, "finish_reason", None) == "length":
+        truncated = getattr(response, "finish_reason", None) == "length"
+        if truncated:
             result = None
+            discard_rule = ""
         else:
             response_data = getattr(response, "data", response)
-            result = _parse_candidate_response(
+            result, discard_rule = _parse_candidate_payload(
                 response_data,
                 threshold,
                 requirement_spec,
             )
         if result is None:
+            # These are two different failures and must not share one reason
+            # string. "Truncated" means the answer outgrew max_tokens, which is a
+            # budget problem this side of the API and is fixed by raising the
+            # ceiling. "Malformed" means Pegasus returned something that does not
+            # match the schema, which is a model problem. Reporting both as
+            # "malformed" hid a token-budget bug behind a word that made it look
+            # like the provider's fault, and it hid it worst on exactly the long,
+            # busy clips that Pinterest returns most.
+            #
+            # "Malformed" alone is still too coarse for the same reason: the parser
+            # has more than twenty ways to reject a response and the word names
+            # none of them. The rule that fired is appended, and appended rather
+            # than substituted because _API_FAILURE_REASON_PREFIXES matches this
+            # string by prefix to decide that a query failed for provider reasons
+            # rather than content ones.
+            failure = (
+                "truncated TwelveLabs structured response"
+                if truncated
+                else "malformed TwelveLabs structured response"
+            )
+            if discard_rule:
+                failure = f"{failure}: {discard_rule}"
             logger.warning(
-                "TwelveLabs candidate analysis returned malformed structured data: "
-                f"slot={slot_index}, provider={provider}, asset_id={asset_id}"
+                "TwelveLabs candidate analysis produced no verdict: "
+                f"slot={slot_index}, provider={provider}, asset_id={asset_id}, "
+                f"reason={failure}, max_tokens={_PEGASUS_CANDIDATE_MAX_TOKENS}"
             )
             return _failed_candidate_evaluation(
-                "malformed TwelveLabs structured response",
+                failure,
                 api_call=True,
                 requirement_spec=requirement_spec,
             )
@@ -1463,11 +1554,41 @@ def select_best_candidate(
                 adjudication_inputs,
                 app_config=app_config,
             )
-            if set(decisions) != set(candidate_ids):
+            # Apply what came back per candidate. This used to be all-or-nothing:
+            # if the returned candidate_id set was not exactly the requested set,
+            # every candidate in the batch was overwritten as UNCERTAIN. A batch
+            # holds up to five candidates that have each already passed the whole
+            # critical evidence gate -- the scarcest thing this pipeline produces --
+            # and one absent or one surplus id threw away all five, and with them
+            # the search phrasing they came from. The requested-but-absent ones do
+            # have to fail closed, because no verdict was reached for them. The
+            # others were judged, and there is no reading of a missing sibling that
+            # makes a delivered verdict less true.
+            unjudged_ids = [
+                candidate_id
+                for candidate_id in candidate_ids
+                if candidate_id not in decisions
+            ]
+            surplus_ids = [
+                candidate_id
+                for candidate_id in decisions
+                if candidate_id not in candidate_ids
+            ]
+            if unjudged_ids or surplus_ids:
                 adjudication_failures += 1
-                for _, _, result in eligible_batch:
+                logger.warning(
+                    "TwelveLabs semantic adjudication returned an incomplete batch, "
+                    "keeping the verdicts it did return: "
+                    f"slot={slot_index}, batch={batch_number}, "
+                    f"requested={len(candidate_ids)}, returned={len(decisions)}, "
+                    f"unjudged={unjudged_ids}, unrequested={surplus_ids}"
+                )
+            candidates_adjudicated += len(candidate_ids) - len(unjudged_ids)
+            for candidate_id, (_, _, result) in candidate_ids.items():
+                decision = decisions.get(candidate_id)
+                if decision is None:
                     result["semantic_adjudication"] = {
-                        "candidate_id": "",
+                        "candidate_id": candidate_id,
                         "decision": "UNCERTAIN",
                         "mandatory_fact_results": [],
                         "missing_or_contradictory_facts": [],
@@ -1475,13 +1596,10 @@ def select_best_candidate(
                     }
                     result["reason"] = "semantic adjudication unavailable or malformed"
                     result["accepted"] = False
-            else:
-                candidates_adjudicated += len(eligible_batch)
-                for candidate_id, (_, _, result) in candidate_ids.items():
-                    decision = decisions[candidate_id]
-                    result["semantic_adjudication"] = asdict(decision)
-                    result["accepted"] = _candidate_is_accepted(result, threshold)
-                    result["reason"] = _clean_text(decision.reason, 500)
+                    continue
+                result["semantic_adjudication"] = asdict(decision)
+                result["accepted"] = _candidate_is_accepted(result, threshold)
+                result["reason"] = _clean_text(decision.reason, 500)
 
         evaluated.extend(batch_results)
         accepted_so_far = [

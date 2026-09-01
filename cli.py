@@ -211,9 +211,12 @@ Output and exit status:
     material_group = parser.add_argument_group("materials and pipeline")
     material_group.add_argument(
         "--video-source",
-        default="pexels",
-        choices=["pexels", "pixabay", "local"],
-        help="video material provider; online providers require matching API keys in config.toml",
+        default="pinterest",
+        choices=["pinterest", "pexels", "pixabay", "local"],
+        help=(
+            "video material provider; pinterest needs no credential, "
+            "pexels and pixabay require matching API keys in config.toml"
+        ),
     )
     material_group.add_argument(
         "--video-materials",

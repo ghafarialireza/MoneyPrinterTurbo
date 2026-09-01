@@ -728,7 +728,167 @@ class TestSmartTwelveLabsSelection(unittest.TestCase):
             )
 
         self.assertFalse(result["accepted"])
-        self.assertIn("malformed", result["reason"])
+        # A truncated answer and an unparseable one are different failures with
+        # different fixes, so they must never collapse into one reason string:
+        # reporting truncation as "malformed" is what hid the token-budget bug.
+        self.assertIn("truncated", result["reason"])
+        self.assertNotIn("malformed", result["reason"])
+
+    def test_a_discarded_response_names_the_rule_that_discarded_it(self):
+        # Every discard here throws away an analysis that was already billed, and
+        # "malformed" names the outcome while hiding which of two dozen checks
+        # produced it. That is not a cosmetic complaint: it is how a token-budget
+        # bug survived long enough to lose 12 candidates in one run.
+        spec = _requirement_spec("narration")
+        payload = _payload(0.9, spec=spec)
+        payload["scores"] = {"semantic_match": 1.0}
+
+        with patch.object(
+            twelvelabs,
+            "_sync_candidate_analysis",
+            return_value=(payload, "direct_url"),
+        ):
+            result = twelvelabs.evaluate_candidate(
+                asset_id="short-scores",
+                video_url="https://videos.example/short-scores.mp4",
+                slot_index=1,
+                slot_duration=4,
+                narration_text="narration",
+                search_query="query",
+                requirement_spec=spec,
+            )
+
+        self.assertFalse(result["accepted"])
+        self.assertIn("scores", result["reason"])
+        # The prefix has to survive, because _analysis_api_failure_reason matches
+        # this string by prefix to tell a provider-side non-verdict apart from a
+        # content rejection.
+        self.assertTrue(
+            result["reason"].startswith("malformed TwelveLabs structured response")
+        )
+
+    def test_a_truncated_response_is_never_read_as_unrelated_footage(self):
+        # A truncated answer is the strongest possible case of an observation that
+        # never happened: the model was still writing when the budget ran out. Its
+        # zero score says nothing about the footage, so it must not be able to
+        # retire a search phrasing -- the same rule a quota error already gets.
+        candidates = [_candidate(index) for index in range(1, 11)]
+
+        def evaluate(**kwargs):
+            result = _evaluation(0.0, accepted=False)
+            result["reason"] = "truncated TwelveLabs structured response"
+            return result
+
+        with patch.object(twelvelabs, "evaluate_candidate", side_effect=evaluate):
+            _, stats = twelvelabs.select_best_candidate(
+                candidates=candidates,
+                slot_index=1,
+                slot_duration=4,
+                narration_text="narration",
+                search_query="query",
+                requirement_spec=_requirement_spec("narration"),
+                batch_size=5,
+                max_candidates=15,
+                minimum_score=0.7,
+                concurrency=5,
+            )
+
+        self.assertFalse(stats["unrelated_footage"])
+        self.assertEqual(
+            stats["api_failure_reason"], "truncated TwelveLabs structured response"
+        )
+
+    def test_an_unrequested_extra_field_does_not_discard_the_analysis(self):
+        # Absent fields are fatal because the evidence they carried is genuinely
+        # not there. An extra one is not: every field this parser uses it reads by
+        # name, so a surplus sibling changes nothing, and discarding a complete
+        # observation over it spends a candidate and can spend the phrasing too.
+        spec = _requirement_spec("narration")
+        payload = _payload(0.8, spec=spec)
+        payload["confidence_note"] = "high confidence in the framing call"
+
+        result = twelvelabs._parse_candidate_response(payload, 0.70, spec)
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result["critical_gate"]["decision"], "PASS")
+        self.assertTrue(result["eligible_for_adjudication"])
+
+    def test_a_missing_field_still_discards_the_analysis(self):
+        spec = _requirement_spec("narration")
+        payload = _payload(0.8, spec=spec)
+        del payload["visible_state"]
+
+        result, rule = twelvelabs._parse_candidate_payload(payload, 0.70, spec)
+
+        self.assertIsNone(result)
+        self.assertIn("visible_state", rule)
+
+    def test_a_restated_fact_list_is_derived_rather_than_used_to_discard(self):
+        # missing_required_facts, contradictory_facts and uncertainty are a pure
+        # function of critical_fact_evidence, which is validated fact by fact just
+        # above. Comparing them to the model's own restatement was a cross-check
+        # with no information in it whose penalty was discarding the whole billed
+        # analysis, so they are derived and a disagreement is only logged.
+        spec = _requirement_spec("narration")
+        statuses = {fact.id: "OBSERVED" for fact in spec.critical_visual_facts}
+        first_fact = spec.critical_visual_facts[0].id
+        statuses[first_fact] = "CONTRADICTED"
+        payload = _payload(0.8, spec=spec, statuses=statuses)
+        payload["contradictory_facts"] = []
+        payload["uncertainty"] = ["f99"]
+
+        result = twelvelabs._parse_candidate_response(payload, 0.70, spec)
+
+        self.assertIsNotNone(result)
+        self.assertEqual(
+            result["observed_facts"]["contradictory_facts"], [first_fact]
+        )
+        self.assertEqual(result["observed_facts"]["uncertainty"], [])
+        self.assertEqual(result["critical_gate"]["decision"], "REJECT")
+
+    def test_one_unjudged_candidate_does_not_void_its_adjudicated_siblings(self):
+        # A batch holds up to five candidates that have each already passed the
+        # whole critical evidence gate, which is the scarcest thing this pipeline
+        # produces. An adjudicator that returns four verdicts instead of five used
+        # to cost all five, and the search phrasing behind them.
+        candidates = [_candidate(index) for index in range(1, 6)]
+        spec = _requirement_spec("narration")
+
+        def partial_adjudication(requirement_spec, batch, app_config=None):
+            decisions = self._accept_observed_candidates(
+                requirement_spec, batch, app_config=app_config
+            )
+            decisions.pop(batch[0]["candidate_id"], None)
+            return decisions
+
+        self.adjudicator.side_effect = partial_adjudication
+        with patch.object(
+            twelvelabs,
+            "evaluate_candidate",
+            side_effect=lambda **kwargs: _evaluation(
+                0.95 if kwargs["asset_id"] == "1" else 0.80
+            ),
+        ):
+            winner, stats = twelvelabs.select_best_candidate(
+                candidates=candidates,
+                slot_index=1,
+                slot_duration=4,
+                narration_text="narration",
+                search_query="query",
+                requirement_spec=spec,
+                batch_size=5,
+                max_candidates=5,
+                minimum_score=0.7,
+                strong_early_stop_score=0.99,
+                concurrency=5,
+            )
+
+        # The unjudged candidate was the highest scoring one, so if it were still
+        # poisoning the batch there would be no winner at all.
+        self.assertIsNotNone(winner)
+        self.assertEqual(winner.source_info["asset_id"], "2")
+        self.assertEqual(stats["adjudication_failures"], 1)
+        self.assertEqual(stats["candidates_adjudicated"], 4)
 
     def test_candidate_cache_hit_avoids_duplicate_api_call(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -970,6 +1130,43 @@ class TestSmartTwelveLabsSelection(unittest.TestCase):
                 twelvelabs._candidate_response_schema(_requirement_spec()),
             )
         client.assets.create.assert_not_called()
+
+    def test_candidate_analysis_gets_its_own_output_budget(self):
+        """The evidence schema must not reuse the one-line QA token floor.
+
+        The candidate schema has fourteen required fields, two of which are
+        arrays of objects carrying free-text evidence. Sending it with the QA
+        floor made Pegasus return finish_reason="length" on long or visually
+        busy clips, and every one of those candidates was discarded without a
+        verdict. Asserting the shape -- a dedicated, strictly larger budget that
+        stays inside the documented range -- is what stops the constants being
+        conflated again, because the failure is invisible to any test whose
+        fixture response happens to be short.
+        """
+        stub_types = type(sys)("twelvelabs.types")
+        stub_types.AnalyzePromptV2 = lambda **kwargs: kwargs
+        stub_types.SyncResponseFormat = lambda **kwargs: kwargs
+        stub_types.VideoContext_AssetId = lambda **kwargs: kwargs
+        stub_types.VideoContext_Url = lambda **kwargs: kwargs
+        client = MagicMock()
+        client.analyze.return_value = SimpleNamespace(data=_payload())
+
+        with (
+            patch.dict(sys.modules, {"twelvelabs.types": stub_types}),
+            patch.object(twelvelabs, "_client", return_value=client),
+        ):
+            twelvelabs._sync_candidate_analysis(
+                "https://videos.example/budget.mp4",
+                "prompt",
+                twelvelabs._candidate_response_schema(_requirement_spec()),
+            )
+
+        max_tokens = client.analyze.call_args.kwargs["max_tokens"]
+        self.assertEqual(max_tokens, twelvelabs._PEGASUS_CANDIDATE_MAX_TOKENS)
+        self.assertGreater(max_tokens, twelvelabs._PEGASUS_MIN_MAX_TOKENS)
+        # Pegasus rejects max_tokens outside [512, 98304] with a 400.
+        self.assertGreaterEqual(max_tokens, 512)
+        self.assertLessEqual(max_tokens, 98304)
 
     def test_temporal_parser_selects_middle_match_and_rejects_ungated_segments(self):
         response = SimpleNamespace(
@@ -2151,12 +2348,16 @@ class TestSmartProviderCascade(unittest.TestCase):
     def test_selected_provider_always_leads_the_cascade(self):
         with patch.dict(config.app, self._keys()):
             self.assertEqual(
+                material.smart_provider_chain("pinterest"),
+                ["pinterest", "pexels", "pixabay"],
+            )
+            self.assertEqual(
                 material.smart_provider_chain("pixabay"),
-                ["pixabay", "pexels"],
+                ["pixabay", "pinterest", "pexels"],
             )
             self.assertEqual(
                 material.smart_provider_chain("pexels"),
-                ["pexels", "pixabay"],
+                ["pexels", "pinterest", "pixabay"],
             )
             # Coverr was retired as a paid provider and is no longer a
             # searchable stock source, so it never enters the cascade.
@@ -2166,12 +2367,28 @@ class TestSmartProviderCascade(unittest.TestCase):
         with patch.dict(config.app, self._keys(pixabay_api_keys=[])):
             self.assertFalse(material.provider_has_api_key("pixabay"))
             self.assertEqual(
-                material.smart_provider_chain("pexels"), ["pexels"]
+                material.smart_provider_chain("pexels"), ["pexels", "pinterest"]
             )
 
-    def test_cascade_without_any_key_keeps_the_selected_provider(self):
-        # With nothing configured the user must still see the actionable
-        # "api key is not set" error for the provider they actually picked.
+    def test_a_keyless_provider_is_never_treated_as_unconfigured(self):
+        # Pinterest has no config key at all. The readiness check has to answer
+        # "needs no credential" and "has a credential" the same way, or the one
+        # provider that always works would be the only one dropped.
+        with patch.dict(
+            config.app,
+            self._keys(pexels_api_keys=[], pixabay_api_keys=[]),
+        ):
+            self.assertTrue(material.provider_has_api_key("pinterest"))
+            self.assertTrue(material.provider_has_api_key("PINTEREST"))
+            self.assertFalse(material.provider_has_api_key("coverr"))
+            self.assertFalse(material.provider_has_api_key(""))
+            self.assertFalse(material.provider_has_api_key(None))
+
+    def test_cascade_without_any_key_falls_through_to_the_keyless_provider(self):
+        # This used to keep the unusable selected provider so the user would see
+        # its "api key is not set" error. There is now a provider that needs no
+        # key, so the run has somewhere to go and stopping would be a choice to
+        # fail a task that can still succeed.
         with patch.dict(
             config.app,
             self._keys(
@@ -2179,7 +2396,8 @@ class TestSmartProviderCascade(unittest.TestCase):
                 pixabay_api_keys=[],
             ),
         ):
-            self.assertEqual(material.smart_provider_chain("pexels"), ["pexels"])
+            self.assertEqual(material.smart_provider_chain("pexels"), ["pinterest"])
+            self.assertEqual(material.smart_provider_chain("pixabay"), ["pinterest"])
 
     def test_cascade_can_be_disabled_to_pin_the_selected_provider(self):
         with patch.dict(
@@ -2188,8 +2406,21 @@ class TestSmartProviderCascade(unittest.TestCase):
             self.assertFalse(material.is_provider_cascade_enabled())
             self.assertEqual(material.smart_provider_chain("pexels"), ["pexels"])
 
+    def test_a_pinned_provider_without_a_key_still_reports_its_own_error(self):
+        # With the cascade off there is nothing to fall through to, so the chain
+        # must keep the provider the user selected. Returning an empty list here
+        # would surface as "no candidates" instead of "your key is missing".
+        with patch.dict(
+            config.app,
+            self._keys(
+                pexels_api_keys=[],
+                smart_material_provider_cascade="off",
+            ),
+        ):
+            self.assertEqual(material.smart_provider_chain("pexels"), ["pexels"])
+
     def test_only_searchable_stock_providers_support_smart_matching(self):
-        for provider in ("pexels", "Pixabay"):
+        for provider in ("pinterest", "pexels", "Pixabay"):
             self.assertTrue(material.supports_smart_visual_matching(provider))
         for provider in ("", "local", "generated", None, "coverr", " coverr "):
             self.assertFalse(material.supports_smart_visual_matching(provider))

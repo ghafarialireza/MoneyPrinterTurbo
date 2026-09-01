@@ -25,7 +25,12 @@ PROJECT_ARCHIVE_URL = (
 DEFAULT_ROOT = Path.home() / "MoneyPrinterTurbo"
 DEFAULT_VOICE_NAME = "zh-CN-XiaoxiaoNeural-Female"
 NEEDS_INPUT_EXIT_CODE = 10
-SUPPORTED_SOURCES = {"pexels", "pixabay", "local"}
+SUPPORTED_SOURCES = {"pinterest", "pexels", "pixabay", "local"}
+# Sources that need no credential, so the helper must not stop and ask for one.
+# Pinterest reads a public search resource and local files come from disk; for
+# every other source the helper still requires ``<source>_api_keys`` before it
+# starts a run that would otherwise fail minutes later.
+KEYLESS_SOURCES = {"pinterest", "local"}
 PEXELS_API_KEY_URL = "https://www.pexels.com/api/"
 PEXELS_VALIDATION_URL = "https://api.pexels.com/v1/collections?per_page=1"
 PEXELS_API_KEY_HELP_URL = (
@@ -281,7 +286,10 @@ def selected_video_source(cli_args: list[str]) -> str:
             return cli_args[index + 1].strip().lower()
         if item.startswith("--video-source="):
             return item.split("=", 1)[1].strip().lower()
-    return "pexels"
+    # Mirrors the ``--video-source`` default in ``cli.py``. This value decides
+    # which credential the helper demands up front, so it has to track the CLI
+    # rather than name a provider the run will not actually use.
+    return "pinterest"
 
 
 def has_cli_option(cli_args: list[str], option: str) -> bool:
@@ -307,7 +315,7 @@ def missing_config(config_path: Path, cli_args: list[str]) -> tuple[str, list[st
     source = selected_video_source(cli_args)
     if source not in SUPPORTED_SOURCES:
         raise SkillError(f"unsupported video source: {source}")
-    if source != "local":
+    if source not in KEYLESS_SOURCES:
         value = _plain_config_value(text, f"{source}_api_keys")
         if not _has_configured_value(value):
             missing.append(f"{source}_api_keys")
@@ -353,10 +361,14 @@ def report_invalid_pexels_config() -> int:
 
 def _validate_pexels_key(api_key: str) -> str:
     """
-    Return ``valid``, ``rejected``, or ``unknown`` for a Pexels key.
+    Return ``valid``, ``rejected``, ``throttled``, or ``unknown`` for a key.
 
-    HTTP 401, 403, and rate-limited 429 responses make a key unusable for this
-    run. Network and server errors return unknown so the configuration is kept.
+    None of these can be collapsed into the others. HTTP 401 and 403 mean the
+    credential itself is dead, so it is safe to drop from the configuration. A
+    429 means the opposite: the key is real and accepted, it is simply over
+    quota right now, so it must be kept even though this run cannot use it.
+    Network and server errors return unknown, because the failure is ours and
+    says nothing about the key.
     """
     # Curated and popular search requests may hit a public cache and return 200
     # without valid authorization. My Collections is account-specific, requires
@@ -372,8 +384,10 @@ def _validate_pexels_key(api_key: str) -> str:
         with urllib.request.urlopen(request, timeout=15) as response:
             return "valid" if 200 <= response.status < 300 else "unknown"
     except urllib.error.HTTPError as exc:
-        if exc.code in {401, 403, 429}:
+        if exc.code in {401, 403}:
             return "rejected"
+        if exc.code == 429:
+            return "throttled"
         return "unknown"
     except (TimeoutError, urllib.error.URLError):
         return "unknown"
@@ -381,49 +395,84 @@ def _validate_pexels_key(api_key: str) -> str:
 
 def validate_pexels_config(config_path: Path, cli_args: list[str]) -> bool:
     """
-    Validate all Pexels keys used by the default material source.
+    Validate every configured Pexels key this run could actually reach.
 
-    Downstream code selects configured keys randomly. Keeping rejected keys can
-    cause intermittent 401 responses and missing material results. If at least
-    one key is verified, retain only verified keys. If validation is impossible
-    because of a transient network failure, keep the original configuration.
+    Pexels is no longer the source a default run uses; it is the second provider
+    in the smart-matching cascade. So validation is keyed to whether keys exist
+    rather than to which source was named: a Pinterest-led run still falls back
+    to Pexels whenever a key is configured, and a dead key left in place
+    produces intermittent 401 responses in the middle of that run.
+
+    Two absences are deliberately not treated as failures. No key at all is only
+    fatal when Pexels is the source that was explicitly asked for — every other
+    searchable source leads a cascade that skips a provider it has no credential
+    for, which is what makes a first run with no stock credential possible. And
+    keys that could not be verified are kept, because an unverifiable key says
+    something about our network, not about the key.
+
+    Only keys the API itself refused (401/403) are removed. A rate-limited key
+    is accepted-but-exhausted, so deleting it would destroy a working credential
+    over a temporary quota.
     """
-    if selected_video_source(cli_args) != "pexels":
+    source = selected_video_source(cli_args)
+    if source == "local":
         return True
 
     text = config_path.read_text(encoding="utf-8")
     keys = _parse_string_list(_plain_config_value(text, "pexels_api_keys"))
     if not keys:
-        return False
+        if source == "pexels":
+            return False
+        return True
 
     valid_keys: list[str] = []
+    keep_keys: list[str] = []
     rejected_count = 0
+    throttled_count = 0
     unknown_count = 0
     for api_key in keys:
         status = _validate_pexels_key(api_key)
         if status == "valid":
             valid_keys.append(api_key)
+            keep_keys.append(api_key)
         elif status == "rejected":
             rejected_count += 1
+        elif status == "throttled":
+            throttled_count += 1
+            keep_keys.append(api_key)
         else:
             unknown_count += 1
+            keep_keys.append(api_key)
 
     if valid_keys:
-        if valid_keys != keys:
-            text = _replace_config_value(text, "pexels_api_keys", valid_keys)
+        if keep_keys != keys:
+            text = _replace_config_value(text, "pexels_api_keys", keep_keys)
             config_path.write_text(text, encoding="utf-8")
         log(
             "Pexels key validation completed: "
-            f"valid={len(valid_keys)}, rejected={rejected_count}, "
-            f"unknown={unknown_count}"
+            f"valid={len(valid_keys)}, refused={rejected_count}, "
+            f"rate_limited={throttled_count}, unverified={unknown_count}"
         )
         return True
     if unknown_count:
         log("Pexels keys could not be verified due to a network or service error; keeping the existing configuration")
         return True
 
-    log(f"Pexels key validation failed: all {rejected_count} configured keys are unusable")
-    return False
+    if source == "pexels":
+        log(
+            "Pexels key validation failed: "
+            f"refused={rejected_count}, rate_limited={throttled_count}"
+        )
+        return False
+    # Pexels was not the source this run asked for, so an unusable Pexels key is
+    # a degraded cascade rather than a blocked run. Stopping here to demand a new
+    # key would hold a Pinterest run hostage to a credential it never needed.
+    log(
+        "Pexels is unusable right now "
+        f"(refused={rejected_count}, rate_limited={throttled_count}); "
+        f"the run continues with the remaining providers for source={source}"
+    )
+    return True
 
 
 def result_manifest_path(root: Path) -> Path:

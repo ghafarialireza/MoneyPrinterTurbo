@@ -77,7 +77,12 @@ class TestMptAgentSkill(unittest.TestCase):
             text = output.getvalue()
             self.assertIn("MPT_NEEDS_INPUT", text)
             self.assertIn("MISSING=moonshot_api_key", text)
-            self.assertIn("MISSING=pexels_api_keys", text)
+            # The default source is Pinterest, which has no credential to ask
+            # for. Demanding a stock key here would make an LLM key plus a
+            # second signup the price of a first run for no functional reason.
+            self.assertNotIn("MISSING=pexels_api_keys", text)
+            self.assertNotIn("MISSING=pinterest_api_keys", text)
+            self.assertNotIn("PEXELS_API_KEY_URL=", text)
             self.assertIn("LLM_PROVIDER_OPTION=deepseek|DeepSeek|", text)
             self.assertIn(
                 "LLM_PROVIDER_OPTION=oneapi|Other OpenAI-compatible provider|",
@@ -86,6 +91,30 @@ class TestMptAgentSkill(unittest.TestCase):
             self.assertNotIn("Alibaba Cloud Qwen", text)
             self.assertNotIn("Microsoft Azure OpenAI", text)
             self.assertNotIn("xAI Grok", text)
+
+    def test_an_explicitly_selected_pexels_run_still_requests_its_key(self):
+        """The signup link is only worth showing when the run truly needs it."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir) / "MoneyPrinterTurbo"
+            self.create_project(root)
+            output = io.StringIO()
+
+            with patch.dict(os.environ, {}, clear=True), redirect_stdout(output):
+                code = mpt_agent.main(
+                    [
+                        "--subject",
+                        "人工智能如何改变生活",
+                        "--root",
+                        str(root),
+                        "--",
+                        "--video-source",
+                        "pexels",
+                    ]
+                )
+
+            self.assertEqual(code, mpt_agent.NEEDS_INPUT_EXIT_CODE)
+            text = output.getvalue()
+            self.assertIn("MISSING=pexels_api_keys", text)
             self.assertIn(
                 f"PEXELS_API_KEY_URL={mpt_agent.PEXELS_API_KEY_URL}", text
             )
@@ -127,12 +156,32 @@ class TestMptAgentSkill(unittest.TestCase):
             )
 
             _, default_missing = mpt_agent.missing_config(config_path, [])
+            _, pinterest_missing = mpt_agent.missing_config(
+                config_path, ["--video-source", "pinterest"]
+            )
             _, pixabay_missing = mpt_agent.missing_config(
                 config_path, ["--video-source", "pixabay"]
             )
+            _, pexels_missing = mpt_agent.missing_config(
+                config_path, ["--video-source", "pexels"]
+            )
 
-            self.assertEqual(default_missing, ["pexels_api_keys"])
+            # Pinterest is both the default and keyless, so the default run and
+            # the explicit one have to agree that nothing is missing.
+            self.assertEqual(default_missing, [])
+            self.assertEqual(pinterest_missing, [])
             self.assertEqual(pixabay_missing, [])
+            self.assertEqual(pexels_missing, ["pexels_api_keys"])
+
+    def test_an_unknown_video_source_is_refused_before_the_run_starts(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "config.toml"
+            config_path.write_text(MINIMAL_CONFIG, encoding="utf-8")
+
+            with self.assertRaises(mpt_agent.SkillError):
+                mpt_agent.missing_config(
+                    config_path, ["--video-source", "coverr"]
+                )
 
     def test_existing_provider_key_is_reused_without_asking_user(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -189,7 +238,7 @@ class TestMptAgentSkill(unittest.TestCase):
             self.assertEqual(provider, "oneapi")
             self.assertEqual(
                 missing,
-                ["oneapi_base_url", "oneapi_model_name", "pexels_api_keys"],
+                ["oneapi_base_url", "oneapi_model_name"],
             )
             self.assertIn("OPENAI_COMPATIBLE_REQUIRED=", output.getvalue())
 
@@ -287,9 +336,75 @@ class TestMptAgentSkill(unittest.TestCase):
             with patch.object(
                 mpt_agent.urllib.request, "urlopen", side_effect=error
             ):
+                selected = mpt_agent.validate_pexels_config(
+                    config_path, ["--video-source", "pexels"]
+                )
+                cascade = mpt_agent.validate_pexels_config(config_path, [])
+
+            # Asked for Pexels and Pexels refused: the run cannot proceed.
+            self.assertFalse(selected)
+            # Led by Pinterest, Pexels is one fallback out of several, so a dead
+            # key degrades the cascade instead of blocking the whole run.
+            self.assertTrue(cascade)
+
+    def test_a_rate_limited_key_is_kept_because_it_is_not_a_dead_key(self):
+        """A 429 says the key is accepted and out of quota, not that it is wrong."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "config.toml"
+            throttled = "over-quota-but-valid-key"
+            dead = "revoked-key"
+            working = "working-key"
+            config_path.write_text(
+                MINIMAL_CONFIG.replace(
+                    "pexels_api_keys = []",
+                    f'pexels_api_keys = ["{throttled}", "{dead}", "{working}"]',
+                ),
+                encoding="utf-8",
+            )
+
+            def validate(request, timeout):
+                api_key = request.get_header("Authorization")
+                if api_key == throttled:
+                    raise mpt_agent.urllib.error.HTTPError(
+                        request.full_url, 429, "Too Many Requests", None, None
+                    )
+                if api_key == dead:
+                    raise mpt_agent.urllib.error.HTTPError(
+                        request.full_url, 401, "Unauthorized", None, None
+                    )
+                return self.FakeHttpResponse()
+
+            with patch.object(
+                mpt_agent.urllib.request, "urlopen", side_effect=validate
+            ):
                 valid = mpt_agent.validate_pexels_config(config_path, [])
 
-            self.assertFalse(valid)
+            config = config_path.read_text(encoding="utf-8")
+            self.assertTrue(valid)
+            # Deleting a throttled key would destroy a working credential over a
+            # quota window that resets within the hour.
+            self.assertIn(throttled, config)
+            self.assertIn(working, config)
+            self.assertNotIn(dead, config)
+
+    def test_a_keyless_run_is_not_blocked_by_an_absent_pexels_key(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "config.toml"
+            config_path.write_text(MINIMAL_CONFIG, encoding="utf-8")
+
+            with patch.object(mpt_agent.urllib.request, "urlopen") as urlopen:
+                self.assertTrue(
+                    mpt_agent.validate_pexels_config(config_path, [])
+                )
+                self.assertFalse(
+                    mpt_agent.validate_pexels_config(
+                        config_path, ["--video-source", "pexels"]
+                    )
+                )
+
+            # With no key there is nothing to validate, so no request is worth
+            # spending on either outcome.
+            urlopen.assert_not_called()
 
     def test_generation_returns_only_non_empty_final_video(self):
         with tempfile.TemporaryDirectory() as temp_dir:

@@ -20,6 +20,17 @@ from app.utils import utils
 
 
 MATERIAL_SEARCH_CACHE_TTL_SECONDS = 24 * 60 * 60
+# Per-provider overrides for providers whose media URLs do not live as long as
+# the default window. Pinterest serves pin video files from a CDN that signs
+# short-lived links, so a day-old cache entry is a list of URLs that no longer
+# resolve: the search would "hit", every download would fail, and the beat would
+# burn its budget on candidates that cannot be fetched. A short window keeps the
+# de-duplication benefit within one run without ever replaying a dead link.
+# Expired files are removed the next time they are read, so the shared cleanup
+# pass can keep using the default window.
+_PROVIDER_CACHE_TTL_SECONDS: dict[str, int] = {
+    "pinterest": 15 * 60,
+}
 _CACHE_FORMAT_VERSION = 2
 _CACHE_CLEANUP_INTERVAL_SECONDS = 60 * 60
 _CACHE_FUTURE_MTIME_TOLERANCE_SECONDS = 5.0
@@ -192,6 +203,20 @@ def _remove_invalid_cache(cache_path: Path) -> None:
         )
 
 
+def material_search_cache_ttl_seconds(provider: str) -> int:
+    """How long a cached search result stays valid for one provider.
+
+    Freshness is a property of the provider, not of the cache, because what
+    expires is the media URL inside the entry rather than the entry itself. This
+    is enforced on read so that shortening a window takes effect for entries that
+    were already written under the old one.
+    """
+    normalized = str(provider or "").strip().lower()
+    return _PROVIDER_CACHE_TTL_SECONDS.get(
+        normalized, MATERIAL_SEARCH_CACHE_TTL_SECONDS
+    )
+
+
 def load_material_search_cache(
     provider: str,
     search_term: str,
@@ -201,7 +226,8 @@ def load_material_search_cache(
     now: float | None = None,
 ) -> list[MaterialInfo] | None:
     """
-    读取仍在 24 小时有效期内的素材搜索结果。
+    读取仍在有效期内的素材搜索结果。有效期按 provider 取值，见
+    ``material_search_cache_ttl_seconds``。
 
     ``None`` 表示缓存未命中，需要请求远端 API；空列表不作为有效缓存返回，
     避免网络错误或上游异常被误缓存后持续阻断后续任务。
@@ -238,7 +264,7 @@ def load_material_search_cache(
     # 缓存长期视为新鲜数据，直接失效并重新请求远端更可靠。
     if (
         cache_age < -_CACHE_FUTURE_MTIME_TOLERANCE_SECONDS
-        or cache_age >= MATERIAL_SEARCH_CACHE_TTL_SECONDS
+        or cache_age >= material_search_cache_ttl_seconds(provider)
     ):
         _remove_invalid_cache(cache_path)
         return None

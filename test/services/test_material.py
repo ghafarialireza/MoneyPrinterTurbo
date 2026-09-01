@@ -963,5 +963,213 @@ class TestMaterialTlsVerification(unittest.TestCase):
         self.assertTrue(warning.called)
 
 
+class TestPinterestMaterialSearch(unittest.TestCase):
+    """``search_videos_pinterest`` as the cascade's first, keyless provider."""
+
+    def setUp(self):
+        self.original_app_config = dict(config.app)
+        self.original_proxy_config = dict(config.proxy)
+
+    def tearDown(self):
+        config.app.clear()
+        config.app.update(self.original_app_config)
+        config.proxy.clear()
+        config.proxy.update(self.original_proxy_config)
+
+    @staticmethod
+    def _record(**overrides):
+        record = {
+            "pin_id": "9001",
+            "pin_url": "https://www.pinterest.com/pin/9001/",
+            "duration": 8.9,
+            "poster": "https://i.pinimg.com/9001.jpg?size=large",
+            "creator": {
+                "id": "77",
+                "name": "Pinner",
+                "profile_page": "https://www.pinterest.com/pinner/?token=drop",
+            },
+            "renditions": [
+                {
+                    "id": "V_720P",
+                    "link": "https://v.pinimg.com/videos/9001/720p.mp4",
+                    "width": 1080,
+                    "height": 1920,
+                }
+            ],
+        }
+        record.update(overrides)
+        return record
+
+    def test_a_pin_becomes_a_material_with_provenance_and_no_query_string(self):
+        config.proxy.clear()
+        config.app.pop("tls_verify", None)
+
+        with patch.object(
+            material.pinterest, "search_video_pins", return_value=[self._record()]
+        ) as search:
+            results = material.search_videos_pinterest("sunrise", minimum_duration=3)
+
+        self.assertEqual(len(results), 1)
+        item = results[0]
+        self.assertEqual(item.provider, "pinterest")
+        self.assertEqual(item.url, "https://v.pinimg.com/videos/9001/720p.mp4")
+        # Floored, never rounded: 8.9 must not be reported as a 9 second source.
+        self.assertEqual(item.duration, 8)
+        self.assertEqual(item.provider_asset_id, "9001")
+        self.assertEqual(item.width, 1080)
+        self.assertEqual(item.height, 1920)
+        self.assertEqual(item.orientation, "portrait")
+        self.assertEqual(item.rendition_id, "V_720P")
+        self.assertEqual(item.search_query, "sunrise")
+        self.assertEqual(item.query_attempt, 1)
+        self.assertEqual(item.source_page_url, "https://www.pinterest.com/pin/9001/")
+        self.assertEqual(item.preview_url, "https://i.pinimg.com/9001.jpg")
+        self.assertEqual(
+            item.source_info["creator"]["profile_page"],
+            "https://www.pinterest.com/pinner/",
+        )
+        self.assertEqual(item.source_info["provider"], "pinterest")
+        self.assertEqual(item.source_info["search_term"], "sunrise")
+        self.assertTrue(search.call_args.kwargs["verify"])
+
+    def test_the_search_runs_through_the_configured_proxy(self):
+        config.proxy.clear()
+        config.proxy.update({"https": "http://127.0.0.1:7890"})
+
+        with patch.object(
+            material.pinterest, "search_video_pins", return_value=[]
+        ) as search:
+            material.search_videos_pinterest("sunrise", minimum_duration=3)
+
+        self.assertEqual(
+            search.call_args.kwargs["proxies"], {"https": "http://127.0.0.1:7890"}
+        )
+
+    def test_a_pin_shorter_than_the_beat_needs_is_dropped(self):
+        with patch.object(
+            material.pinterest,
+            "search_video_pins",
+            return_value=[self._record(duration=4.0)],
+        ):
+            results = material.search_videos_pinterest("sunrise", minimum_duration=6)
+
+        self.assertEqual(results, [])
+
+    def test_a_pin_with_an_unknown_duration_is_dropped_rather_than_guessed(self):
+        # The render timeline sizes a beat's window from this number, so an
+        # unknown length cannot be treated as "probably long enough".
+        with patch.object(
+            material.pinterest,
+            "search_video_pins",
+            return_value=[self._record(duration=None)],
+        ):
+            results = material.search_videos_pinterest("sunrise", minimum_duration=1)
+
+        self.assertEqual(results, [])
+
+    def test_renditions_face_the_same_resolution_gate_as_pexels(self):
+        low_resolution = self._record(
+            renditions=[
+                {
+                    "id": "V_360P",
+                    "link": "https://v.pinimg.com/videos/9001/360p.mp4",
+                    "width": 360,
+                    "height": 640,
+                }
+            ]
+        )
+
+        with patch.object(
+            material.pinterest, "search_video_pins", return_value=[low_resolution]
+        ):
+            results = material.search_videos_pinterest("sunrise", minimum_duration=1)
+
+        self.assertEqual(results, [])
+
+    def test_a_landscape_rendition_is_refused_for_a_portrait_video(self):
+        landscape = self._record(
+            renditions=[
+                {
+                    "id": "V_1080P",
+                    "link": "https://v.pinimg.com/videos/9001/1080p.mp4",
+                    "width": 1920,
+                    "height": 1080,
+                }
+            ]
+        )
+
+        with patch.object(
+            material.pinterest, "search_video_pins", return_value=[landscape]
+        ):
+            portrait = material.search_videos_pinterest(
+                "sunrise", minimum_duration=1, video_aspect=material.VideoAspect.portrait
+            )
+            wide = material.search_videos_pinterest(
+                "sunrise",
+                minimum_duration=1,
+                video_aspect=material.VideoAspect.landscape,
+            )
+
+        self.assertEqual(portrait, [])
+        self.assertEqual(len(wide), 1)
+        self.assertEqual(wide[0].orientation, "landscape")
+
+    def test_a_search_outage_returns_empty_and_says_why(self):
+        # The provider interface conflates "nothing found" with "could not ask",
+        # so the actionable cause has to reach the log at error level or a
+        # rate limit reads as an absent concept.
+        with patch.object(
+            material.pinterest,
+            "search_video_pins",
+            side_effect=material.pinterest.PinterestSearchError(
+                "pinterest rate limit exceeded: status=429, retry_after=30"
+            ),
+        ):
+            with patch.object(material.logger, "error") as error:
+                results = material.search_videos_pinterest("sunrise", minimum_duration=1)
+
+        self.assertEqual(results, [])
+        self.assertTrue(error.called)
+        message = error.call_args.args[0]
+        self.assertIn("rate limit", message)
+        self.assertIn("next provider in the cascade", message)
+
+    def test_an_unexpected_error_is_contained_rather_than_raised(self):
+        with patch.object(
+            material.pinterest, "search_video_pins", side_effect=RuntimeError("boom")
+        ):
+            with patch.object(material.logger, "error") as error:
+                results = material.search_videos_pinterest("sunrise", minimum_duration=1)
+
+        self.assertEqual(results, [])
+        self.assertTrue(error.called)
+
+    def test_pins_that_all_fail_the_gates_are_logged_apart_from_no_results(self):
+        with patch.object(
+            material.pinterest,
+            "search_video_pins",
+            return_value=[self._record(duration=2.0)],
+        ):
+            with patch.object(material.logger, "info") as info:
+                results = material.search_videos_pinterest("sunrise", minimum_duration=9)
+
+        self.assertEqual(results, [])
+        messages = [call.args[0] for call in info.call_args_list]
+        self.assertTrue(
+            any("none passed the material gates" in message for message in messages)
+        )
+
+    def test_pinterest_is_the_first_provider_and_needs_no_key(self):
+        self.assertEqual(
+            material._SMART_PROVIDER_CASCADE_ORDER,
+            ("pinterest", "pexels", "pixabay"),
+        )
+        self.assertIsNone(material._STOCK_VIDEO_PROVIDER_API_KEYS["pinterest"])
+        self.assertIs(
+            material._remote_search_function("pinterest"),
+            material.search_videos_pinterest,
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

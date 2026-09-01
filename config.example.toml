@@ -53,14 +53,21 @@ tls_verify = true
 # Video Materials / 视频素材
 # -----------------------------------------------------------------------------
 
-# Available values: "pexels", "pixabay", "loomloom", "local".
+# Available values: "pinterest", "pexels", "pixabay", "loomloom", "local".
+# "pinterest" is the default because it needs no credential: it reads Pinterest's
+# public video-pin search, so there is no key to register and no quota to spend.
+# The trade-off is that its clips are user-pinned reposts rather than licensed
+# stock, so they are not cleared for reuse and are more likely to carry
+# watermarks or burnt-in captions. Select "pexels" if a licensed source matters
+# for how the finished video will be published.
 # "loomloom" is a paid Shengsuan Cloud source and requires explicit
 # confirmation in the WebUI before each generation request.
-video_source = "pexels"
+video_source = "pinterest"
 
 # API key lists support key rotation. Use straight ASCII double quotes and
 # separate multiple keys with commas, for example: ["key-1", "key-2"].
 # Key 必须使用英文半角双引号，多个 Key 使用英文逗号分隔。
+# Pinterest has no entry here on purpose — it takes no key.
 
 # Register at https://www.pexels.com/api/
 pexels_api_keys = []
@@ -102,7 +109,8 @@ match_materials_to_script = false
 # Smart visual matching, per beat, when a provider returns nothing usable:
 # first try the alternative phrasings the script stage generated for that beat on
 # the same provider, then move on to the next searchable provider
-# (pexels -> pixabay, providers without an API key are skipped).
+# (pinterest -> pexels -> pixabay; the selected provider always goes first, and
+# providers that need a key but have none are skipped).
 # Set the cascade to false to stay on the selected provider only, and set the
 # variant count to 1 to spend exactly one query per provider. Each extra phrasing
 # costs one stock search plus one more round of candidate analysis.
