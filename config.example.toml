@@ -120,6 +120,13 @@ smart_material_max_query_variants = 3
 # a second way and search once more before failing the video. The alternative must
 # quote the beat's own spoken text, so the video still shows what it says.
 smart_material_requirement_rewrite = true
+# The one exception: the shot that opens the video. A rewrite may change what is
+# depicted, not only how findable it is, and in a vertical feed the frame at t=0 is
+# the thumbnail — the video is judged on it before the first word is audible. So the
+# opening shot keeps its literal requirement and fails as unfillable instead, which
+# is visible and fixable. Set true if you would rather have any opening shot than
+# none.
+smart_material_rewrite_opening_shot = false
 # Spend ceiling, in analyzed candidates, for one selection round of one beat.
 # Only a successful round stops early, so a beat that can be filled never comes
 # near this; a beat nothing can satisfy would otherwise spend the full

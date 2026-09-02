@@ -2688,15 +2688,15 @@ class TestVisualBeatMaterialSelection(unittest.TestCase):
             )
 
         service.select_best_candidate.assert_not_called()
-        # Both providers report NO_CANDIDATES, then the requirement-rewrite rung
-        # runs (its LLM call is patched to return nothing here) and records that
-        # no alternative wording was usable before the beat is finally failed.
+        # Both providers report NO_CANDIDATES. The requirement-rewrite rung would
+        # run next, but this beat is the one that opens the video, so it is withheld
+        # and the beat is failed rather than re-described into something else.
         self.assertEqual(
             [
                 run["final_decision"]
                 for run in persist.call_args.kwargs["semantic_verifier_runs"]
             ],
-            ["NO_CANDIDATES", "NO_CANDIDATES", "REQUIREMENT_REWRITE_UNAVAILABLE"],
+            ["NO_CANDIDATES", "NO_CANDIDATES", "OPENING_SHOT_REWRITE_WITHHELD"],
         )
 
     def test_render_segments_join_records_to_beats_by_beat_index(self):
@@ -3857,6 +3857,10 @@ class TestUnfillableRequirementRewrite(unittest.TestCase):
     ALTERNATIVE_QUERY = "workers walking railway tracks"
     ORIGINAL = "Workers inspecting railway tracks"
     ORIGINAL_QUERY = "railway track inspection"
+    # Only used by the tests that need the item under test to not be the opening
+    # shot: this one fills on its first phrasing and takes position 0 away from it.
+    LEAD = "A train approaching a station platform"
+    LEAD_QUERY = "train approaching station"
 
     @staticmethod
     def _settings(**overrides):
@@ -3896,9 +3900,31 @@ class TestUnfillableRequirementRewrite(unittest.TestCase):
         approved_queries=(),
         asset_id_for=None,
         rewrite_enabled=None,
+        rewrite_opening_shot=True,
+        lead_with_a_filled_beat=False,
         settings_overrides=None,
     ):
-        beat = _visual_beat(requirement=self.ORIGINAL, query=self.ORIGINAL_QUERY)
+        # Every test here is about the rewrite mechanism, and the single beat they
+        # use would otherwise be the opening shot, where the rewrite is withheld on
+        # purpose. So the opening-shot protection is off by default in this harness
+        # and switched on only by the tests that are about the protection itself.
+        if lead_with_a_filled_beat:
+            lead = _visual_beat(
+                index=1,
+                semantic_group_id=1,
+                requirement=self.LEAD,
+                query=self.LEAD_QUERY,
+            )
+            beat = _visual_beat(
+                index=2,
+                semantic_group_id=2,
+                requirement=self.ORIGINAL,
+                query=self.ORIGINAL_QUERY,
+            )
+            beats = [lead, beat]
+        else:
+            beat = _visual_beat(requirement=self.ORIGINAL, query=self.ORIGINAL_QUERY)
+            beats = [beat]
         undecomposable = set(undecomposable)
         decomposition_outage = set(decomposition_outage)
         asset_id_for = asset_id_for or (lambda term: term.replace(" ", "-"))
@@ -3963,11 +3989,11 @@ class TestUnfillableRequirementRewrite(unittest.TestCase):
         query_generator = MagicMock(
             return_value={beat.index: list(alternative_queries)}
         )
-        config_overrides = (
-            {}
-            if rewrite_enabled is None
-            else {"smart_material_requirement_rewrite": rewrite_enabled}
-        )
+        config_overrides = {
+            "smart_material_rewrite_opening_shot": rewrite_opening_shot,
+        }
+        if rewrite_enabled is not None:
+            config_overrides["smart_material_requirement_rewrite"] = rewrite_enabled
         error = None
         paths: list[str] = []
         with (
@@ -3987,8 +4013,8 @@ class TestUnfillableRequirementRewrite(unittest.TestCase):
             try:
                 paths = material._download_videos_by_script_order_smart(
                     task_id="rewrite-unfillable-requirement",
-                    search_terms=[beat.search_queries[0]],
-                    visual_beats=[beat],
+                    search_terms=[item.search_queries[0] for item in beats],
+                    visual_beats=beats,
                     provider_searches=[("pexels", search)],
                     video_aspect=VideoAspect.portrait,
                     max_clip_duration=4,
@@ -4155,6 +4181,88 @@ class TestUnfillableRequirementRewrite(unittest.TestCase):
         self.assertEqual(outcome.decisions, ["DECOMPOSITION_FAILED"])
         self.assertIn("decomposition failed for visual beat 1", str(outcome.error))
 
+    def test_the_opening_shot_is_never_rewritten(self):
+        """Run bdfd478b opened on a cheese grater because of this exact path.
+
+        Beat 1 asked for a plate of restaurant-style vegetables, could not be
+        filled, was re-described as "vegetables cooking in a restaurant kitchen",
+        and won a shot of cheese being grated — over a line saying the dish is not
+        about butter. The rewrite is allowed to change what is depicted, so the one
+        frame the whole video is judged on is the one place it must not run.
+        """
+        outcome = self._run(
+            undecomposable={self.ORIGINAL},
+            alternative=self._grounded_alternative(),
+            approved_queries=(self.ALTERNATIVE_QUERY,),
+            rewrite_opening_shot=False,
+        )
+
+        # The alternative wording would have filled this beat. It is refused
+        # anyway: a failed opening shot is visible and fixable, a wrong one is not.
+        self.assertIsNotNone(outcome.error)
+        self.assertEqual(outcome.paths, [])
+        outcome.rewrite.assert_not_called()
+        self.assertEqual(outcome.searches, [])
+        self.assertEqual(
+            outcome.decisions,
+            ["DECOMPOSITION_FAILED", "OPENING_SHOT_REWRITE_WITHHELD"],
+        )
+        # The operator has to be able to tell this apart from a plain outage.
+        self.assertIn("withheld from the opening", str(outcome.error))
+
+    def test_a_later_shot_is_still_rewritten_when_the_opening_shot_is_not(self):
+        """The policy is about position, not about distrusting the rewrite.
+
+        Same setting, same failure, same alternative — the only difference is that
+        something else opens the video now, and the recovery runs again.
+        """
+        outcome = self._run(
+            undecomposable={self.ORIGINAL},
+            alternative=self._grounded_alternative(),
+            approved_queries=(self.LEAD_QUERY, self.ALTERNATIVE_QUERY),
+            rewrite_opening_shot=False,
+            lead_with_a_filled_beat=True,
+        )
+
+        self.assertIsNone(outcome.error)
+        self.assertEqual(outcome.rewrite.call_count, 1)
+        self.assertEqual(
+            outcome.decisions,
+            ["ACCEPT", "DECOMPOSITION_FAILED", "REQUIREMENT_REWRITTEN", "ACCEPT"],
+        )
+        self.assertNotIn("OPENING_SHOT_REWRITE_WITHHELD", outcome.decisions)
+
+    def test_the_opening_shot_flag_is_opt_in_rather_than_opt_out(self):
+        """Unlike the global rewrite flag, an unreadable value keeps the protection.
+
+        The two flags default opposite ways, so they cannot share a parser: an
+        unset or misspelled value has to leave the opening shot protected.
+        """
+        for value, expected in (
+            ("on", True),
+            ("1", True),
+            ("TRUE", True),
+            ("yes", True),
+            (True, True),
+            ("off", False),
+            ("0", False),
+            ("no", False),
+            (False, False),
+            ("maybe", False),
+        ):
+            with self.subTest(value=value):
+                with patch.dict(
+                    config.app, {"smart_material_rewrite_opening_shot": value}
+                ):
+                    self.assertEqual(
+                        material.is_opening_shot_rewrite_enabled(), expected
+                    )
+
+    def test_an_unconfigured_run_protects_its_opening_shot(self):
+        with patch.dict(config.app, {}, clear=False):
+            config.app.pop("smart_material_rewrite_opening_shot", None)
+            self.assertFalse(material.is_opening_shot_rewrite_enabled())
+
     def test_the_rewrite_flag_is_read_like_the_other_smart_material_flags(self):
         for value, expected in (
             ("off", False),
@@ -4252,6 +4360,15 @@ class TestPerRoundAnalysisBudget(unittest.TestCase):
         self.requirement_patcher.start()
         self.addCleanup(self.requirement_patcher.stop)
         self.rewrite = _patch_requirement_rewrite(self)
+        # This class measures the rewrite round's budget using a single beat, which
+        # is therefore also the opening shot, where the rewrite is withheld on
+        # purpose. Enable it explicitly so the round under test actually runs; the
+        # policy itself is covered by TestUnfillableRequirementRewrite.
+        opening_shot_rewrite = patch.dict(
+            config.app, {"smart_material_rewrite_opening_shot": True}
+        )
+        opening_shot_rewrite.start()
+        self.addCleanup(opening_shot_rewrite.stop)
 
     @staticmethod
     def _settings(**overrides):

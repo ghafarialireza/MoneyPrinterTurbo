@@ -1597,6 +1597,30 @@ def is_requirement_rewrite_enabled() -> bool:
     return bool(value)
 
 
+def is_opening_shot_rewrite_enabled() -> bool:
+    """Whether the opening shot may have its visual requirement re-described.
+
+    The rewrite is allowed to change *what is depicted*, not merely how findable
+    it is, so the shot that comes back can answer a different question than the
+    narration asked. Every other beat survives that: a viewer who is already
+    watching forgives one loose shot in the middle. The opening shot does not
+    survive it, because in a vertical feed the frame at t=0 is the thumbnail and
+    the whole video is judged on it before the first word is audible. A run where
+    the opening shot fails is visible and fixable; a run where it quietly depicts
+    something else is neither.
+
+    So the default here is the opposite of the global toggle: the opening shot
+    keeps its literal requirement and, if no provider and no phrasing can satisfy
+    it, fails as unfillable and is handled by the same recovery the rest of the
+    timeline already uses. Operators who would rather have any opening shot than
+    none can set this to true.
+    """
+    value = config.app.get("smart_material_rewrite_opening_shot", False)
+    if isinstance(value, str):
+        return value.strip().lower() in ("1", "true", "yes", "on")
+    return bool(value)
+
+
 def is_cross_group_merge_enabled() -> bool:
     """Allow the merge rescue to cross a semantic group boundary.
 
@@ -3684,6 +3708,7 @@ def _download_videos_by_script_order_smart(
             "requested for those requirements"
         )
     rewrite_enabled = is_requirement_rewrite_enabled()
+    opening_shot_rewrite_enabled = is_opening_shot_rewrite_enabled()
 
     candidate_limit = settings["max_candidates"]
     if max_candidates_override is not None:
@@ -3797,7 +3822,35 @@ def _download_videos_by_script_order_smart(
         video_budget_exhausted = bool(video_analysis_budget) and (
             total_candidates_analyzed >= video_analysis_budget
         )
-        if selection.attempt is None and rewrite_enabled and video_budget_exhausted:
+        if (
+            selection.attempt is None
+            and rewrite_enabled
+            and item_position == 0
+            and not opening_shot_rewrite_enabled
+        ):
+            # The opening shot is withheld from the rewrite rather than from the
+            # search: every free rung above this one already ran. Position, not
+            # index, decides, because the item that opens the video is the first
+            # one on this timeline whatever its own numbering says.
+            logger.warning(
+                "withholding the requirement rewrite from the opening shot: "
+                f"{item_log_name}={visual_item.index}, "
+                f"requirement={visual_item.visual_requirement!r}"
+            )
+            attempt_failures.append(
+                f"The requirement rewrite is withheld from the opening "
+                f"{item_log_name} {visual_item.index}, because a re-described "
+                f"opening shot can depict something the narration never promised"
+            )
+            semantic_verifier_runs.append(
+                {
+                    "visual_item_type": item_log_name.replace(" ", "_"),
+                    "visual_item_index": visual_item.index,
+                    "visual_requirement": visual_item.visual_requirement,
+                    "final_decision": "OPENING_SHOT_REWRITE_WITHHELD",
+                }
+            )
+        elif selection.attempt is None and rewrite_enabled and video_budget_exhausted:
             # The rewrite is the most expensive rung: a fresh requirement means a
             # fresh search and a fresh page of analyses for an item that has already
             # proved hard. It is also the rung the free rungs can substitute for, so
