@@ -23,8 +23,11 @@ semantic spans, each span becomes one or more visual beats with an explicit writ
 requirement, candidate clips are searched per beat, and a vision model is asked
 whether a specific candidate actually shows what the requirement demands. Only a
 clip that passes on evidence is used, and the exact in-clip window that passes is
-what the renderer cuts. Everything else in the project — script generation, TTS,
-subtitles, music, upload — is upstream's and is untouched by this work.
+what the renderer cuts. The winner is then measured locally, on the downloaded file,
+for the two things a model's opinion cannot settle: whether the window plays across a
+cut, and whether the footage carries burned-in branding. Everything else in the
+project — script generation, TTS, subtitles, music, upload — is upstream's and is
+untouched by this work.
 
 The legacy path is still present and still supported. It runs whenever smart matching
 is off, the source is not a searchable provider, or no searchable provider is ready.
@@ -156,6 +159,11 @@ merge carry the window.
 
 The fourth and last rung is the merge rescue, described below. It is free.
 
+Winning the ladder is not the end of it. The winner is downloaded and then inspected
+locally, and a clip refused there is replaced from `download_plan`, the list of
+alternates the same round already approved. That list is why a local rejection costs
+nothing: the ladder is not restarted and no new analysis is bought.
+
 Cutting across all of this is the unrelated-footage abort in
 `twelvelabs._footage_is_unrelated`. Between analysis batches, if nothing has been
 accepted or even judged eligible, the best score so far is below
@@ -204,6 +212,44 @@ the ignored count logged at debug level. When filtering that list, filter to str
 *before* deduplicating, or an unhashable nested value re-raises the same
 `TypeError` the filter exists to prevent.
 
+## The local gate
+
+Everything above verification is a model's opinion about a URL. Once the winner is
+downloaded the file exists on disk, and `app/services/shot_integrity.py` measures two
+things the models above are demonstrably bad at, from the pixels, for free.
+
+The first is shot continuity. A segmentation window is padded outwards to reach the
+beat's required length, and padding does not know where the source cuts, so a beat can
+be handed a window that plays across an edit — the viewer sees two unrelated shots
+inside one beat and reads the whole video as a montage. `detect_shot_cuts` finds the
+cuts with FFmpeg's `select=gt(scene,0.20)` and `showinfo`, `shot_bounds` turns them
+into intervals, and `window_inside_one_shot` places the window inside the single shot
+that contains the midpoint of what the segmenter actually verified. If that shot is
+too short for the beat, the clip is refused; the window is never moved into some other,
+longer shot elsewhere in the file, because no gate ever looked at that footage.
+
+The second is branding. `measure_burned_in_overlay` decodes a handful of grayscale
+frames, intersects a static mask (pixels that barely change) with an edge mask (pixels
+carrying hard gradients), and compares the density in the top and bottom zones against
+the middle. Channel watermarks, promo bars and burned-in captions are frozen, high
+contrast and pressed against one edge; footage is not. `overlay_is_burned_in` requires
+both an absolute density and a 3× margin over the middle zone, which is what separates
+an advertisement from a locked-off macro shot that happens to be static everywhere.
+This runs on the window that will actually be rendered, not on the whole asset.
+
+A rejection here reuses the existing ladder: `download_plan` already holds the approved
+alternates, so the next approved candidate is downloaded and inspected in turn. The
+verdict is written to provenance with `final_decision` `LOCAL_CLIP_REJECTED` and the
+measurements behind it.
+
+Both probes fail open, and the distinction between `None` and `[]` is the whole of
+that discipline. `[]` means "one continuous shot"; `None` means "could not be
+measured". A missing FFmpeg, an unreadable file or a timeout must never be read as
+evidence against a clip, or a broken install becomes a video with no footage in it.
+One trap is worth naming: the filter graph is passed as argv, never through a shell,
+so the comma inside `gt(scene,0.20)` has to be escaped by hand. Unescaped, FFmpeg
+reads it as a filter separator and every clip silently reports zero cuts.
+
 ## The merge rescue
 
 When no provider, no phrasing and no rewritten requirement can fill a beat, the last
@@ -235,6 +281,14 @@ absorption made. Without stickiness, a later same-group merge would silently upg
 the label of a beat that is still covering a neighbour's window.
 `validate_merged_beat_timeline` then proves the rewritten timeline is still
 monotonic, gap-free and overlap-free.
+
+The free rung is also the widest cut the pipeline makes: one clip is stretched to
+cover two beats, so it is the last place a hidden edit is acceptable. Before the
+neighbour's window is extended, `_restamp_merged_source` re-runs the shot check on the
+already-downloaded file and refuses the free rung when no single shot can hold the
+merged window. The beat then falls through to the paid rung — a fresh selection round,
+or `MERGE_ANALYSIS_BUDGET_EXHAUSTED` if the video has spent its ceiling — instead of
+shipping a seam.
 
 `smart_material_cross_group_merge` gates the cross-group half of this, defaulting to
 on. It is not exposed in the WebUI, and neither is any other `smart_material_*` knob;
@@ -272,9 +326,10 @@ Renditions from Pinterest are handed to the same `_select_best_video_rendition` 
 ranks Pexels renditions, so the 720-pixel short-edge floor and the orientation gate
 cannot drift apart per provider. What Pinterest gives up in exchange for needing no
 key is licensing and cleanliness: pins are user-uploaded reposts, not licensed stock,
-and are far more likely to carry watermarks, burnt-in captions or app chrome. Nothing
-in the pipeline screens for that — the TwelveLabs gate judges content, not
-cleanliness.
+and are far more likely to carry watermarks, burnt-in captions or app chrome. The
+TwelveLabs gate judges content, not cleanliness, and will approve a clip that is
+itself an advertisement; the local gate above is what screens for that, after
+download and from the pixels. Licensing it does not screen for at all.
 
 Coverr was removed in full because it is a paid API. Two guards remain on purpose:
 the CLI rejects `--video-source coverr`, and `smart_provider_chain("coverr")` returns
@@ -334,9 +389,18 @@ fact without re-running it. The codes written by selection are
 
 Merge records additionally carry `merge_scope` (`same_semantic_group` or
 `adjacent_semantic_group`) and `merge_fill` (`neighbour_window_extended` for the free
-path, `fresh_selection_round` for the paid one). API keys and sensitive payloads are
-never written to provenance or logs; `_redact_secret` and `_redact_request_error`
-exist for that.
+path, `fresh_selection_round` for the paid one). A clip refused after download is
+recorded as a verifier run with `final_decision` `LOCAL_CLIP_REJECTED`. API keys and
+sensitive payloads are never written to provenance or logs; `_redact_secret` and
+`_redact_request_error` exist for that.
+
+Each material in `script.json` also carries `temporal_segment` — the interval the
+segmenter actually verified, the padding added around it, `match_quality` and the
+visibility flags — next to `local_clip_check`, which holds the measured cuts, the
+containment verdict, how far the window was moved and the overlay measurement. Both
+distinguish an unavailable probe from a negative result. Without them the manifest
+recorded the padded window as though the whole of it had been described, which is the
+one thing it cannot be used to check.
 
 ## Invariants
 
@@ -364,6 +428,15 @@ keep provider-aware deduplication, caches and provenance intact.
 In this codebase, "sibling" means *same semantic group*. Use "neighbour" when either
 group may be the absorber. The distinction is load-bearing in the merge code and
 mixing the two words is how the rescue became dead code the first time.
+
+Local probes fail open, and `None` never means `[]`. Anything measured from the file
+on disk — cuts, overlays, anything added later — must return `None` when it could not
+run, and a `None` must be treated as "unknown", never as evidence against the clip.
+A footage-less video is a worse failure than a video with one bad clip in it.
+
+A window is only ever moved inside the shot the segmenter looked at. Sliding it into a
+longer shot elsewhere in the same file would ship footage that no gate examined, which
+is the same defect as `source_start = 0` wearing better clothes.
 
 ## Testing
 

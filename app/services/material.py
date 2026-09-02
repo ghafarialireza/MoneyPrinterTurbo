@@ -25,7 +25,14 @@ from app.models.schema import (
     VisualSlot,
     VISUAL_BEAT_RAPID_CUT_SECONDS,
 )
-from app.services import llm, material_cache, pinterest, task_artifacts
+from app.services import (
+    llm,
+    material_cache,
+    pinterest,
+    shot_integrity,
+    task_artifacts,
+)
+
 from app.utils import utils
 
 # Thread-safe counter for API key rotation
@@ -238,6 +245,96 @@ def _creator_info(value: Any) -> dict[str, str] | None:
     return creator or None
 
 
+def _plain_text(value: Any, limit: int) -> str:
+    """Strip control characters and clamp length for manifest storage."""
+    return re.sub(r"[\x00-\x1f\x7f]+", " ", str(value or "").strip())[:limit]
+
+
+def _temporal_segment_record(value: Any) -> dict[str, Any]:
+    """The part of a temporal segmentation result worth keeping in the manifest.
+
+    ``source_start_time``/``source_end_time`` are already recorded at the top
+    level, and they are the *padded* window. What is missing from the manifest —
+    and what every audit of "why did this beat look wrong" needs — is how well
+    the model said the clip matched, which slice of it the model actually
+    described, and how much of the shipped window nothing described at all.
+    """
+    if not isinstance(value, dict):
+        return {}
+    segment: dict[str, Any] = {}
+    for field in ("verified_start_time", "verified_end_time", "padded_seconds"):
+        try:
+            number = float(value[field])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if math.isfinite(number) and number >= 0:
+            segment[field] = round(number, 3)
+    try:
+        segment["match_quality"] = round(
+            min(1.0, max(0.0, float(value["match_quality"]))), 4
+        )
+    except (KeyError, TypeError, ValueError):
+        pass
+    for field in ("action_visible", "subject_visible"):
+        if isinstance(value.get(field), bool):
+            segment[field] = value[field]
+    description = _plain_text(value.get("description"), 240)
+    if description:
+        segment["description"] = description
+    return segment
+
+
+def _local_clip_check_record(value: Any) -> dict[str, Any]:
+    """The local pixel checks, flattened for the manifest.
+
+    Kept short on purpose: an edited reel can have dozens of cuts, and the
+    manifest only needs enough of them to show why the window moved.
+    """
+    if not isinstance(value, dict):
+        return {}
+    check: dict[str, Any] = {}
+    cuts = value.get("shot_cuts")
+    if isinstance(cuts, list):
+        check["shot_cut_count"] = len(cuts)
+        trimmed = []
+        for cut in cuts[:24]:
+            try:
+                trimmed.append(round(float(cut), 3))
+            except (TypeError, ValueError):
+                continue
+        if trimmed:
+            check["shot_cuts"] = trimmed
+    elif isinstance(cuts, str):
+        check["shot_cuts"] = _plain_text(cuts, 40)
+    containment = value.get("shot_containment")
+    if containment:
+        check["shot_containment"] = _plain_text(containment, 40)
+    try:
+        check["shifted_seconds"] = round(float(value["shifted_seconds"]), 3)
+    except (KeyError, TypeError, ValueError):
+        pass
+    overlay = value.get("burned_in_overlay")
+    if isinstance(overlay, dict):
+        kept: dict[str, Any] = {}
+        zone = _plain_text(overlay.get("zone"), 10)
+        if zone:
+            kept["zone"] = zone
+        for field in ("density", "middle_density", "transitions"):
+            try:
+                kept[field] = round(float(overlay[field]), 4)
+            except (KeyError, TypeError, ValueError):
+                continue
+        try:
+            kept["frames_sampled"] = int(overlay["frames_sampled"])
+        except (KeyError, TypeError, ValueError):
+            pass
+        if kept:
+            check["burned_in_overlay"] = kept
+    elif isinstance(overlay, str):
+        check["burned_in_overlay"] = _plain_text(overlay, 40)
+    return check
+
+
 def _material_source_record(item: MaterialInfo, local_path: str) -> dict[str, Any]:
     """
     为成功下载的素材生成轻量来源记录。
@@ -350,6 +447,13 @@ def _material_source_record(item: MaterialInfo, local_path: str) -> dict[str, An
                     record["source_end_time"] = round(source_end, 3)
         except (TypeError, ValueError):
             pass
+
+    temporal_segment = _temporal_segment_record(source.get("temporal_segment"))
+    if temporal_segment:
+        record["temporal_segment"] = temporal_segment
+    local_clip_check = _local_clip_check_record(source.get("local_clip_check"))
+    if local_clip_check:
+        record["local_clip_check"] = local_clip_check
 
     if isinstance(item.semantic_evaluation, dict):
         evaluation = {}
@@ -944,6 +1048,18 @@ def _normalize_selected_source_range(
     normalized = dict(segment)
     normalized["source_start_time"] = normalized_start
     normalized["source_end_time"] = normalized_end
+    # ``padded_seconds`` was computed by the segmentation call against its own
+    # requested length. This path can re-derive the window against a different
+    # required duration, so the padding has to be restated here or the manifest
+    # would under-report how much of the shipped window nothing ever described.
+    try:
+        verified_span = float(segment["verified_end_time"]) - float(
+            segment["verified_start_time"]
+        )
+    except (KeyError, TypeError, ValueError):
+        verified_span = None
+    if verified_span is not None and math.isfinite(verified_span):
+        normalized["padded_seconds"] = round(max(0.0, required - verified_span), 3)
     return normalized
 
 
@@ -2853,35 +2969,95 @@ def _download_smart_winner(
             save_dir=material_directory,
             video_aspect=video_aspect,
         )
-        if saved_video_path:
-            if plan_position:
-                logger.warning(
-                    "the ranked winner could not be downloaded; promoted an "
-                    "already approved candidate for this "
-                    f"{item_log_name}: index={visual_item.index}, "
-                    f"provider={provider}, "
-                    f"asset_id={candidate_asset_id or 'unknown'}, "
-                    f"plan_position={plan_position + 1}"
-                )
-                result.verifier_runs.append(
-                    {
-                        "visual_item_type": item_log_name.replace(" ", "_"),
-                        "visual_item_index": visual_item.index,
-                        "visual_requirement": requirement,
-                        "stock_provider": provider,
-                        "search_query": query,
-                        "final_decision": "WINNER_DOWNLOAD_SUBSTITUTED",
-                        "promoted_plan_position": plan_position + 1,
-                    }
-                )
-            result.video_path = saved_video_path
-            result.winner = candidate
-            return result
-        result.failures.append(
-            f"The selected {provider} winner for {item_log_name} "
-            f"{visual_item.index} could not "
-            "be downloaded"
+        if not saved_video_path:
+            result.failures.append(
+                f"The selected {provider} winner for {item_log_name} "
+                f"{visual_item.index} could not "
+                "be downloaded"
+            )
+            continue
+
+        # Everything above this line is a model's opinion about a URL. The file
+        # now exists locally, so the two defects a model cannot be trusted on —
+        # a window that spans a cut, and footage that is itself an advertisement
+        # — are measured from its pixels before it is allowed onto the timeline.
+        inspection = shot_integrity.inspect_downloaded_clip(
+            saved_video_path,
+            source_duration=max(
+                float(candidate.duration or 0.0), candidate.source_end_time
+            ),
+            start_time=candidate.source_start_time,
+            end_time=candidate.source_end_time,
+            verified_start=candidate_segment.get("verified_start_time"),
+            verified_end=candidate_segment.get("verified_end_time"),
         )
+        source = dict(candidate.source_info or {})
+        source["local_clip_check"] = dict(inspection.evidence)
+        candidate.source_info = source
+        if inspection.rejected:
+            logger.warning(
+                "local inspection rejected an approved clip: "
+                f"{item_log_name}={visual_item.index}, provider={provider}, "
+                f"asset_id={candidate_asset_id or 'unknown'}, "
+                f"reason={inspection.rejection_reason}"
+            )
+            result.verifier_runs.append(
+                {
+                    "visual_item_type": item_log_name.replace(" ", "_"),
+                    "visual_item_index": visual_item.index,
+                    "visual_requirement": requirement,
+                    "stock_provider": provider,
+                    "search_query": query,
+                    "provider_asset_id": candidate_asset_id,
+                    "final_decision": "LOCAL_CLIP_REJECTED",
+                    "rejection_reason": inspection.rejection_reason,
+                    "local_clip_check": dict(inspection.evidence),
+                }
+            )
+            result.failures.append(
+                f"The selected {provider} clip for {item_log_name} "
+                f"{visual_item.index} was rejected locally: "
+                f"{inspection.rejection_reason}"
+            )
+            continue
+        if abs(inspection.start_time - candidate.source_start_time) > 1e-3:
+            logger.info(
+                "pulled the rendered window back inside one shot: "
+                f"{item_log_name}={visual_item.index}, "
+                f"{candidate.source_start_time:.3f}..{candidate.source_end_time:.3f}"
+                f" -> {inspection.start_time:.3f}..{inspection.end_time:.3f}"
+            )
+            candidate.source_start_time = inspection.start_time
+            candidate.source_end_time = inspection.end_time
+            segment_record = dict(source.get("temporal_segment") or {})
+            segment_record["source_start_time"] = inspection.start_time
+            segment_record["source_end_time"] = inspection.end_time
+            source["temporal_segment"] = segment_record
+            candidate.source_info = source
+
+        if plan_position:
+            logger.warning(
+                "the ranked winner did not survive download and local "
+                "inspection; promoted an already approved candidate for this "
+                f"{item_log_name}: index={visual_item.index}, "
+                f"provider={provider}, "
+                f"asset_id={candidate_asset_id or 'unknown'}, "
+                f"plan_position={plan_position + 1}"
+            )
+            result.verifier_runs.append(
+                {
+                    "visual_item_type": item_log_name.replace(" ", "_"),
+                    "visual_item_index": visual_item.index,
+                    "visual_requirement": requirement,
+                    "stock_provider": provider,
+                    "search_query": query,
+                    "final_decision": "WINNER_DOWNLOAD_SUBSTITUTED",
+                    "promoted_plan_position": plan_position + 1,
+                }
+            )
+        result.video_path = saved_video_path
+        result.winner = candidate
+        return result
     return result
 
 
@@ -3208,18 +3384,72 @@ def _restamp_merged_source(
     segment: dict[str, Any],
     required_target_duration: float,
     required_source_duration: float,
-) -> None:
-    """Point an already downloaded winner at the wider window it now has to cover."""
-    winner.source_start_time = float(segment["source_start_time"])
-    winner.source_end_time = float(segment["source_end_time"])
+    video_path: str,
+) -> bool:
+    """Point an already downloaded winner at the wider window it now has to cover.
+
+    Returns ``False`` when the file on disk proves the wider window cannot stay
+    inside one continuous shot of the source, leaving the winner untouched so the
+    caller can fill the beat another way. A merge asks for the widest window this
+    pipeline ever cuts — one clip covering two beats — which makes it the most
+    likely to run past a cut, and it is the one place a cut is least acceptable,
+    since the whole point of the merge is that these two beats become one shot.
+    The file is already local, so the check costs nothing but an FFmpeg pass.
+
+    An unmeasurable file keeps the window it was given: not being able to check
+    must never be the reason a beat goes unfilled.
+    """
+    start = float(segment["source_start_time"])
+    end = float(segment["source_end_time"])
+    evidence: dict[str, Any] = {}
+    cuts = shot_integrity.detect_shot_cuts(video_path) if video_path else None
+    if cuts is None:
+        evidence["shot_cuts"] = "unavailable"
+    else:
+        evidence["shot_cuts"] = cuts
+        try:
+            anchor_start = float(segment["verified_start_time"])
+            anchor_end = float(segment["verified_end_time"])
+        except (KeyError, TypeError, ValueError):
+            anchor_start, anchor_end = start, end
+        contained = shot_integrity.window_inside_one_shot(
+            cuts,
+            source_duration=max(float(winner.duration or 0.0), end),
+            verified_start=anchor_start,
+            verified_end=anchor_end,
+            required_duration=end - start,
+        )
+        if contained is None:
+            evidence["shot_containment"] = "no_shot_long_enough"
+            logger.warning(
+                "the neighbour's clip cannot cover the merged window inside one "
+                f"shot: visual_beat={merged_beat.index}, cuts={cuts}, "
+                f"window={start:.3f}..{end:.3f}"
+            )
+            return False
+        shifted = abs(contained[0] - start)
+        start, end = contained
+        evidence["shot_containment"] = (
+            "shifted" if shifted > 1e-3 else "already_inside"
+        )
+        if shifted > 1e-3:
+            evidence["shifted_seconds"] = round(shifted, 3)
+
+    winner.source_start_time = start
+    winner.source_end_time = end
     source = dict(winner.source_info) if isinstance(winner.source_info, dict) else {}
     source["slot_index"] = merged_beat.index
     source["visual_beat_index"] = merged_beat.index
     source["semantic_group_id"] = int(merged_beat.semantic_group_id)
     source["required_target_duration"] = required_target_duration
     source["required_source_duration"] = required_source_duration
-    source["temporal_segment"] = dict(segment)
+    segment_record = dict(segment)
+    segment_record["source_start_time"] = start
+    segment_record["source_end_time"] = end
+    source["temporal_segment"] = segment_record
+    source["local_clip_check"] = evidence
     winner.source_info = source
+    return True
 
 
 def _merge_unfillable_beats(
@@ -3341,29 +3571,32 @@ def _merge_unfillable_beats(
             if segment is None:
                 _refuse("MERGE_SEGMENTATION_FAILED", segment_failure)
                 continue
-            _restamp_merged_source(
+            if _restamp_merged_source(
                 winner=survivor_winner,
                 merged_beat=merged_beat,
                 segment=segment,
                 required_target_duration=required_target_duration,
                 required_source_duration=required_source_duration,
-            )
-            merge_fill = "neighbour_window_extended"
-        elif video_budget_exhausted:
-            # The neighbour's asset cannot cover both windows, so filling this one
-            # means buying a whole new selection round — the single most expensive
-            # thing left in the ladder, spent on a beat that already failed once.
-            # A video that has hit its ceiling refuses it and fails this beat
-            # instead, which is what keeps the ceiling an actual bound rather than
-            # a suggestion. Every free rung above has already been tried.
-            _refuse(
-                "MERGE_ANALYSIS_BUDGET_EXHAUSTED",
-                "the neighbour's approved clip is too short to cover both windows "
-                f"and this video has spent its analysis budget of "
-                f"{video_analysis_budget} analyzed candidates",
-            )
-            continue
-        else:
+                video_path=survivor.video_path,
+            ):
+                merge_fill = "neighbour_window_extended"
+        if not merge_fill:
+            # The free rung is unavailable: either the neighbour's asset is too
+            # short for the combined window, or its shots are. Both mean the beat
+            # can now only be filled by buying a fresh selection round.
+            if video_budget_exhausted:
+                # Filling this beat is the single most expensive thing left in the
+                # ladder, spent on a beat that already failed once. A video that
+                # has hit its ceiling refuses it and fails this beat instead,
+                # which is what keeps the ceiling an actual bound rather than a
+                # suggestion. Every free rung above has already been tried.
+                _refuse(
+                    "MERGE_ANALYSIS_BUDGET_EXHAUSTED",
+                    "the neighbour's approved clip cannot cover both windows in "
+                    "one continuous shot and this video has spent its analysis "
+                    f"budget of {video_analysis_budget} analyzed candidates",
+                )
+                continue
             fresh = _reselect_for_merged_beat(
                 merged_beat=merged_beat,
                 resolved_specs=resolved_specs,

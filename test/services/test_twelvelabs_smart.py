@@ -1283,6 +1283,89 @@ class TestSmartTwelveLabsSelection(unittest.TestCase):
         )
         self.assertGreater(segment["source_start_time"], 0.0)
 
+    def test_the_segment_reports_the_described_interval_beside_the_padded_one(self):
+        """A padded window is partly footage no gate ever looked at.
+
+        The model described 9.0s to 11.0s; the slot needs 6.0s, so the renderer
+        plays four seconds nothing was asked about. Recording only the padded
+        window makes the whole six seconds look verified, which is how a beat can
+        pass every gate at full marks and still show the wrong thing.
+        """
+        response = SimpleNamespace(
+            result=SimpleNamespace(
+                finish_reason="stop",
+                data=json.dumps(
+                    {
+                        "best_visual_match": [
+                            {
+                                "start_time": 9.0,
+                                "end_time": 11.0,
+                                "metadata": {
+                                    "match_quality": 0.9,
+                                    "action_visible": True,
+                                    "subject_visible": True,
+                                    "description": "the match ignites",
+                                },
+                            }
+                        ]
+                    }
+                ),
+            )
+        )
+
+        segment = twelvelabs._parse_temporal_segments(
+            response,
+            source_duration=20.0,
+            requested_source_duration=6.0,
+        )
+
+        self.assertEqual(segment["verified_start_time"], 9.0)
+        self.assertEqual(segment["verified_end_time"], 11.0)
+        self.assertEqual(segment["padded_seconds"], 4.0)
+        self.assertAlmostEqual(
+            segment["source_end_time"] - segment["source_start_time"], 6.0
+        )
+        # The described interval stays inside the window that will be played, or
+        # the padding is not padding but a different moment entirely.
+        self.assertLessEqual(
+            segment["source_start_time"], segment["verified_start_time"]
+        )
+        self.assertGreaterEqual(segment["source_end_time"], segment["verified_end_time"])
+
+    def test_a_segment_wider_than_the_slot_reports_no_padding(self):
+        """Trimming a long match down is not padding, and must not be recorded as it."""
+        response = SimpleNamespace(
+            result=SimpleNamespace(
+                finish_reason="stop",
+                data=json.dumps(
+                    {
+                        "best_visual_match": [
+                            {
+                                "start_time": 4.0,
+                                "end_time": 12.0,
+                                "metadata": {
+                                    "match_quality": 0.9,
+                                    "action_visible": True,
+                                    "subject_visible": True,
+                                    "description": "the match ignites",
+                                },
+                            }
+                        ]
+                    }
+                ),
+            )
+        )
+
+        segment = twelvelabs._parse_temporal_segments(
+            response,
+            source_duration=20.0,
+            requested_source_duration=3.0,
+        )
+
+        self.assertEqual(segment["padded_seconds"], 0.0)
+        self.assertEqual(segment["verified_start_time"], 4.0)
+        self.assertEqual(segment["verified_end_time"], 12.0)
+
     def test_temporal_retrieval_retries_transient_error_on_same_task_id(self):
         class RemoteProtocolError(Exception):
             pass
@@ -3537,7 +3620,16 @@ class TestApprovedAlternatePromotion(unittest.TestCase):
             ],
         }
 
-    def _run(self, *, candidates, verdicts, winner, transfers, segments):
+    def _run(
+        self,
+        *,
+        candidates,
+        verdicts,
+        winner,
+        transfers,
+        segments,
+        inspections=None,
+    ):
         beat = _visual_beat(
             requirement="Worker digs a hole", query="worker digging hole"
         )
@@ -3554,10 +3646,26 @@ class TestApprovedAlternatePromotion(unittest.TestCase):
         save_video = MagicMock(
             side_effect=lambda **kwargs: transfers.get(kwargs["video_url"], "")
         )
+
+        def inspect(video_path, **kwargs):
+            verdict = (inspections or {}).get(video_path)
+            if verdict is not None:
+                return verdict
+            return material.shot_integrity.ClipInspection(
+                start_time=kwargs["start_time"],
+                end_time=kwargs["end_time"],
+                evidence={"shot_cuts": []},
+            )
+
         error = None
         paths: list[str] = []
         with (
             patch.object(material, "save_video", save_video),
+            patch.object(
+                material.shot_integrity,
+                "inspect_downloaded_clip",
+                side_effect=inspect,
+            ) as inspected,
             patch.object(
                 material.task_artifacts, "patch_script_data", return_value=True
             ) as persist,
@@ -3584,6 +3692,7 @@ class TestApprovedAlternatePromotion(unittest.TestCase):
             persist=persist,
             service=service,
             save_video=save_video,
+            inspected=inspected,
             beat=beat,
         )
 
@@ -3676,6 +3785,139 @@ class TestApprovedAlternatePromotion(unittest.TestCase):
                 for run in outcome.persist.call_args.kwargs["semantic_verifier_runs"]
             ],
         )
+
+    def test_a_locally_rejected_winner_promotes_the_next_approved_candidate(self):
+        """Branded footage is a bad clip, not a bad transfer, and the ladder holds.
+
+        The advertisement that shipped reached the timeline with every paid gate
+        green, so the local refusal has to behave exactly like a failed transfer:
+        drop this asset, render the runner-up whose verdict is already bought.
+        """
+        winner = self._candidate_for("top-ranked")
+        alternate = self._candidate_for("approved-runner-up")
+        outcome = self._run(
+            candidates=[winner, alternate],
+            verdicts=[(winner, True), (alternate, True)],
+            winner=winner,
+            transfers={
+                winner.url: "D:/task/branded.mp4",
+                alternate.url: "D:/task/promoted.mp4",
+            },
+            segments=[
+                {
+                    "source_start_time": 5.0,
+                    "source_end_time": 7.8,
+                    "description": "the requested action",
+                },
+                {
+                    "source_start_time": 1.0,
+                    "source_end_time": 3.8,
+                    "description": "the requested action, promoted asset",
+                },
+            ],
+            inspections={
+                "D:/task/branded.mp4": material.shot_integrity.ClipInspection(
+                    start_time=5.0,
+                    end_time=7.8,
+                    rejected=True,
+                    rejection_reason=(
+                        "the footage carries burned-in text or branding across "
+                        "its bottom edge"
+                    ),
+                    evidence={
+                        "shot_cuts": [],
+                        "burned_in_overlay": {
+                            "zone": "bottom",
+                            "density": 0.149,
+                            "middle_density": 0.025,
+                        },
+                    },
+                )
+            },
+        )
+
+        self.assertIsNone(outcome.error)
+        self.assertEqual(outcome.paths, ["D:/task/promoted.mp4"])
+        record = outcome.persist.call_args.kwargs["material_sources"][0]
+        self.assertEqual(record["asset_id"], "approved-runner-up")
+        runs = outcome.persist.call_args.kwargs["semantic_verifier_runs"]
+        self.assertEqual(
+            [run["final_decision"] for run in runs],
+            ["ACCEPT", "LOCAL_CLIP_REJECTED", "WINNER_DOWNLOAD_SUBSTITUTED"],
+        )
+        # The refusal has to name the asset it refused and carry the measurement
+        # it refused on, or a later review cannot tell a strict threshold from a
+        # broken detector.
+        refusal = runs[1]
+        self.assertEqual(refusal["provider_asset_id"], "top-ranked")
+        self.assertIn("burned-in", refusal["rejection_reason"])
+        self.assertEqual(
+            refusal["local_clip_check"]["burned_in_overlay"]["density"], 0.149
+        )
+
+    def test_a_window_pulled_back_inside_one_shot_is_the_window_rendered(self):
+        """The manifest must describe the frames that played, not the ones asked for."""
+        winner = self._candidate_for("top-ranked")
+        outcome = self._run(
+            candidates=[winner],
+            verdicts=[(winner, True)],
+            winner=winner,
+            transfers={winner.url: "D:/task/two-shot.mp4"},
+            segments=[
+                {
+                    "source_start_time": 0.0,
+                    "source_end_time": 2.8,
+                    "verified_start_time": 3.1,
+                    "verified_end_time": 4.4,
+                    "description": "the requested action",
+                }
+            ],
+            inspections={
+                "D:/task/two-shot.mp4": material.shot_integrity.ClipInspection(
+                    start_time=2.46,
+                    end_time=5.26,
+                    evidence={
+                        "shot_cuts": [2.4],
+                        "shot_containment": "shifted",
+                        "shifted_seconds": 2.46,
+                    },
+                )
+            },
+        )
+
+        self.assertIsNone(outcome.error)
+        record = outcome.persist.call_args.kwargs["material_sources"][0]
+        self.assertEqual(record["source_start_time"], 2.46)
+        self.assertEqual(record["source_end_time"], 5.26)
+        self.assertEqual(record["temporal_segment"]["verified_start_time"], 3.1)
+        self.assertEqual(record["local_clip_check"]["shot_containment"], "shifted")
+        self.assertEqual(record["local_clip_check"]["shot_cut_count"], 1)
+
+    def test_the_inspection_reads_the_window_and_the_verified_interval(self):
+        """Anchoring on the padded window would move a clip for the wrong reason."""
+        winner = self._candidate_for("top-ranked")
+        outcome = self._run(
+            candidates=[winner],
+            verdicts=[(winner, True)],
+            winner=winner,
+            transfers={winner.url: "D:/task/clip.mp4"},
+            segments=[
+                {
+                    "source_start_time": 5.0,
+                    "source_end_time": 7.8,
+                    "verified_start_time": 5.4,
+                    "verified_end_time": 6.9,
+                    "description": "the requested action",
+                }
+            ],
+        )
+
+        inspected = outcome.inspected.call_args
+        self.assertEqual(inspected.args, ("D:/task/clip.mp4",))
+        self.assertEqual(inspected.kwargs["start_time"], 5.0)
+        self.assertEqual(inspected.kwargs["end_time"], 7.8)
+        self.assertEqual(inspected.kwargs["verified_start"], 5.4)
+        self.assertEqual(inspected.kwargs["verified_end"], 6.9)
 
     def test_without_an_approved_alternate_the_failure_message_is_unchanged(self):
         winner = self._candidate_for("top-ranked")
@@ -4733,6 +4975,7 @@ class TestUnfillableBeatMerge(unittest.TestCase):
         undownloadable=(),
         segment_failures_after=None,
         clip_speed=1.0,
+        shot_cuts=None,
     ):
         durations = durations or {}
         searches: list[str] = []
@@ -4805,6 +5048,12 @@ class TestUnfillableBeatMerge(unittest.TestCase):
             saved.append(url)
             return f"D:/task/{Path(url).name}"
 
+        # The downloaded paths these tests produce do not exist on disk, so the
+        # real probe fails open and the merge behaves as it always has. A test
+        # that wants to talk about cuts names the file it is talking about.
+        def detect_cuts(video_path):
+            return (shot_cuts or {}).get(video_path)
+
         service = SimpleNamespace(
             candidate_selection_settings=lambda: self._settings(),
             select_best_candidate=MagicMock(side_effect=select_best),
@@ -4827,6 +5076,9 @@ class TestUnfillableBeatMerge(unittest.TestCase):
                 material.llm, "generate_visual_slot_queries", MagicMock(return_value={})
             ),
             patch.object(material, "save_video", side_effect=save),
+            patch.object(
+                material.shot_integrity, "detect_shot_cuts", side_effect=detect_cuts
+            ),
             patch.dict(
                 config.app,
                 {
@@ -4949,6 +5201,50 @@ class TestUnfillableBeatMerge(unittest.TestCase):
         # The reason a beat was retired has to survive in the provenance, because
         # the finished video no longer shows that a shot was planned there.
         self.assertIn("visual beat 2", outcome.merges[0]["reason"])
+
+    def test_the_widened_window_is_pulled_into_the_shot_it_belongs_to(self):
+        """A merge is the widest cut this pipeline makes, so it is the likeliest
+        to run past a cut — and the one place a cut is least acceptable, since the
+        whole point is that these two beats become a single shot."""
+        outcome = self._run(
+            beats=self._beats(2),
+            approved_queries={"beans query 1"},
+            shot_cuts={"D:/task/beans-query-1.mp4": [5.0]},
+        )
+
+        self.assertIsNone(outcome.error)
+        self.assertEqual(outcome.merges[0]["merge_fill"], "neighbour_window_extended")
+        record = outcome.records[0]
+        # 5.6s out of the seven unbroken seconds after the cut, clear of the
+        # boundary, rather than the window that straddled it.
+        self.assertGreaterEqual(record["source_start_time"], 5.0)
+        self.assertAlmostEqual(
+            record["source_end_time"] - record["source_start_time"], 5.6, places=3
+        )
+        self.assertEqual(record["local_clip_check"]["shot_containment"], "shifted")
+
+    def test_a_neighbour_whose_shots_are_too_short_does_not_absorb_the_beat(self):
+        """The free rung is unavailable, so the merge falls through to a paid one.
+
+        The clip is long enough for the merged window and would have been widened
+        before this check existed. What disqualifies it is that its shots are
+        three seconds each: fine for the beat it was approved for, too short for
+        both beats together, which is exactly how one beat ends up playing two
+        unrelated scenes back to back.
+        """
+        outcome = self._run(
+            beats=self._beats(2),
+            approved_queries={"beans query 1"},
+            shot_cuts={"D:/task/beans-query-1.mp4": [3.0, 6.0, 9.0]},
+        )
+
+        self.assertIsNone(outcome.error)
+        self.assertEqual(outcome.merges[0]["merge_fill"], "fresh_selection_round")
+        self.assertEqual(outcome.paths, ["D:/task/beans-query-1-spare.mp4"])
+        # The refused clip keeps its own window: a merge that did not happen must
+        # not leave the survivor pointing at frames nothing asked for.
+        self.assertEqual(len(outcome.records), 1)
+        self.assertEqual(outcome.records[0]["asset_id"], "beans-query-1-spare")
 
     def test_the_next_sibling_absorbs_a_first_beat_nothing_could_fill(self):
         outcome = self._run(beats=self._beats(2), approved_queries={"beans query 2"})

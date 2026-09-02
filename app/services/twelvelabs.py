@@ -1928,6 +1928,15 @@ def _parse_temporal_segments(
     return {
         "source_start_time": round(normalized_start, 3),
         "source_end_time": round(normalized_end, 3),
+        # The interval above is the padded one the renderer will play. These two
+        # are the interval the model actually described, which is the only part
+        # any gate verified. Keeping both is what lets a later check tell a
+        # window that was genuinely matched apart from one that only reaches its
+        # length because it was grown around a two-second observation — and lets
+        # a local shot check re-anchor on the evidence instead of on the padding.
+        "verified_start_time": round(start_time, 3),
+        "verified_end_time": round(end_time, 3),
+        "padded_seconds": round(max(0.0, requested - (end_time - start_time)), 3),
         "match_quality": round(match_quality, 4),
         "action_visible": metadata.get("action_visible") is True,
         "subject_visible": metadata.get("subject_visible") is True,

@@ -656,6 +656,136 @@ class TestMaterialTlsVerification(unittest.TestCase):
         self.assertNotIn("/Users/example", serialized)
         self.assertNotIn("private@example.com", serialized)
 
+    def test_material_source_record_keeps_the_evidence_behind_the_window(self):
+        """The manifest has to say how good the match was and what played.
+
+        ``source_start_time``/``source_end_time`` are the padded window the
+        renderer plays; on their own they cannot answer why a beat looked wrong,
+        because nothing records how much of that window the model actually
+        described or what the local probes measured on the file. Both are kept
+        here, trimmed: a reel can have dozens of cuts and the manifest only needs
+        enough of them to explain why the window moved.
+        """
+        item = material.MaterialInfo(
+            provider="pinterest",
+            url="https://v.pinimg.com/videos/clip.mp4",
+            duration=15,
+            source_start_time=7.6,
+            source_end_time=10.988,
+            source_info={
+                "provider": "pinterest",
+                "asset_id": "998877",
+                "temporal_segment": {
+                    "source_start_time": 7.6,
+                    "source_end_time": 10.988,
+                    "verified_start_time": 7.013,
+                    "verified_end_time": 8.9,
+                    "padded_seconds": 1.501,
+                    "match_quality": 0.8123,
+                    "action_visible": True,
+                    "subject_visible": False,
+                    "description": "hands shaping clay\non a wheel",
+                    "raw_provider_payload": {"token": "must-not-persist"},
+                },
+                "local_clip_check": {
+                    "shot_cuts": [round(0.5 * step, 3) for step in range(1, 61)],
+                    "shot_containment": "shifted",
+                    "shifted_seconds": 0.587,
+                    "burned_in_overlay": {
+                        "zone": "bottom",
+                        "density": 0.1494,
+                        "middle_density": 0.0252,
+                        "transitions": 5.3,
+                        "frames_sampled": 8,
+                    },
+                },
+            },
+        )
+
+        record = material._material_source_record(item, "/tmp/task/vid-998877.mp4")
+
+        segment = record["temporal_segment"]
+        self.assertEqual(segment["match_quality"], 0.8123)
+        self.assertEqual(segment["verified_start_time"], 7.013)
+        self.assertEqual(segment["verified_end_time"], 8.9)
+        self.assertEqual(segment["padded_seconds"], 1.501)
+        self.assertTrue(segment["action_visible"])
+        self.assertFalse(segment["subject_visible"])
+        # A control character in a model's prose must not reach the manifest.
+        self.assertEqual(segment["description"], "hands shaping clay on a wheel")
+        self.assertNotIn("must-not-persist", str(record))
+
+        check = record["local_clip_check"]
+        self.assertEqual(check["shot_cut_count"], 60)
+        self.assertEqual(len(check["shot_cuts"]), 24)
+        self.assertEqual(check["shot_containment"], "shifted")
+        self.assertEqual(check["shifted_seconds"], 0.587)
+        self.assertEqual(check["burned_in_overlay"]["density"], 0.1494)
+        self.assertEqual(check["burned_in_overlay"]["zone"], "bottom")
+
+    def test_material_source_record_survives_probes_that_could_not_run(self):
+        """An unmeasurable clip records that, and records nothing it did not measure."""
+        item = material.MaterialInfo(
+            provider="pexels",
+            url="https://videos.example/clip.mp4",
+            duration=9,
+            source_info={
+                "provider": "pexels",
+                "asset_id": "42",
+                "temporal_segment": {"source_start_time": 0.0, "source_end_time": 3.0},
+                "local_clip_check": {
+                    "shot_cuts": "unavailable",
+                    "burned_in_overlay": "unavailable",
+                },
+            },
+        )
+
+        record = material._material_source_record(item, "/tmp/task/vid-42.mp4")
+
+        self.assertNotIn("temporal_segment", record)
+        self.assertEqual(
+            record["local_clip_check"],
+            {"shot_cuts": "unavailable", "burned_in_overlay": "unavailable"},
+        )
+
+    def test_normalized_window_restates_padding_against_the_duration_it_used(self):
+        """Padding is only meaningful next to the length the window was cut for.
+
+        ``padded_seconds`` arrives computed against the length the segmentation
+        call asked for. Whenever a window is re-derived against a different
+        length, that number is stale, and a stale one under-reports how much of
+        the shipped window nothing ever described.
+        """
+        normalized = material._normalize_selected_source_range(
+            {
+                "source_start_time": 3.0,
+                "source_end_time": 9.0,
+                "verified_start_time": 5.0,
+                "verified_end_time": 7.0,
+                "padded_seconds": 4.0,
+            },
+            source_duration=20.0,
+            required_source_duration=5.6,
+        )
+
+        self.assertEqual(normalized["padded_seconds"], 3.6)
+        self.assertAlmostEqual(
+            normalized["source_end_time"] - normalized["source_start_time"], 5.6
+        )
+        # The described interval is untouched: only the window around it moved.
+        self.assertEqual(normalized["verified_start_time"], 5.0)
+        self.assertEqual(normalized["verified_end_time"], 7.0)
+
+    def test_normalized_window_leaves_padding_alone_when_nothing_was_verified(self):
+        """A segment from the fail-open path has no verified interval to measure."""
+        normalized = material._normalize_selected_source_range(
+            {"source_start_time": 0.0, "source_end_time": 8.0},
+            source_duration=8.0,
+            required_source_duration=3.0,
+        )
+
+        self.assertNotIn("padded_seconds", normalized)
+
     def test_download_videos_distributes_terms_monotonically_in_script_order(self):
         """
         三个镜头覆盖两个关键词时，第一个关键词连续覆盖前两个镜头，随后
